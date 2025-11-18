@@ -6,7 +6,7 @@ file_path = 'weights/detector.pt'
 if not os.path.exists(file_path):
     print(f"'{file_path}' not exist")
 else:
-    data = torch.load(file_path, map_location='cpu')
+    data = torch.load(file_path, map_location='cpu', weights_only=False)
     print(f"weight type: {type(data)}")
 
     if isinstance(data, dict):
