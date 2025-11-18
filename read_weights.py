@@ -15,9 +15,9 @@ else:
 
         for i, (key, value) in enumerate(data.items()):
             if hasattr(value, 'shape'):
-                print(f"  键 '{key}': 张量形状 {value.shape}")
+                print(f"  key '{key}': shape {value.shape}")
             else:
-                print(f"  键 '{key}': 类型 {type(value)}")
+                print(f"  key '{key}': type {type(value)}")
     
     elif isinstance(data, torch.Tensor):
         print("\n--- Tsensor ---")
