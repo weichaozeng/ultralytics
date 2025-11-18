@@ -1,7 +1,7 @@
 import torch
 import os
 
-file_path = '.weights/detector.pt'
+file_path = 'weights/detector.pt'
 
 if not os.path.exists(file_path):
     print(f"'{file_path}' not exist")
