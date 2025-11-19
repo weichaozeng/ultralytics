@@ -1,0 +1,90 @@
+# --- Project and Execution Settings ---
+project: ./logs/
+name: custom_tracking_finetune
+resume: False               
+exist_ok: False
+task: pose
+mode: train
+device: [0]                
+amp: True                 
+verbose: True
+seed: 0
+deterministic: True
+workers: 16               
+
+# --- Dataset and Model Paths ---
+data: cfg_custom/dataset_whim.yaml      
+model_cfg: cfg_custom/yolov8-pose.yaml  
+weights: weights/detector.pt
+
+# --- Core Training Hyperparameters ---
+epochs: 200                
+patience: 50
+batch: 30
+imgsz: 512
+time: None                 
+fraction: 1.0
+
+# --- Optimizer and Learning Rate ---
+optimizer: AdamW                 
+lr0: 0.001                  
+lrf: 0.0001                   
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0           
+warmup_momentum: 0.8
+warmup_bias_lr: 0.0
+box: 15.0
+cls: 0.5
+dfl: 1.5
+pose: 10.0
+kobj: 1.0
+label_smoothing: 0.0
+nbs: 64
+
+# --- Data Augmentation/Transform ---
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 60
+translate: 0.1
+scale: 0.5
+shear: 0.0
+perspective: 0.0
+flipud: 0.0
+fliplr: 0.0
+mosaic: 0.7
+mixup: 0.0
+copy_paste: 0.0
+auto_augment: randaugment
+erasing: 0.4
+crop_fraction: 1.0
+close_mosaic: 10
+
+# --- Validation and Inference Parameters ---
+val: True
+split: val
+conf: 0.001                 # ( None)
+iou: 0.7
+max_det: 300
+half: False
+agnostic_nms: False
+classes: None
+retina_masks: False
+
+# --- Output and Saving ---
+save: True
+save_period: 1              
+save_json: False
+save_txt: False
+save_conf: False
+save_crop: False
+plots: True
+show_labels: True
+show_conf: True
+show_boxes: True
+save_frames: True
+line_width: None
+
+# --- Tracker ---
+tracker: botsort.yaml      
