@@ -104,7 +104,7 @@ def save_results(args, frames, results, seq_name, frame_names):
         vis_frame = frame.copy()
         if results[i]['has_det']:
             for j, track_id in enumerate(results[i]['track_id']):
-                vis_frame = draw_bbox(vis_frame, track_id, results[i]['boxes'][j], results[i]['handedness'][j][0])
+                vis_frame = draw_bbox(vis_frame, track_id, results[i]['boxes'][j], results[i]['handedness'][j])
         if args.save_type == "video":
             video_writer.write(vis_frame)
         else:
