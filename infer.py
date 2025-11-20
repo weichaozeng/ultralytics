@@ -122,7 +122,7 @@ def draw_bbox(img_cv2, id, box, is_right):
     (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, THICKNESS_TEXT)
     pt1 = (x1, y1)
     pt2 = (x1 + text_w, y1 + text_h + baseline)
-    text_org = (x1, y1 + baseline)
+    text_org = (x1, y1 + baseline + baseline)
     cv2.rectangle(img_cv2, (x1, y1), (x2, y2), color, 2)
     cv2.rectangle(img_cv2, pt1, pt2, color, -1)
     cv2.putText(img_cv2, text, text_org, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, TEXT_COLOR, THICKNESS_TEXT)
