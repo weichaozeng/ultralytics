@@ -105,10 +105,10 @@ def draw_bbox(img_cv2, id, box, is_right):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference")
-    parser.add_argument("--in_dir", type=str, default="example_data/")
-    parser.add_argument("--in_type", type=str, choices=["video", "rgb", "color"], default="")
-    parser.add_argument("--save_dir", type=str, default="example_out/wilor/")
-    parser.add_argument("--save_type", type=str, default="video")
+    parser.add_argument("--in_dir", type=str, default="example_data/FPHA/")
+    parser.add_argument("--in_type", type=str, choices=["video", "rgb", "color"], default="color")
+    parser.add_argument("--save_dir", type=str, default="example_out/wilor/FPHA/")
+    parser.add_argument("--save_type", type=str, default="img")
     parser.add_argument("--det_thresh", type=float, default=0.5)
     parser.add_argument("--ckpt", type=str, default="weights/detector.pt")
 
