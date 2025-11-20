@@ -78,7 +78,7 @@ def detect_track(args, model, frames):
                             'has_det': True,
                             'track_id': track_id,
                             'boxes': np.hstack([boxes, box_confs[:, None]]),
-                            'poses': np.hstack([poses, pose_confs[..., None]]),
+                            'poses': np.concatenate([poses, pose_confs[..., None]], axis=2),
                             'handedness': handedness,
                         }
                     else:
