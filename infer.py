@@ -74,6 +74,8 @@ def detect_track(args, model, frames):
                         handedness = result[0].boxes.cls.cpu().numpy()
                         poses = result[0].keypoints.xy.cpu().numpy()
                         pose_confs = result[0].keypoints.conf.cpu().numpy()
+                        print(boxes.shape)
+                        print(box_confs.shape)
                         print(poses.shape)
                         print(pose_confs.shape)
                         out = {
