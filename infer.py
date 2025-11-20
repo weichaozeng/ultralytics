@@ -67,7 +67,19 @@ def detect_track(args, model, frames):
             with torch.no_grad():
                 with autocast():
                     result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=True)
-            results.append(result)
+                    track_id = result[0].boxes.id.cpu().numpy()
+                    boxes = result[0].boxes.xyxy.cpu().numpy()
+                    box_confs = result[0].boxes.conf.cpu().numpy()
+                    handedness = result[0].boxes.cls.cpu().numpy()
+                    poses = result[0].keypoints.xy.cpu().numpy()
+                    pose_confs = result[0].keypoints.conf.cpu().numpy()
+                    out = {
+                        'track_id': track_id,
+                        'boxes': np.hstack([boxes, box_confs[:, None]]),
+                        'poses': np.hstack([poses, pose_confs[:, None]]),
+                        'handedness': handedness
+                    }
+            results.append(out)
     return results
 
 
@@ -84,9 +96,8 @@ def save_results(args, frames, results, seq_name, frame_names):
 
     for i, frame in enumerate(frames):
         vis_frame = frame.copy()
-        for track_id in results[i].item().keys():
-            for subj in results[i].item()[track_id]:
-                vis_frame = draw_bbox(vis_frame, track_id, subj['det_box'], subj['det_handedness'][0])
+        for j, track_id in enumerate(results[i]['track_id']):
+            vis_frame = draw_bbox(vis_frame, track_id, results[i]['boxes'][j], results[i]['handedness'][j][0])
         if args.save_type == "video":
             video_writer.write(vis_frame)
         else:
