@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 weights/
+example_data/
+example_out/
 
 # C extensions
 *.so

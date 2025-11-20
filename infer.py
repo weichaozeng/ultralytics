@@ -1,0 +1,137 @@
+from ultralytics import YOLO
+import argparse
+import os
+import cv2
+import numpy as np
+from typing import List
+import torch
+from tqdm import tqdm
+if torch.cuda.is_available():
+    autocast = torch.cuda.amp.autocast
+else:
+    class autocast:
+        def __init__(self, enabled=True):
+            pass
+        def __enter__(self):
+            pass
+        def __exit__(self, *args):
+            pass
+
+def get_frames(args, name) -> List[np.ndarray]:
+    out_frames = []
+    out_names = []
+    if args.in_type == "video":
+        assert name.lower().endswith('.mp4'), print(f"Conflit with file type {name} and args.intype {args.in_type}.")
+        video_path = os.path.join(args.in_dir, name)
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise IOError(f"Error opening video stream: {video_path}")
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+            out_frames.append(frame)
+        cap.release()
+        if not out_frames:
+            raise FileNotFoundError(f"No valid frames found for: {name}")
+        return out_frames, None
+    else:
+        if args.in_type == "":
+            seq_dir = os.path.join(args.in_dir, name)
+        else:
+            seq_dir = os.path.join(args.in_dir, name, args.in_type)
+        if not os.path.isdir(seq_dir):
+            raise FileNotFoundError(f"Image sequence directory not found: {seq_dir}")
+        img_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
+        img_paths = []
+        for filename in sorted(os.listdir(seq_dir)):
+            if filename.lower().endswith(img_ext):
+                img_paths.append(os.path.join(seq_dir, filename))
+        for img_path in img_paths:
+            img = cv2.imread(img_path)
+            if img is None:
+                print(f"Warning: Failed to read image: {img_path}. Skipping.")
+                continue
+            out_frames.append(img)
+            out_names.append(os.path.basename(img_path))
+        if not out_frames:
+            raise FileNotFoundError(f"No valid images found for: {name}")
+        return out_frames, out_names
+
+
+def detect_track(args, model, frames):
+    results = []
+    for frame_cv2 in frames:
+            with torch.no_grad():
+                with autocast():
+                    result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=True)
+            results.append(result)
+    return results
+
+
+def save_results(args, frames, results, seq_name, frame_names):
+    seq_name = seq_name.split('.')[0]
+    assert len(frames) == len(results), print(f"Lenght missmatch between frames {len(frames)} and results {len(results)}.")
+    if args.save_type == "video":
+        img_h, img_w = frames[0].shape[:2]
+        video_output_path = os.path.join(args.save_dir, f'{seq_name}.mp4')
+        video_writer = cv2.VideoWriter(video_output_path,
+                                       cv2.VideoWriter_fourcc(*'mp4v'), 30, (img_w, img_h)) 
+    else:
+        os.makedirs(os.path.join(args.save_dir, seq_name), exist_ok=True)
+
+    for i, frame in enumerate(frames):
+        vis_frame = frame.copy()
+        for track_id in results[i].item().keys():
+            for subj in results[i].item()[track_id]:
+                vis_frame = draw_bbox(vis_frame, track_id, subj['det_box'], subj['det_handedness'][0])
+        if args.save_type == "video":
+            video_writer.write(vis_frame)
+        else:
+            cv2.imwrite(os.path.join(args.save_dir, seq_name, frame_names[i]), vis_frame)
+
+
+def draw_bbox(img_cv2, id, box, is_right):
+    x1, y1, x2, y2, conf = box
+    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+    color = (0, 0, 255) if is_right > 0 else (255, 0, 0)
+    cv2.rectangle(img_cv2, (x1, y1), (x2, y2), color, 2)
+    cv2.putText(img_cv2, f'ID: {int(id)}', (x1, y1 + 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    return img_cv2
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Inference")
+    parser.add_argument("--in_dir", type=str, default="example_data/")
+    parser.add_argument("--in_type", type=str, choices=["video" | "rgb" | "color"], default="")
+    parser.add_argument("--save_dir", type=str, default="example_out/wilor/")
+    parser.add_argument("--save_type", type=str, default="video")
+    parser.add_argument("--det_thresh", type=float, default=0.5)
+    parser.add_argument("--ckpt", type=str, default="weights/detector.pt")
+
+    args = parser.parse_args()
+
+    model = YOLO(args.ckpt)
+
+    for seq_name in tqdm(os.listdir(args.in_dir)):
+        frames, frame_names = get_frames(args, seq_name)
+        if args.save_type == "video":
+            first_frame = cv2.imread(frames[0])
+            img_h, img_w = first_frame.shape[:2]
+            video_output_path = os.path.join(args.save_dir, f'{seq_name}.mp4')
+            video_writer = cv2.VideoWriter(video_output_path,
+                                        cv2.VideoWriter_fourcc(*'mp4v'), 30, (img_w, img_h)) 
+        else:
+            os.makedirs(args.save_dir, exist_ok=True)
+        
+        results = detect_track(args, model, frames)
+        save_results(args, frames, results, seq_name, frame_names)
+        
+
+
+
+        
+
