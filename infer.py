@@ -66,7 +66,7 @@ def detect_track(args, model, frames):
     for frame_cv2 in frames:
             with torch.no_grad():
                 with autocast():
-                    result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=True)
+                    result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False)
                     if not result[0].boxes.id is None:
                         track_id = result[0].boxes.id.cpu().numpy()
                         boxes = result[0].boxes.xyxy.cpu().numpy()
