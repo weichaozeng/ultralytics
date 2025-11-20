@@ -115,9 +115,17 @@ def draw_bbox(img_cv2, id, box, is_right):
     x1, y1, x2, y2, conf = box
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
     color = (0, 0, 255) if is_right > 0 else (255, 0, 0)
+    text = f'ID: {int(id)}'
+    FONT_SCALE = 0.8
+    THICKNESS_TEXT = 2
+    TEXT_COLOR = (255, 255, 255)
+    (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, THICKNESS_TEXT)
+    pt1 = (x1, y1)
+    pt2 = (x1 + text_w, y1 + text_h + baseline)
+    text_org = (x1, y1 + baseline)
     cv2.rectangle(img_cv2, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(img_cv2, f'ID: {int(id)}', (x1, y1 + 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    cv2.rectangle(img_cv2, pt1, pt2, color, -1)
+    cv2.putText(img_cv2, text, text_org, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, TEXT_COLOR, THICKNESS_TEXT)
     return img_cv2
 
 
