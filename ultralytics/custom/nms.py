@@ -9,8 +9,8 @@ from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import batch_probiou, box_iou
 from ultralytics.utils.ops import xywh2xyxy
 
-point_thres = 100.0
-bone_thres = 100.0
+point_thres = 0.5
+bone_thres = 0.5
 def pose_aware_non_max_suppression(
     prediction,
     conf_thres: float = 0.25,
@@ -397,7 +397,7 @@ class TorchNMS:
 
         bone_A = bone_vecs_norm.unsqueeze(1)  # (N, 1, 20, 2)
         bone_B = bone_vecs_norm.unsqueeze(0)  # (1, N, 20, 2)
-        cos_sim = torch.sum(bone_A * bone_B, dim=3)  # (N, N, 20)
+        cos_sim = (torch.sum(bone_A * bone_B, dim=3) + 1.0) / 2.0  # (N, N, 20)
         weights_A = bone_weights.unsqueeze(1) # (N, 1, 20)
         weights_B = bone_weights.unsqueeze(0) # (1, N, 20)
         final_weights = torch.minimum(weights_A, weights_B) # (N, N, 20)
