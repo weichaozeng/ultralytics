@@ -1,3 +1,4 @@
+# Modify on postprocess
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from ultralytics.engine.predictor import BasePredictor
@@ -51,7 +52,14 @@ class DetectionPredictor(BasePredictor):
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
         save_feats = getattr(self, "_feats", None) is not None
-        preds = nms.non_max_suppression(
+        
+        # modify
+        nms_mode = getattr(self.args, 'pose_nms', False)
+        if nms_mode == 'pose_aided' or nms_mode is True:
+            from ultralytics.custom.nms import pose_aware_non_max_suppression as nms_func
+        else:
+            nms_func = nms.non_max_suppression
+        preds = nms_func(
             preds,
             self.args.conf,
             self.args.iou,
@@ -63,6 +71,20 @@ class DetectionPredictor(BasePredictor):
             rotated=self.args.task == "obb",
             return_idxs=save_feats,
         )
+        
+        # origin
+        # preds = nms.non_max_suppression(
+        #     preds,
+        #     self.args.conf,
+        #     self.args.iou,
+        #     self.args.classes,
+        #     self.args.agnostic_nms,
+        #     max_det=self.args.max_det,
+        #     nc=0 if self.args.task == "detect" else len(self.model.names),
+        #     end2end=getattr(self.model, "end2end", False),
+        #     rotated=self.args.task == "obb",
+        #     return_idxs=save_feats,
+        # )
 
         if not isinstance(orig_imgs, list):  # input images are a torch.Tensor, not a list
             orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)
