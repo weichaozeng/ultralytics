@@ -9,8 +9,8 @@ from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import batch_probiou, box_iou
 from ultralytics.utils.ops import xywh2xyxy
 
-point_thres = 2
-bone_thres = 2
+point_thres = 1e5
+bone_thres = 1e5
 def pose_aware_non_max_suppression(
     prediction,
     conf_thres: float = 0.25,
