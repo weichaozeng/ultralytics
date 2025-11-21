@@ -54,11 +54,11 @@ class DetectionPredictor(BasePredictor):
         save_feats = getattr(self, "_feats", None) is not None
         
         # modify
-        nms_mode = getattr(self.args, 'pa_nms', False)
-        if nms_mode == 'pa_nms' or nms_mode is True:
-            from ultralytics.custom.nms import pose_aware_non_max_suppression as nms_func
-        else:
-            nms_func = nms.non_max_suppression
+        # nms_mode = getattr(self.args, 'pa_nms', False)
+        # if nms_mode == 'pa_nms' or nms_mode is True:
+        from ultralytics.custom.nms import pose_aware_non_max_suppression as nms_func
+        # else:
+        #     nms_func = nms.non_max_suppression
         preds = nms_func(
             preds,
             self.args.conf,
