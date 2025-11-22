@@ -158,7 +158,7 @@ def pose_aware_non_max_suppression(
             
             # modify
             pose_data = x[:, 6:69].reshape(x.shape[0], -1, 3)
-            poses = pose_data[..., :2].reshape(x.shape[0], -1)
+            poses = pose_data[..., :2].reshape(x.shape[0], -1) + c
             pose_scores = pose_data[..., 2].reshape(x.shape[0], -1)
             i = TorchNMS.pa_nms(boxes, scores, iou_thres, poses, pose_scores, point_thres, bone_thres)
         i = i[:max_det]  # limit detections
