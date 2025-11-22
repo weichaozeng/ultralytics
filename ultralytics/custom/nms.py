@@ -376,6 +376,7 @@ class TorchNMS:
         scales = torch.cat([widths, heights], dim=2)
         kps_norm = kps_tr / scales # (N, K, 2)
 
+        pose_scores[pose_scores < 0.5] = 0.0
         # point dist
         point_diff = kps_norm.unsqueeze(0) - kps_norm.unsqueeze(1) # (N. N, K, 2)
         conf_A = pose_scores.unsqueeze(1) # (N, 1, K)
