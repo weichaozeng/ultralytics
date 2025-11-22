@@ -145,7 +145,7 @@ if __name__ == "__main__":
     for seq_name in tqdm(os.listdir(args.in_dir)):
         frames, frame_names = get_frames(args, seq_name)
         if args.save_type == "video":
-            first_frame = cv2.imread(frames[0])
+            first_frame = frames[0]
             img_h, img_w = first_frame.shape[:2]
             video_output_path = os.path.join(args.save_dir, f'{seq_name}.mp4')
             video_writer = cv2.VideoWriter(video_output_path,
