@@ -28,15 +28,18 @@ def get_frames(args, name) -> List[np.ndarray]:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise IOError(f"Error opening video stream: {video_path}")
+        idx_name = 0
         while True:
             ret, frame = cap.read()
             if not ret or frame is None:
                 break
             out_frames.append(frame)
+            out_names.append(str(idx_name).zfill(6) + '.jpg')
+            idx_name += 1
         cap.release()
         if not out_frames:
             raise FileNotFoundError(f"No valid frames found for: {name}")
-        return out_frames, None
+        return out_frames, out_names
     else:
         if args.in_type == "":
             seq_dir = os.path.join(args.in_dir, name)
