@@ -19,7 +19,7 @@ BONE_CONNECTIONS = torch.tensor([
 
 
 point_thres = 0.1
-bone_thres = 0.2
+bone_thres = 0.1
 def pose_aware_non_max_suppression(
     prediction,
     conf_thres: float = 0.25,
