@@ -17,6 +17,24 @@ else:
         def __exit__(self, *args):
             pass
 
+BONE_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),    # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),    # Index
+    (0, 9), (9, 10), (10, 11), (11, 12), # Mid
+    (0, 13), (13, 14), (14, 15), (15, 16), # Ring
+    (0, 17), (17, 18), (18, 19), (19, 20)  # Pinky
+]
+FINGER_COLORS = [
+    (0, 0, 255),    # Thumb - Red
+    (255, 0, 0),    # Index - Blue
+    (0, 255, 0),    # Mid - Green
+    (0, 255, 255),  # Ring - Yellow
+    (255, 0, 255)   # Pinky - magenta
+]
+COLOR_KEYPOINT = (255, 255, 255) # Joint - White
+COLOR_WRIST = (255, 165, 0)      # Wrist - Orange
+
+
 def get_frames(args, name) -> List[np.ndarray]:
     out_frames = []
     out_names = []
@@ -107,7 +125,8 @@ def save_results(args, frames, results, seq_name, frame_names):
         vis_frame = frame.copy()
         if results[i]['has_det']:
             for j, track_id in enumerate(results[i]['track_id']):
-                vis_frame = draw_bbox(vis_frame, track_id, results[i]['boxes'][j], results[i]['handedness'][j])
+                vis_frame = draw_bbox(vis_frame, track_id, results[i]['boxes'][j],results[i]['handedness'][j])
+                vis_frame = draw_pose(vis_frame, results[i]['poses'][j])
         if args.save_type == "video":
             video_writer.write(vis_frame)
         else:
@@ -130,6 +149,54 @@ def draw_bbox(img_cv2, id, box, is_right):
     cv2.rectangle(img_cv2, pt1, pt2, color, -1)
     cv2.putText(img_cv2, text, text_org, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, TEXT_COLOR, THICKNESS_TEXT)
     return img_cv2
+
+
+def get_finger_color(bone_index: int) -> tuple:
+    # Thumb (0-3) -> 0
+    if bone_index < 4:
+        return FINGER_COLORS[0]
+    # Index (4-7) -> 1
+    elif bone_index < 8:
+        return FINGER_COLORS[1]
+    # Mid (8-11) -> 2
+    elif bone_index < 12:
+        return FINGER_COLORS[2]
+    # Ring (12-15) -> 3
+    elif bone_index < 16:
+        return FINGER_COLORS[3]
+    # Pinky (16-19) -> 4
+    else:
+        return FINGER_COLORS[4]
+
+
+def draw_pose(img_cv2, pose, thresh=0.5, K=21):
+    if pose.shape != (K, 3):
+        raise ValueError(f"Pose shape must be ({K}, 3), but got {pose.shape}")
+    if isinstance(pose, torch.Tensor):
+        keypoints = pose.cpu().numpy()
+    else:
+        keypoints = pose
+    for i, (start_idx, end_idx) in enumerate(BONE_CONNECTIONS):
+        kp_start = keypoints[start_idx]
+        kp_end = keypoints[end_idx]
+        if kp_start[2] > thresh and kp_end[2] > thresh:
+            pt1 = (int(kp_start[0]), int(kp_start[1]))
+            pt2 = (int(kp_end[0]), int(kp_end[1]))
+            color = get_finger_color(i)
+            cv2.line(img_cv2, pt1, pt2, color, 3)
+    for i in range(K):
+        kp = keypoints[i]
+        if kp[2] > thresh:
+            center = (int(kp[0]), int(kp[1]))
+            if i == 0:
+                color = COLOR_WRIST 
+                radius = 6
+            else:
+                color = COLOR_KEYPOINT
+                radius = 4
+            cv2.circle(img_cv2, center, radius, color, -1) 
+    return img_cv2
+
 
 
 if __name__ == "__main__":
