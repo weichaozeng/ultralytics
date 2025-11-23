@@ -83,6 +83,11 @@ def get_frames(args, name) -> List[np.ndarray]:
 
 
 def detect_track(args, model, frames):
+    if hasattr(model.predictor, 'trackers') and model.predictor.trackers:
+        model.predictor.trackers[0].reset()
+    else:
+        print("Tracker not found or not initialized.")
+    
     results = []
     for frame_cv2 in frames:
             with torch.no_grad():
