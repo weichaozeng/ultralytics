@@ -9,6 +9,15 @@ from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import batch_probiou, box_iou
 from ultralytics.utils.ops import xywh2xyxy
 
+BONE_CONNECTIONS = torch.tensor([
+    [0, 1], [1, 2], [2, 3], [3, 4],    # Thumb
+    [0, 5], [5, 6], [6, 7], [7, 8],    # Index
+    [0, 9], [9, 10], [10, 11], [11, 12], # Middle
+    [0, 13], [13, 14], [14, 15], [15, 16], # Ring
+    [0, 17], [17, 18], [18, 19], [19, 20]  # Pinky
+], dtype=torch.int64)
+
+
 point_thres = 0.01
 bone_thres = 0.9
 def pose_aware_non_max_suppression(
@@ -443,10 +452,3 @@ class TorchNMS:
 
 
 
-BONE_CONNECTIONS = torch.tensor([
-    [0, 1], [1, 2], [2, 3], [3, 4],    # Thumb
-    [0, 5], [5, 6], [6, 7], [7, 8],    # Index
-    [0, 9], [9, 10], [10, 11], [11, 12], # Middle
-    [0, 13], [13, 14], [14, 15], [15, 16], # Ring
-    [0, 17], [17, 18], [18, 19], [19, 20]  # Pinky
-], dtype=torch.int64)
