@@ -89,7 +89,10 @@ def detect_track(args, model, frames):
         print("Tracker not found or not initialized.")
     
     results = []
+    i = 0
     for frame_cv2 in frames:
+            print(i)
+            i += 1
             with torch.no_grad():
                 with autocast():
                     result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False)
