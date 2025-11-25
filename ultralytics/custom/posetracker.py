@@ -2,14 +2,21 @@
 import numpy as np
 
 
+
 from ultralytics.trackers.byte_tracker import BYTETracker
 from ultralytics.trackers.bot_sort import BOTSORT, BOTrack
 
+from ultralytics.trackers.utils.kalman_filter import KalmanFilterXYWH
+from ultralytics.custom.kalman_filter_pose import KalmanFilterPose
 
 
 
 
 class PTrack(BOTrack):
+    
+    shared_kalman = KalmanFilterXYWH()
+    shared_kalman_pose = KalmanFilterPose()
+
     def __init__(self, xywh: np.ndarray, score: float, cls: int, pxy: np.ndarray, pscore: np.ndarray, feat: np.ndarray | None = None, feat_history: int = 50
     ):
         """
@@ -24,7 +31,7 @@ class PTrack(BOTrack):
         """
         super().__init__(xywh, score, cls, feat, feat_history)
     
-    
+
 
 
 

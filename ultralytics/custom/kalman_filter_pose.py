@@ -105,3 +105,56 @@ class KalmanFilterPose:
         new_covariance = covariance - np.linalg.multi_dot((kalman_gain, projected_cov, kalman_gain.T))
 
         return new_mean, new_covariance
+    
+    def multi_predict(self, mean: np.ndarray, covariance: np.ndarray):
+        """
+        Args:
+            mean (np.ndarray): Nx84 dim.
+            covariance (np.ndarray): Nx84x84.
+
+        Returns:
+            mean (np.ndarray): (N, 84).
+            covariance (np.ndarray): (N, 84, 84).
+        """
+        if mean.shape[0] == 0:
+            return mean, covariance
+        
+        N = mean.shape[0]
+        std_pos_kps = self._std_weight_position * self.scale_factor
+        std_vel_kps = self._std_weight_velocity * self.scale_factor
+
+        std_pos = np.full((N, self.ndim), std_pos_kps)
+        std_vel = np.full((N, self.ndim), std_vel_kps)
+
+        sqr = np.square(np.concatenate((std_pos, std_vel), axis=1))
+        motion_cov = np.array([np.diag(sqr[i]) for i in range(N)])
+
+        # X_t = X_{t-1} * F.T
+        mean = np.dot(mean, self._motion_mat.T) # Shape (N, 84)
+        
+        # P_t = F * P_{t-1} * F.T + Q
+        # F * P_{t-1}
+        left = np.dot(self._motion_mat, covariance).transpose((1, 0, 2)) # Shape (N, 84, 84)
+        
+        # (F * P_{t-1}) * F.T + Q
+        covariance = np.dot(left, self._motion_mat.T) + motion_cov # Shape (N, 84, 84)
+
+        return mean, covariance
+
+
+    def gating_distance(self, mean: np.ndarray, covariance: np.ndarray, measurements: np.ndarray, only_position: bool = False, metric: str = "maha"):
+        projected_mean, projected_cov = self.project(mean, covariance)
+        if only_position:
+            pass
+        d = measurements - projected_mean
+        if metric == "gaussian":
+            return np.sum(d * d, axis=1)
+        
+        elif metric == "maha":
+            # d^2 = y.T * S^-1 * y
+            cholesky_factor = np.linalg.cholesky(projected_cov)
+            z = scipy.linalg.solve_triangular(cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
+            return np.sum(z * z, axis=0)
+        
+        else:
+            raise ValueError("Invalid distance metric")
