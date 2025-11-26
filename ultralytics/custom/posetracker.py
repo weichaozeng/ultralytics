@@ -224,14 +224,14 @@ class PoseTracker(BOTSORT):
 
         dets_main = dets[remain_inds]
         poses_main = poses[remain_inds]
-        feats_main = feats[remain_inds] if feats is not None else None
+        feats_main = feats[remain_inds] if feats is not None else img
 
         dets_second = dets[inds_second]
         poses_second = poses[inds_second]
-        feats_second = feats[inds_second] if feats is not None else None
+        feats_second = feats[inds_second] if feats is not None else img
 
-        detections = self.init_track(dets_main, poses_main, img, feats_main)
-        detections_second = self.init_track(dets_second, poses_second, img, feats_second)
+        detections = self.init_track(dets_main, poses_main, feats_main)
+        detections_second = self.init_track(dets_second, poses_second, feats_second)
 
         unconfirmed = []
         tracked_stracks = [] 
