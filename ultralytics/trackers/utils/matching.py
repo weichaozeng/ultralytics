@@ -153,4 +153,98 @@ def fuse_score(cost_matrix: np.ndarray, detections: list) -> np.ndarray:
     return 1 - fuse_sim  # fuse_cost
 
 
+HAND_BONE_CONNECTIONS = np.array([
+    # Thumb
+    [0, 1], [1, 2], [2, 3], [3, 4],
+    # Index
+    [0, 5], [5, 6], [6, 7], [7, 8],
+    # Middle
+    [0, 9], [9, 10], [10, 11], [11, 12],
+    # Ring
+    [0, 13], [13, 14], [14, 15], [15, 16],
+    # Pinky
+    [0, 17], [17, 18], [18, 19], [19, 20]
+], dtype=np.int32)
+
+def normalize_vectors(vecs: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vecs, axis=-1, keepdims=True)
+    norms[norms < 1e-6] = 1.0 
+    return vecs / norms
+
 def bone_distance(atracks: list, btracks: list) -> np.ndarray: 
+    Nt = len(atracks)
+    Nd = len(btracks)
+    if Nt == 0 or Nd == 0:
+        return np.zeros((Nt, Nd), dtype=np.float32)
+    kps_a = np.array([track.pxyxy.reshape(-1, 2) for track in atracks], dtype=np.float32)
+    kps_b = np.array([track.pxyxy.reshape(-1, 2) for track in btracks], dtype=np.float32)
+    confs_a = np.array([track.kps_score for track in atracks], dtype=np.float32)
+    confs_b = np.array([track.kps_score for track in btracks], dtype=np.float32) 
+    
+    conn = HAND_BONE_CONNECTIONS
+    vecs_a = kps_a[:, conn[:, 1], :] - kps_a[:, conn[:, 0], :]
+    vecs_b = kps_b[:, conn[:, 1], :] - kps_b[:, conn[:, 0], :]
+    vecs_norm_a = normalize_vectors(vecs_a)
+    vecs_norm_b = normalize_vectors(vecs_b)
+
+    confs_start_a = confs_a[:, conn[:, 0]]
+    confs_end_a = confs_a[:, conn[:, 1]]
+    bone_weight_a = np.minimum(confs_start_a, confs_end_a)
+
+    confs_start_b = confs_b[:, conn[:, 0]]
+    confs_end_b = confs_b[:, conn[:, 1]]
+    bone_weight_b = np.minimum(confs_start_b, confs_end_b)
+
+    vecs_norm_a_exp = np.expand_dims(vecs_norm_a, 1)
+    vecs_norm_b_exp = np.expand_dims(vecs_norm_b, 0)
+
+    cos_sim = np.sum(vecs_norm_a_exp * vecs_norm_b_exp, axis=-1) # (Nt, Nd, 20)
+    dissim = (1 - cos_sim) / 2.0
+
+    weights_a_exp = np.expand_dims(bone_weight_a, 1)
+    weights_b_exp = np.expand_dims(bone_weight_b, 0)
+    final_weights = 1 - np.minimum(weights_a_exp, weights_b_exp) # (Nt, Nd, 20)
+
+    weighted_dissim = np.sum(dissim * final_weights, axis=-1) # (Nt, Nd)
+
+    total_weight = np.sum(final_weights, axis=-1)
+    total_weight[total_weight < 1e-6] = 1e-6
+
+    return weighted_dissim / total_weight
+
+
+def kp_distance(atracks: list, btracks: list, scale_factor: float = 50.0) -> np.ndarray:
+    Nt = len(atracks)
+    Nd = len(btracks)
+    if Nt == 0 or Nd == 0:
+        return np.zeros((Nt, Nd), dtype=np.float32)
+    
+    kps_a = np.array([track.pxyxy for track in atracks], dtype=np.float32) # (Nt, 42)
+    kps_b = np.array([track.pxyxy for track in btracks], dtype=np.float32) # (Nd, 42)
+    
+    scores_a_21 = np.array([track.kps_score for track in atracks], dtype=np.float32) # (Nt, 21)
+    scores_b_21 = np.array([track.kps_score for track in btracks], dtype=np.float32) # (Nd, 21)
+
+    scores_a_42 = np.repeat(scores_a_21, 2, axis=1) 
+    scores_b_42 = np.repeat(scores_b_21, 2, axis=1)
+
+    kps_a_exp = np.expand_dims(kps_a, 1)
+    kps_b_exp = np.expand_dims(kps_b, 0)
+    squared_diff = np.square(kps_a_exp - kps_b_exp)
+
+    confs_a_42 = 1.0 - scores_a_42
+    confs_b_42 = 1.0 - scores_b_42
+    confs_a_exp = np.expand_dims(confs_a_42, 1)
+    confs_b_exp = np.expand_dims(confs_b_42, 0)
+
+    final_confs = np.maximum(confs_a_exp, confs_b_exp) # (Nt, Nd, 42)
+    weighted_distance_sum = np.sum(squared_diff * (1.0 + final_confs), axis=-1) # (Nt, Nd)
+
+    M = scores_a_42.shape[1] # 42
+    normalization_factor = M * (scale_factor ** 2)
+
+    kp_dissimilarity_matrix = np.sqrt(weighted_distance_sum / normalization_factor)
+
+    kp_dissimilarity_matrix[kp_dissimilarity_matrix > 1.0] = 1.0
+
+    return kp_dissimilarity_matrix

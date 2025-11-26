@@ -88,12 +88,63 @@ class PTrack(BOTrack):
         self.kps_pos = new_track.kps_pos
         self.kps_score = new_track.kps_score
             
+    @staticmethod
+    def multi_gmc(tracks, H: np.ndarray = np.eye(2, 3)):
+        if tracks:
+            multi_bbox_mean = np.asarray([t.mean.copy() for t in tracks])
+            multi_bbox_cov = np.asarray([t.covariance for t in tracks])
+            R = H[:2, :2]
+            R8x8 = np.kron(np.eye(4, dtype=float), R)
+            t = H[:2, 2]
+
+            for i, (mean, cov) in enumerate(zip(multi_bbox_mean, multi_bbox_cov)):
+                mean = R8x8.dot(mean)
+                mean[:2] += t
+                cov = R8x8.dot(cov).dot(R8x8.transpose())      
+                tracks[i].mean = mean
+                tracks[i].covariance = cov
+
+            kf_pose = tracks[0].pose_kalman_filter 
+            M = kf_pose.ndim # 42
+            D = 2 * M
+            pose_tracks = [t for t in tracks if t.pose_mean is not None]
+            if not pose_tracks:
+                return
+
+            pose_means = np.asarray([t.pose_mean.copy() for t in pose_tracks])
+            pose_covs = np.asarray([t.pose_covariance for t in pose_tracks])
+
+            R_kps = np.kron(np.eye(M // 2, dtype=float), R)
+            R_pose_block = np.kron(np.eye(2, dtype=float), R_kps)
+            for i, (mean, cov) in enumerate(zip(pose_means, pose_covs)):
+                mean = R_pose_block.dot(mean)
+                t_pose = np.tile(t, M // 2) # (42,)
+                mean[:M] += t_pose
+                cov = R_pose_block.dot(cov).dot(R_pose_block.transpose())
+                pose_tracks[i].pose_mean = mean
+                pose_tracks[i].pose_covariance = cov
     @property
-    def predicted_kps_pos(self):
+    def pxyxy(self):
         if self.pose_mean is None:
              return self.kps_pos
         M = self.shared_kalman_pose.ndim
         return self.pose_mean[:M].copy()
+    
+    @property
+    def result(self):
+        coords = self.xyxy if self.angle is None else self.xywha
+        kps = self.pxyxy.tolist()
+        kps_score = self.kps_score.tolist()
+        output_list = [
+            *coords.tolist(),
+            self.track_id,
+            self.score,
+            self.cls,
+            self.idx,
+            *kps,
+            *kps_score
+        ]
+        return output_list
 
 
 
@@ -159,3 +210,129 @@ class PoseTracker(BOTSORT):
 
         return dists
     
+    def update(self, dets, poses, img, feats):
+        self.frame_id += 1
+        activated_stracks = []
+        refind_stracks = []
+        lost_stracks = []
+        removed_stracks = []
+
+        scores = dets.conf
+        remain_inds = scores >= self.args.track_high_thresh
+        inds_low = scores > self.args.track_low_thresh
+        inds_high = scores < self.args.track_high_thresh
+
+        inds_second = inds_high & inds_low
+
+        dets_main = dets[remain_inds]
+        poses_main = poses[remain_inds]
+        feats_main = feats[remain_inds] if feats is not None else None
+
+        dets_second = dets[inds_second]
+        poses_second = poses[inds_second]
+        feats_second = feats[inds_second] if feats is not None else None
+
+        detections = self.init_track(dets_main, poses_main, img, feats_main)
+        detections_second = self.init_track(dets_second, poses_second, img, feats_second)
+
+        unconfirmed = []
+        tracked_stracks = [] 
+        for track in self.tracked_stracks:
+            if not track.is_activated:
+                unconfirmed.append(track)
+            else:
+                tracked_stracks.append(track)
+                
+        strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
+
+        self.multi_predict(strack_pool)
+
+        # GMC
+        if hasattr(self, "gmc") and img is not None:
+            try:
+                warp = self.gmc.apply(img, dets_main.xyxy) 
+            except Exception:
+                warp = np.eye(2, 3)
+            PTrack.multi_gmc(strack_pool, warp)
+            PTrack.multi_gmc(unconfirmed, warp)
+
+        # First Association
+        dists = self.get_dists(strack_pool, detections)
+        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
+
+        for itracked, idet in matches:
+            track = strack_pool[itracked]
+            det = detections[idet]
+            if track.state == TrackState.Tracked:
+                track.update(det, self.frame_id) 
+                activated_stracks.append(track)
+            else:
+                track.re_activate(det, self.frame_id, new_id=False) 
+                refind_stracks.append(track)
+        
+        # Second Association
+        r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+        dists = matching.iou_distance(r_tracked_stracks, detections_second)
+        matches, u_track, _u_detection_second = matching.linear_assignment(dists, thresh=0.5)
+
+        for itracked, idet in matches:
+            track = r_tracked_stracks[itracked]
+            det = detections_second[idet]
+            if track.state == TrackState.Tracked:
+                track.update(det, self.frame_id)
+                activated_stracks.append(track)
+            else:
+                track.re_activate(det, self.frame_id, new_id=False)
+                refind_stracks.append(track)
+
+        for it in u_track:
+            track = r_tracked_stracks[it]
+            if track.state != TrackState.Lost:
+                track.mark_lost()
+                lost_stracks.append(track)
+        
+        # Unconfirmed
+        detections_remaining = [detections[i] for i in u_detection]
+        dists = self.get_dists(unconfirmed, detections_remaining)
+        matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
+
+        for itracked, idet in matches:
+            unconfirmed[itracked].update(detections_remaining[idet], self.frame_id)
+            activated_stracks.append(unconfirmed[itracked])
+            
+        for it in u_unconfirmed:
+            track = unconfirmed[it]
+            track.mark_removed()
+            removed_stracks.append(track)
+
+        # Init new stracks
+        for inew in u_detection:
+            track = detections_remaining[inew]
+            if track.score < self.args.new_track_thresh:
+                continue
+            track.activate(self.kalman_filter, self.pose_kalman_filter, self.frame_id)
+            activated_stracks.append(track)
+
+
+        # Update state lists
+        for track in self.lost_stracks:
+            if self.frame_id - track.end_frame > self.max_time_lost:
+                track.mark_removed()
+                removed_stracks.append(track)
+
+        self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
+        self.tracked_stracks = self.joint_stracks(self.tracked_stracks, activated_stracks)
+        self.tracked_stracks = self.joint_stracks(self.tracked_stracks, refind_stracks)
+        self.lost_stracks = self.sub_stracks(self.lost_stracks, self.tracked_stracks)
+        self.lost_stracks.extend(lost_stracks)
+        self.lost_stracks = self.sub_stracks(self.lost_stracks, self.removed_stracks)
+        self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
+        self.removed_stracks.extend(removed_stracks)
+        if len(self.removed_stracks) > 1000:
+            self.removed_stracks = self.removed_stracks[-999:]
+        
+        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+
+    
+    def multi_predict(self, tracks: list[PTrack]):
+        PTrack.multi_predict(tracks)
