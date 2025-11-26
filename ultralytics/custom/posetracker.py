@@ -1,8 +1,6 @@
-
-import numpy as np
-from typing import Any
 from __future__ import annotations
 
+import numpy as np
 
 from ultralytics.trackers.basetrack import TrackState
 from ultralytics.trackers.byte_tracker import BYTETracker
