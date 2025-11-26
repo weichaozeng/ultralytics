@@ -69,7 +69,7 @@ class KalmanFilterPose:
         innovation_cov = np.diag(np.square(std))
 
         # Z_{t} = H & X_{t}
-        mean = np.dot(self._updata_mat, mean)
+        mean = np.dot(self._update_mat, mean)
         # S = H * P * H.T + R
         covariance = np.linalg.multi_dot((self._update_mat, covariance, self._update_mat.T))
         
