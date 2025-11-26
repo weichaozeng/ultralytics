@@ -15,7 +15,7 @@ class KalmanFilterPose:
             self._motion_mat[i, self.ndim + i] = self.dt
         
         # H = [[I, 0]]
-        self._updata_mat = np.eye(self.ndim, 2 * self.ndim)
+        self._update_mat = np.eye(self.ndim, 2 * self.ndim)
 
         # 
         self._std_weight_position = 1.0 / 20.0 
