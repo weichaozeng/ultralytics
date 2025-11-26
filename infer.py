@@ -82,7 +82,7 @@ def get_frames(args, name) -> List[np.ndarray]:
         return out_frames, out_names
 
 
-def detect_track(args, model, frames):
+def detect_track(args, model, frames, tracker):
     if hasattr(model.predictor, 'trackers') and model.predictor.trackers:
         model.predictor.trackers[0].reset()
     else:
@@ -95,7 +95,10 @@ def detect_track(args, model, frames):
             i += 1
             with torch.no_grad():
                 with autocast():
-                    result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False)
+                    if tracker == "posetrack":
+                        result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False, tracker="./ultralytics/custom/posetrack.yaml")
+                    else:
+                        result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False)
                     if not result[0].boxes.id is None:
                         track_id = result[0].boxes.id.cpu().numpy()
                         boxes = result[0].boxes.xyxy.cpu().numpy()
@@ -215,6 +218,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_type", type=str, default="img")
     parser.add_argument("--det_thresh", type=float, default=0.1)
     parser.add_argument("--ckpt", type=str, default="weights/detector.pt")
+    parser.add_argument("--tracker", type=str, default="posetrack")
 
     args = parser.parse_args()
 
@@ -231,7 +235,7 @@ if __name__ == "__main__":
         else:
             os.makedirs(args.save_dir, exist_ok=True)
         
-        results = detect_track(args, model, frames)
+        results = detect_track(args, model, frames, args.tracker)
         save_results(args, frames, results, seq_name, frame_names)
 
 

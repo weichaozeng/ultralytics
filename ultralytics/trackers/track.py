@@ -123,17 +123,36 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
 
         det = (result.obb if is_obb else result.boxes).cpu().numpy()
         pose = result.keypoints.cpu().numpy() if hasattr(result, 'keypoints') else None
-        
+
         if getattr(tracker, 'pose_weight', None):
             tracks = tracker.update(det, pose, result.orig_img, getattr(result, "feats", None))
         else:
             tracks = tracker.update(det, result.orig_img, getattr(result, "feats", None))
         if len(tracks) == 0:
             continue
-        idx = tracks[:, -1].astype(int)
-        predictor.results[i] = result[idx]
 
-        update_args = {"obb" if is_obb else "boxes": torch.as_tensor(tracks[:, :-1])}
+
+        if getattr(tracker, 'pose_weight', None):
+            idx = tracks[:, -64].astype(int)
+            predictor.results[i] = result[idx]
+            kps_pos_start = -63
+            kps_pos_end = -21 
+            kps_pos_flat = torch.as_tensor(tracks[:, kps_pos_start:kps_pos_end]) # (N, 42)
+            kps_pos_reshaped = kps_pos_flat.view(-1, 21, 2) # 
+            kps_score_start = -21
+            kps_scores = torch.as_tensor(tracks[:, kps_score_start:]) # (N, 21)
+            kps_scores_reshaped = kps_scores.view(-1, 21, 1) # (N, 21, 1)
+            # Keypoints: (N, 21, 2) + (N, 21, 1) = (N, 21, 3)
+            keypoints_tensor = torch.cat((kps_pos_reshaped, kps_scores_reshaped), dim=2)
+            update_args = {
+                "obb" if is_obb else "boxes": torch.as_tensor(tracks[:, :-64]),
+                "keypoints": keypoints_tensor
+            }
+        else:
+            idx = tracks[:, -1].astype(int)
+            predictor.results[i] = result[idx]
+            update_args = {"obb" if is_obb else "boxes": torch.as_tensor(tracks[:, :-1])}
+            
         predictor.results[i].update(**update_args)
 
 
