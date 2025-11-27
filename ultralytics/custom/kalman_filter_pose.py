@@ -18,8 +18,8 @@ class KalmanFilterPose:
         self._update_mat = np.eye(self.ndim, 2 * self.ndim)
 
         # 
-        self._std_weight_position = 1.0 / 20.0 
-        self._std_weight_velocity = 1.0 / 160.0
+        self._std_weight_position = 1.0 / 200.0 # 1.0 / 20.0 
+        self._std_weight_velocity = 1.0 / 800.0 # 1.0 / 160.0
 
     def initiate(self, measurement: np.ndarray):
         """
