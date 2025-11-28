@@ -196,7 +196,7 @@ class PoseTracker(BOTSORT):
         
         # bone
         dists_bone = matching.bone_distance(tracks, detections)
-        dists_bone[dists_bone < (1 - self.bone_thresh)] = 1.0
+        dists_bone[dists_bone > (1 - self.bone_thresh)] = 1.0
         dists_bone[dists_iou_mask] = 1.0
         dists = np.minimum(dists, dists_bone)
 
