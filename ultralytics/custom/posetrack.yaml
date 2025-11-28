@@ -10,7 +10,7 @@ fuse_score: True # (bool) Fuse detection score with motion/IoU for matching; sta
 gmc_method: sparseOptFlow # (str) Global motion compensation: sparseOptFlow|orb|none; helps moving camera scenes
 
 # ReID model related thresh
-proximity_thresh: 0.5 # (float) Min IoU to consider tracks proximate for ReID; higher is stricter
+proximity_thresh: 0.2 # (float) Min IoU to consider tracks proximate for ReID; higher is stricter
 appearance_thresh: 0.8 # (float) Min appearance similarity for ReID; raise to avoid identity swaps
 with_reid: True # (bool) Enable ReID model use; needs extra model and compute
 model: auto # (str) ReID model name/path; "auto" uses detector features if available
