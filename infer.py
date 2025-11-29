@@ -212,9 +212,9 @@ def draw_pose(img_cv2, pose, thresh=0.5, K=21):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference")
-    parser.add_argument("--in_dir", type=str, default="example_data/FPHA/")
+    parser.add_argument("--in_dir", type=str, default="example_data/FPHA_demo/")
     parser.add_argument("--in_type", type=str, choices=["video", "rgb", "color", ""], default="color")
-    parser.add_argument("--save_dir", type=str, default="example_out/pa_nms/FPHA/")
+    parser.add_argument("--save_dir", type=str, default="example_out/pa_nms_posetrack/FPHA_demo/")
     parser.add_argument("--save_type", type=str, default="img")
     parser.add_argument("--det_thresh", type=float, default=0.2)
     parser.add_argument("--ckpt", type=str, default="weights/detector.pt")
@@ -224,7 +224,9 @@ if __name__ == "__main__":
 
     model = YOLO(args.ckpt)
 
-    for seq_name in tqdm(os.listdir(args.in_dir)):
+    for i, seq_name in enumerate(tqdm(sorted(os.listdir(args.in_dir)))):
+        if "FPHA" in args.in_dir and "symlink" in args.in_dir and i % 20 != 0:
+            continue
         frames, frame_names = get_frames(args, seq_name)
         if args.save_type == "video":
             first_frame = frames[0]
