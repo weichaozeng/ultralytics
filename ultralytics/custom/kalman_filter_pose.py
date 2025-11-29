@@ -8,7 +8,7 @@ class KalmanFilterPose:
     def __init__(self):
         self.ndim = 42 
         self.dt = 1.0
-        self.scale_factor = 50.0
+        self.scale_factor = 10.0
         # F = [[I, dt*I], [0, I]]
         self._motion_mat = np.eye(2 * self.ndim, 2 * self.ndim)
         for i in range(self.ndim):
@@ -17,9 +17,12 @@ class KalmanFilterPose:
         # H = [[I, 0]]
         self._update_mat = np.eye(self.ndim, 2 * self.ndim)
 
-        # 
-        self._std_weight_position = 1.0 / 20.0 
-        self._std_weight_velocity = 1.0 / 20.0
+        # noise in measurement
+        self._std_weight_measurement = 1.0 / 5.0
+
+        # noise in estimation
+        self._std_weight_motion_pos = 1.0 / 100.0 
+        self._std_weight_motion_vel = 1.0 / 20.0
 
     def initiate(self, measurement: np.ndarray):
         """
@@ -36,8 +39,8 @@ class KalmanFilterPose:
         mean_vel = np.zeros_like(mean_pos)
         mean = np.r_[mean_pos, mean_vel]
 
-        std_pos_kps = 2 * self._std_weight_position * self.scale_factor
-        std_vel_kps = 10 * self._std_weight_velocity * self.scale_factor
+        std_pos_kps = 2 * self._std_weight_measurement * self.scale_factor
+        std_vel_kps = 10 * self._std_weight_motion_vel * self.scale_factor
 
         std_pos_array = np.full(self.ndim, std_pos_kps)
         std_vel_array = np.full(self.ndim, std_vel_kps)
@@ -47,8 +50,8 @@ class KalmanFilterPose:
         return mean, covariance
     
     def predict(self, mean: np.ndarray, covariance: np.ndarray):
-        std_pos_kps = self._std_weight_position * self.scale_factor
-        std_vel_kps = self._std_weight_velocity * self.scale_factor
+        std_pos_kps = self._std_weight_motion_pos * self.scale_factor
+        std_vel_kps = self._std_weight_motion_vel * self.scale_factor
 
         std_pos = np.full(self.ndim, std_pos_kps)
         std_vel = np.full(self.ndim, std_vel_kps)
@@ -64,7 +67,7 @@ class KalmanFilterPose:
     
     def project(self, mean: np.ndarray, covariance: np.ndarray):
 
-        std_kps = self._std_weight_position * self.scale_factor
+        std_kps = self._std_weight_measurement * self.scale_factor
         std = np.full(self.ndim, std_kps)
         innovation_cov = np.diag(np.square(std))
 
@@ -120,8 +123,8 @@ class KalmanFilterPose:
             return mean, covariance
         
         N = mean.shape[0]
-        std_pos_kps = self._std_weight_position * self.scale_factor
-        std_vel_kps = self._std_weight_velocity * self.scale_factor
+        std_pos_kps = self._std_weight_motion_pos * self.scale_factor
+        std_vel_kps = self._std_weight_motion_vel * self.scale_factor
 
         std_pos = np.full((N, self.ndim), std_pos_kps)
         std_vel = np.full((N, self.ndim), std_vel_kps)
