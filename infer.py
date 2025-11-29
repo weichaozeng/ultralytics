@@ -227,18 +227,21 @@ if __name__ == "__main__":
     for i, seq_name in enumerate(tqdm(sorted(os.listdir(args.in_dir)))):
         if "FPHA" in args.in_dir and "symlink" in args.in_dir and i % 20 != 0:
             continue
-        frames, frame_names = get_frames(args, seq_name)
-        if args.save_type == "video":
-            first_frame = frames[0]
-            img_h, img_w = first_frame.shape[:2]
-            video_output_path = os.path.join(args.save_dir, f'{seq_name}.mp4')
-            video_writer = cv2.VideoWriter(video_output_path,
-                                        cv2.VideoWriter_fourcc(*'mp4v'), 30, (img_w, img_h)) 
-        else:
-            os.makedirs(args.save_dir, exist_ok=True)
-        
-        results = detect_track(args, model, frames, args.tracker)
-        save_results(args, frames, results, seq_name, frame_names)
+        try:
+            frames, frame_names = get_frames(args, seq_name)
+            if args.save_type == "video":
+                first_frame = frames[0]
+                img_h, img_w = first_frame.shape[:2]
+                video_output_path = os.path.join(args.save_dir, f'{seq_name}.mp4')
+                video_writer = cv2.VideoWriter(video_output_path,
+                                            cv2.VideoWriter_fourcc(*'mp4v'), 30, (img_w, img_h)) 
+            else:
+                os.makedirs(args.save_dir, exist_ok=True)
+            
+            results = detect_track(args, model, frames, args.tracker)
+            save_results(args, frames, results, seq_name, frame_names)
+        except Exception as e:
+            print(f"Error when tracking on {seq_name}: {e}")
 
 
 
