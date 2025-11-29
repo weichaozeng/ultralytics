@@ -128,7 +128,7 @@ def save_results(args, frames, results, seq_name, frame_names):
         img_h, img_w = frames[0].shape[:2]
         video_output_path = os.path.join(args.save_dir, f'{seq_name}.mp4')
         video_writer = cv2.VideoWriter(video_output_path,
-                                       cv2.VideoWriter_fourcc(*'H264'), 30, (img_w, img_h)) 
+                                       cv2.VideoWriter_fourcc(*'mp4v'), 30, (img_w, img_h)) 
     else:
         os.makedirs(os.path.join(args.save_dir, seq_name), exist_ok=True)
 
