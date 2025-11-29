@@ -230,15 +230,6 @@ if __name__ == "__main__":
             continue
         try:
             frames, frame_names = get_frames(args, seq_name)
-            os.makedirs(args.save_dir, exist_ok=True)
-            if args.save_type == "video":
-                first_frame = frames[0]
-                img_h, img_w = first_frame.shape[:2]
-
-                video_output_path = os.path.join(args.save_dir, f'{seq_name}.mp4')
-                video_writer = cv2.VideoWriter(video_output_path,
-                                            cv2.VideoWriter_fourcc(*'mp4v'), 30, (img_w, img_h)) 
-            
             results = detect_track(args, model, frames, args.tracker)
             save_results(args, frames, results, seq_name, frame_names)
         except Exception as e:
