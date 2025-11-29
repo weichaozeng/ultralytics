@@ -124,6 +124,7 @@ def detect_track(args, model, frames, tracker):
 def save_results(args, frames, results, seq_name, frame_names):
     seq_name = seq_name.split('.')[0]
     assert len(frames) == len(results), print(f"Lenght missmatch between frames {len(frames)} and results {len(results)}.")
+    os.makedirs(args.save_dir, exist_ok=True)
     if args.save_type == "video":
         img_h, img_w = frames[0].shape[:2]
         video_output_path = os.path.join(args.save_dir, f'{seq_name}.mp4')
