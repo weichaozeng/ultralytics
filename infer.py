@@ -229,6 +229,10 @@ if __name__ == "__main__":
     for i, seq_name in enumerate(tqdm(sorted(os.listdir(args.in_dir)))):
         if "FPHA" in args.in_dir and "symlink" in args.in_dir and i % 20 != 0:
             continue
+        if "H2O" in args.in_dir and i % 10 != 0:
+            continue
+        if "DexYCB" in args.in_dir and i % 200 != 0:
+            continue
         try:
             frames, frame_names = get_frames(args, seq_name)
             results = detect_track(args, model, frames, args.tracker)
