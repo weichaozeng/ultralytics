@@ -142,7 +142,8 @@ def save_results(args, frames, results, seq_name, frame_names):
             video_writer.write(vis_frame)
         else:
             cv2.imwrite(os.path.join(args.save_dir, seq_name, frame_names[i]), vis_frame)
-
+    if video_writer is not None:
+        video_writer.release()
 
 def draw_bbox(img_cv2, id, box, is_right):
     x1, y1, x2, y2, conf = box
