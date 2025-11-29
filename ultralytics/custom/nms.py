@@ -25,7 +25,7 @@ def pose_aware_non_max_suppression(
     conf_thres: float = 0.25,
     iou_thres: float = 0.45,
     classes=None,
-    agnostic: bool = False,
+    agnostic: bool = True, # False,
     multi_label: bool = False,
     labels=(),
     max_det: int = 300,
