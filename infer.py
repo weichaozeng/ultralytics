@@ -131,6 +131,7 @@ def save_results(args, frames, results, seq_name, frame_names):
         video_writer = cv2.VideoWriter(video_output_path,
                                        cv2.VideoWriter_fourcc(*'mp4v'), 30, (img_w, img_h)) 
     else:
+        video_writer = None
         os.makedirs(os.path.join(args.save_dir, seq_name), exist_ok=True)
 
     for i, frame in enumerate(frames):
