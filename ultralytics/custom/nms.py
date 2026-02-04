@@ -522,36 +522,41 @@ class TorchNMS:
 
             # only pose compare for iou > threshold
             candidate_mask = iou > iou_threshold
-            pose_reliable_mask = (valid_nums[i] >= 10) & (valid_nums[rest] >= 10)
-            active_candidate_mask = candidate_mask & pose_reliable_mask
-            if not active_candidate_mask.any():
+            if not candidate_mask.any():
                 order = rest
                 continue
+            pose_reliable_mask = (valid_nums[i] >= 10) & (valid_nums[rest] >= 10)
+            final_mask = torch.zeros_like(candidate_mask)
+
+
+            active_pose_mask = candidate_mask & pose_reliable_mask
+            if active_pose_mask.any():
+                target_indices = rest[active_pose_mask]
+                # point similarity
+                # (M, 20, 2) -> (M, 20)
+                diff_rel = rel_vecs[i:i+1] - rel_vecs[target_indices] 
+                point_norm = torch.norm(diff_rel, dim=2)
+                point_dissim = 1.0 - torch.exp(-5.0 * (point_norm**2))
+
+                # bone consine similarity
+                # (1, 20, 2) * (M, 20, 2) -> (M, 20)
+                cos_sim = torch.sum(bone_vecs_norm[i:i+1] * bone_vecs_norm[target_indices], dim=2)
+                bone_dissim = 1.0 - (cos_sim + 1.0) / 2.0
+
+                # weighted
+                w_i = pair_weights[i:i+1] # (1, 20)
+                w_target = pair_weights[target_indices] # (M, 20)
+                combined_weights = torch.minimum(w_i, w_target).clamp(min=1e-6) # (M, 20)
+
+                m_point_d = torch.sum(point_dissim * combined_weights, dim=1) / torch.sum(combined_weights, dim=1)
+                m_bone_d = torch.sum(bone_dissim * combined_weights, dim=1) / torch.sum(combined_weights, dim=1)
+
+                suppress = (m_point_d < point_threshold) & (m_bone_d < bone_threshold)
+                final_mask[active_pose_mask] = suppress
             
-            target_indices = rest[active_candidate_mask]
-
-            # point similarity
-            # (M, 20, 2) -> (M, 20)
-            diff_rel = rel_vecs[i:i+1] - rel_vecs[target_indices] 
-            point_norm = torch.norm(diff_rel, dim=2)
-            point_dissim = 1.0 - torch.exp(-5.0 * (point_norm**2))
-
-            # bone consine similarity
-            # (1, 20, 2) * (M, 20, 2) -> (M, 20)
-            cos_sim = torch.sum(bone_vecs_norm[i:i+1] * bone_vecs_norm[target_indices], dim=2)
-            bone_dissim = 1.0 - (cos_sim + 1.0) / 2.0
-
-            # weighted
-            w_i = pair_weights[i:i+1] # (1, 20)
-            w_target = pair_weights[target_indices] # (M, 20)
-            combined_weights = torch.minimum(w_i, w_target).clamp(min=1e-6) # (M, 20)
-
-            m_point_d = torch.sum(point_dissim * combined_weights, dim=1) / torch.sum(combined_weights, dim=1)
-            m_bone_d = torch.sum(bone_dissim * combined_weights, dim=1) / torch.sum(combined_weights, dim=1)
-
-            suppress = (m_point_d < point_threshold) & (m_bone_d < bone_threshold)
-            final_mask = active_candidate_mask.clone()
-            final_mask[active_candidate_mask] = suppress
+            fallback_mask = candidate_mask & (~pose_reliable_mask)
+            if fallback_mask.any():
+                final_mask[fallback_mask] = True
 
             order = rest[~final_mask]
 
