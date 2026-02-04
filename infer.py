@@ -97,8 +97,12 @@ def detect_track(args, model, frames, tracker):
                 with autocast():
                     if tracker == "posetrack":
                         result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False, tracker="./ultralytics/custom/posetrack.yaml")
+                    elif tracker == "bytetrack":
+                        result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False, tracker="./ultralytics/cfg/bytetrack.yaml")
+                    elif tracker == "botsort":
+                        result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False, tracker="./ultralytics/cfg/botsort.yaml")
                     else:
-                        result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False)
+                        raise ValueError(f"Unsupported tracker type: {tracker}")
                     if not result[0].boxes.id is None:
                         track_id = result[0].boxes.id.cpu().numpy()
                         boxes = result[0].boxes.xyxy.cpu().numpy()
@@ -215,11 +219,11 @@ def draw_pose(img_cv2, pose, thresh=0.5, K=21):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference")
-    parser.add_argument("--in_dir", type=str, default="example_data/FPHA_demo/")
-    parser.add_argument("--in_type", type=str, choices=["video", "rgb", "color", ""], default="color")
-    parser.add_argument("--save_dir", type=str, default="example_out/pa_nms_posetrack/FPHA_demo/")
+    parser.add_argument("--in_dir", type=str, default="example_data/videos/")
+    parser.add_argument("--in_type", type=str, choices=["video", "rgb", "color", ""], default="video")
+    parser.add_argument("--save_dir", type=str, default="example_out/pa_nms_posetrack/videos/")
     parser.add_argument("--save_type", type=str, default="img")
-    parser.add_argument("--det_thresh", type=float, default=0.2)
+    parser.add_argument("--det_thresh", type=float, default=0.1)
     parser.add_argument("--ckpt", type=str, default="weights/detector.pt")
     parser.add_argument("--tracker", type=str, default="posetrack")
 
