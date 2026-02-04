@@ -483,6 +483,8 @@ class TorchNMS:
         kps = poses.reshape(N, 21, 2)  # (N, 21, 2)
         parent_idx = BONE_CONNECTIONS[:, 0] # (20,)
         child_idx = BONE_CONNECTIONS[:, 1]  # (20,)
+        node_valid = pose_scores > 0.5
+        valid_nums = node_valid.sum(dim=1)
 
         # P_child - P_parent
         # (N, 20, 2)
@@ -519,11 +521,13 @@ class TorchNMS:
 
             # only pose compare for iou > threshold
             candidate_mask = iou > iou_threshold
-            if not candidate_mask.any():
+            pose_reliable_mask = (valid_nums[i] >= 10) & (valid_nums[rest] >= 10)
+            active_candidate_mask = candidate_mask & pose_reliable_mask
+            if not active_candidate_mask.any():
                 order = rest
                 continue
             
-            target_indices = rest[candidate_mask]
+            target_indices = rest[active_candidate_mask]
 
             # point similarity
             # (M, 20, 2) -> (M, 20)
@@ -545,8 +549,8 @@ class TorchNMS:
             m_bone_d = torch.sum(bone_dissim * combined_weights, dim=1) / torch.sum(combined_weights, dim=1)
 
             suppress = (m_point_d < point_threshold) & (m_bone_d < bone_threshold)
-            final_mask = candidate_mask.clone()
-            final_mask[candidate_mask] = suppress
+            final_mask = active_candidate_mask.clone()
+            final_mask[active_candidate_mask] = suppress
 
             order = rest[~final_mask]
 
