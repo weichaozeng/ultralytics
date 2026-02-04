@@ -157,6 +157,7 @@ def pose_aware_non_max_suppression(
             boxes = torch.cat((x[:, :2] + c, x[:, 2:4], x[:, -1:]), dim=-1)  # xywhr
             i = TorchNMS.fast_nms(boxes, scores, iou_thres, iou_func=batch_probiou)
         else:
+            boxes = x[:, :4]
             # boxes = x[:, :4] + c  # boxes (offset by class)
 
             # Speed strategy: torchvision for val or already loaded (faster), TorchNMS for predict (lower latency)
