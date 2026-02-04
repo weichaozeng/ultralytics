@@ -222,7 +222,7 @@ if __name__ == "__main__":
     parser.add_argument("--in_dir", type=str, default="example_data/videos/")
     parser.add_argument("--in_type", type=str, choices=["video", "rgb", "color", ""], default="video")
     parser.add_argument("--save_dir", type=str, default="example_out/pa_nms_posetrack/videos/")
-    parser.add_argument("--save_type", type=str, default="img")
+    parser.add_argument("--save_type", type=str, default="video")
     parser.add_argument("--det_thresh", type=float, default=0.1)
     parser.add_argument("--ckpt", type=str, default="weights/detector.pt")
     parser.add_argument("--tracker", type=str, default="posetrack")
