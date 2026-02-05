@@ -7,7 +7,7 @@ from ultralytics.trackers.byte_tracker import BYTETracker
 from ultralytics.trackers.bot_sort import BOTSORT, BOTrack
 
 from ultralytics.trackers.utils.kalman_filter import KalmanFilterXYWH
-from ultralytics.custom.kalman_filter_pose import KalmanFilterPose
+from ultralytics.custom.kalman_filter_pose import KalmanFilterPose, KalmanFilterPose_Polar
 
 from ultralytics.trackers.utils import matching
 
@@ -17,6 +17,7 @@ class PTrack(BOTrack):
     
     shared_kalman = KalmanFilterXYWH()
     shared_kalman_pose = KalmanFilterPose()
+    # shared_kalman_pose = KalmanFilterPose_Polar()
 
     def __init__(self, xywh: np.ndarray, score: float, cls: int, pxy: np.ndarray, pscore: np.ndarray, feat: np.ndarray | None = None, feat_history: int = 50
     ):
@@ -29,12 +30,22 @@ class PTrack(BOTrack):
         self.kps_pos = pxy.flatten()
         self.kps_score = pscore.flatten()
 
+        # Inertial Path
         self.pose_kalman_filter = None
         self.pose_mean, self.pose_covariance = None, None
 
+        # Static Path
+        self.static_pose_mean = None
+        self.static_pose_covariance = None
+
+    def mark_lost(self):
+        super().mark_lost()
+        if self.pose_mean is not None:
+            self.static_pose_mean = self.pose_mean.copy()
+            self.static_pose_covariance = self.pose_covariance.copy()
+
     def predict(self):
         super().predict()
-
         if self.pose_mean is not None and self.pose_kalman_filter is not None:
             pose_mean_state = self.pose_mean.copy()
             self.pose_mean, self.pose_covariance = self.pose_kalman_filter.predict(pose_mean_state, self.pose_covariance)
@@ -48,8 +59,8 @@ class PTrack(BOTrack):
         multi_covariance = np.asarray([st.covariance for st in stracks])
         for i, st in enumerate(stracks):
             if st.state != TrackState.Tracked:
-                multi_mean[i][6] = 0
-                multi_mean[i][7] = 0
+                multi_mean[i][6] = 0 # v_w
+                multi_mean[i][7] = 0 # v_h
         multi_mean, multi_covariance = PTrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
 
         # pose
