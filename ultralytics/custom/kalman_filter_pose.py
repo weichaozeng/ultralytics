@@ -264,15 +264,12 @@ class KalmanFilterPose:
         """
         measurements: (M, 40)
         """
-        print("1111")
         projected_mean, projected_cov = self.project(mean, covariance, confidence=None)
-        print("2222")
         r_std = np.full(40, self._std_weight_measurement) 
         R_static = np.diag(np.square(r_std))
         S = projected_cov + R_static
         
         # d = z - z_hat
-        print(measurements.shape, projected_mean.shape, projected_cov.shape, R_static.shape)
         d = measurements - projected_mean # (M, 40)
         
         if metric == "maha":
@@ -280,7 +277,6 @@ class KalmanFilterPose:
                 cholesky_factor = np.linalg.cholesky(S)
                 z = scipy.linalg.solve_triangular(
                     cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
-                print("3333")
                 return np.sum(z * z, axis=0) # (M,)
             except np.linalg.LinAlgError:
                 return np.sum(d**2, axis=1)
