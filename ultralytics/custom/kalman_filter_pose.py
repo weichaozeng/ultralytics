@@ -228,6 +228,8 @@ class KalmanFilterPose:
         # S = H * P * H.T + R
         projected_cov = np.linalg.multi_dot((self._update_mat, covariance, self._update_mat.T))
         
+        print(self._update_mat.shape, covariance.shape, innovation_cov.shape)
+
         return projected_mean, projected_cov + innovation_cov
     
     def update(self, mean, covariance, measurement, confidences):

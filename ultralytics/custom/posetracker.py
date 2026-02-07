@@ -383,11 +383,9 @@ class PoseTracker(BOTSORT):
             print("2222")
             if track.state == TrackState.Lost and track.static_mean is not None:
                 # Pose Gating for static
-                print("3333")
                 d_pose_static = self.pose_kalman_filter.gating_distance(
                     track.static_pose_mean, track.static_pose_covariance, det_poses, det_pose_scores
                 )
-                print("4444")
                 gating_dists = np.minimum(d_pose_inertial, d_pose_static)
                 # Box iou for static
                 dt = self.frame_id - track.end_frame
