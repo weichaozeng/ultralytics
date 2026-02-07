@@ -24,31 +24,54 @@ class PTrack(BOTrack):
     shared_kalman = KalmanFilterXYWH()
     shared_kalman_pose = KalmanFilterPose()
     # shared_kalman_pose = KalmanFilterPose_Polar()
+    BONE_CONNECTIONS = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [0,9],[9,10],[10,11],[11,12],
+    [0,13],[13,14],[14,15],[15,16],
+    [0,17],[17,18],[18,19],[19,20]
+]
 
     def __init__(self, xywh: np.ndarray, score: float, cls: int, pxy: np.ndarray, pscore: np.ndarray, feat: np.ndarray | None = None, feat_history: int = 50
     ):
-        super().__init__(xywh, score, cls, feat, feat_history)
-    
+
         M = self.shared_kalman_pose.ndim 
         assert pxy.size == M, f"Expected {M} dimensions for pxy but got {pxy.size}"
         assert pscore.size == M // 2, f"Expected {M // 2} scores but got {pscore.size}"
 
-        self.kps_pos = pxy.flatten()
-        self.kps_score = pscore.flatten()
+        self.obs_scale = np.sqrt(xywh[2]**2 + xywh[3]**2) + 1e-6
+        self.wrist_rel_to_box = (pxy[0] - xywh[:2]) / self.obs_scale
 
-        # (0: left, 1: right)
+        _rel_pose, _rel_pose_score = self._encode_to_relative(pxy, pscore, self.obs_scale)
+
+        super().__init__(xywh, score, cls, feat, feat_history)
+        self.pose = _rel_pose            
+        self.pose_score = _rel_pose_score 
+        self.raw_pixel_kps = pxy.copy()
+        self.raw_pixel_kps_score = pscore.copy()
+
+        # handedness 0: left, 1: right
         self.handedness = float(cls)
-        self.handedness_weight_sum = 0.5 * score + 0.5 * np.mean(self.kps_score)
+        self.handedness_weight_sum = 0.5 * score + 0.5 * np.mean(pscore)
 
-        # Inertial Path Pose
+        # Inertial Path 
         self.pose_kalman_filter = None
         self.pose_mean, self.pose_covariance = None, None
 
-        # Static Path Pose and Box
+        # Static Path 
+        self.static_mean = None
+        self.static_covariance = None
         self.static_pose_mean = None
         self.static_pose_covariance = None
-        self.static_mean = None
-        self.static_pose_covariance = None
+        self.static_wrist_rel_to_box = None
+
+    def _encode_to_relative(self, pxy, pscore, scale):
+        rel_pos = []
+        rel_score = []
+        for p, c in PTrack.BONE_CONNECTIONS:
+            rel_pos.append((pxy[c] - pxy[p]) / scale)
+            rel_score.append(min(pscore[p], pscore[c]))
+        return np.array(rel_pos).flatten(), np.array(rel_score).flatten()
 
     def mark_lost(self):
         super().mark_lost()
@@ -58,14 +81,57 @@ class PTrack(BOTrack):
         if self.pose_mean is not None:
             self.static_pose_mean = self.pose_mean.copy()
             self.static_pose_covariance = self.pose_covariance.copy()
-        
+            self.static_wrist_rel_to_box = self.wrist_rel_to_box.copy()
 
-    def predict(self):
-        super().predict()
-        if self.pose_mean is not None and self.pose_kalman_filter is not None:
-            self.pose_mean, self.pose_covariance = self.pose_kalman_filter.predict(
-                self.pose_mean, self.pose_covariance
-            )
+    def _update_handedness(self, score, pose_score, cls):
+        new_w = 0.5 * score + 0.5 * np.mean(pose_score)
+        total_w = self.handedness_weight_sum + new_w
+        self.handedness = (self.handedness * self.handedness_weight_sum + float(cls) * new_w) / total_w
+        self.handedness_weight_sum = total_w
+        self.cls = int(self.handedness + 0.5)
+
+    def activate(self, kalman_filter, pose_kalman_filter, frame_id):
+        super().activate(kalman_filter, frame_id)
+        self.pose_kalman_filter = pose_kalman_filter
+        self.pose_mean, self.pose_covariance = self.pose_kalman_filter.initiate(self.pose)
+
+    def re_activate(self, new_det, frame_id, new_id = False):
+        new_scale = np.sqrt(new_det.xywh[2]**2 + new_det.xywh[3]**2) + 1e-6
+        rel_pose, rel_score = self._encode_to_relative(new_det.raw_pixel_kps, new_det.raw_pixel_kps_score, new_scale)
+        
+        super().re_activate(new_det, frame_id, new_id)
+        self._update_handedness(new_det.score, new_det.raw_pixel_kps_score, new_det.cls)
+        
+        self.pose_mean, self.pose_covariance = self.pose_kalman_filter.update(
+            self.pose_mean, self.pose_covariance, rel_pose, rel_score
+        )
+        self.pose, self.pose_score = rel_pose, rel_score
+        self.raw_pixel_kps = new_det.raw_pixel_kps.copy()
+        self.raw_pixel_kps_score = new_det.raw_pixel_kps_score.copy()
+        self.static_mean = self.static_pose_mean = self.static_wrist_rel_to_box = None
+        self.static_covariance = self.static_pose_covariance = None
+
+
+    def update(self, new_det, frame_id):
+        self.obs_scale = np.sqrt(new_det.xywh[2]**2 + new_det.xywh[3]**2) + 1e-6
+        self.wrist_rel_to_box = (new_det.raw_pixel_kps[0] - new_det.xywh[:2]) / self.obs_scale
+        
+        rel_pose, rel_score = self._encode_to_relative(
+            new_det.raw_pixel_kps, 
+            new_det.raw_pixel_kps_score,
+            self.obs_scale
+        )
+        
+        super().update(new_det, frame_id)
+        self._update_handedness(new_det.score, new_det.raw_pixel_kps_score, new_det.cls)
+        
+        self.pose_mean, self.pose_covariance = self.pose_kalman_filter.update(
+            self.pose_mean, self.pose_covariance, rel_pose, rel_score
+        )
+
+        self.pose, self.pose_score = rel_pose, rel_score
+        self.raw_pixel_kps = new_det.raw_pixel_kps.copy()
+        self.raw_pixel_kps_score = new_det.raw_pixel_kps_score.copy()
 
     @staticmethod
     def multi_predict(stracks: list[PTrack]):
@@ -89,103 +155,57 @@ class PTrack(BOTrack):
             multi_pose_mean = np.asarray([st.pose_mean.copy() for st in pose_tracks])
             multi_pose_covariance = np.asarray([st.pose_covariance for st in pose_tracks])
 
-        multi_pose_mean, multi_pose_covariance = PTrack.shared_kalman_pose.multi_predict(multi_pose_mean, multi_pose_covariance)
-        
-        for i, st in enumerate(pose_tracks):
-                st.pose_mean = multi_pose_mean[i]
-                st.pose_covariance = multi_pose_covariance[i]
-        
-    def _update_handedness(self, new_track):
-        new_score = new_track.score
-        new_pscore = np.mean(new_track.kps_score)
-        new_weight = 0.5 * new_score + 0.5 * new_pscore
-
-        total_weight = self.handedness_weight_sum + new_weight
-        self.handedness = (self.handedness * self.handedness_weight_sum + 
-                           float(new_track.cls) * new_weight) / total_weight
-        self.handedness_weight_sum = total_weight
-        self.cls = int(self.handedness + 0.5)
-
-
-    def activate(self, kalman_filter, pose_kalman_filter, frame_id):
-        super().activate(kalman_filter, frame_id)
-        self.pose_kalman_filter = pose_kalman_filter
-        self.pose_mean, self.pose_covariance = self.pose_kalman_filter.initiate(self.kps_pos)
-
-    def re_activate(self, new_track, frame_id, new_id = False):
-        super().re_activate(new_track, frame_id, new_id)
-        self._update_handedness(new_track)
-        self.pose_mean, self.pose_covariance = self.pose_kalman_filter.update(
-            self.pose_mean, self.pose_covariance, new_track.kps_pos, new_track.kps_score
-        )
-        self.kps_pos = new_track.kps_pos
-        self.kps_score = new_track.kps_score
-
-        # close static path
-        self.static_pose_mean = None
-        self.static_pose_covariance = None
-        self.static_mean = None
-        self.static_pose_covariance = None
-
-    def update(self, new_track, frame_id):
-        super().update(new_track, frame_id)
-        self._update_handedness(new_track)
-        self.pose_mean, self.pose_covariance = self.pose_kalman_filter.update(
-            self.pose_mean, self.pose_covariance, new_track.kps_pos, new_track.kps_score
-        )
-        self.kps_pos = new_track.kps_pos
-        self.kps_score = new_track.kps_score
+            multi_pose_mean, multi_pose_covariance = PTrack.shared_kalman_pose.multi_predict(multi_pose_mean, multi_pose_covariance)
             
+            for i, st in enumerate(pose_tracks):
+                    st.pose_mean = multi_pose_mean[i]
+                    st.pose_covariance = multi_pose_covariance[i]
+                
     @staticmethod
     def multi_gmc(tracks, H: np.ndarray = np.eye(2, 3)):
-        # Rot and Trans for bbox; Rot for rel pose;
-        # bbox
         if not tracks:
             return
     
         R = H[:2, :2] 
         t = H[:2, 2]  
+        # Bbox
         R8x8 = np.kron(np.eye(4, dtype=float), R)
-        multi_bbox_mean = np.asarray([t.mean.copy() for t in tracks])
-        multi_bbox_cov = np.asarray([t.covariance for t in tracks])
+        for st in tracks:
+            st.mean = R8x8.dot(st.mean)
+            st.mean[:2] += t
+            st.covariance = R8x8.dot(st.covariance).dot(R8x8.T)
 
-        for i, (mean, cov) in enumerate(zip(multi_bbox_mean, multi_bbox_cov)):
-            mean = R8x8.dot(mean)
-            mean[:2] += t
-            cov = R8x8.dot(cov).dot(R8x8.transpose())      
-            
-            tracks[i].mean = mean
-            tracks[i].covariance = cov
-
-        # pose
+        # Pose
         pose_tracks = [t for t in tracks if t.pose_mean is not None]
-        if not pose_tracks:
-            return
-        
-        pose_means = np.asarray([t.pose_mean.copy() for t in pose_tracks])
-        pose_covs = np.asarray([t.pose_covariance for t in pose_tracks])
-        M = PTrack.shared_kalman_pose.ndim
-        R_rel_pos = np.kron(np.eye(M // 2, dtype=float), R)
-        R_pose_total = np.kron(np.eye(2, dtype=float), R_rel_pos)
-        
-        for i, (mean, cov) in enumerate(zip(pose_means, pose_covs)):
-            mean = R_pose_total.dot(mean)
-            cov = R_pose_total.dot(cov).dot(R_pose_total.transpose())
-            pose_tracks[i].pose_mean = mean
-            pose_tracks[i].pose_covariance = cov
+        if pose_tracks:
+            M = PTrack.shared_kalman_pose.ndim
+            R_rel = np.kron(np.eye(M // 2, dtype=float), R)
+            R_pose_total = np.kron(np.eye(2, dtype=float), R_rel)
+            for st in pose_tracks:
+                st.pose_mean = R_pose_total.dot(st.pose_mean)
+                st.pose_covariance = R_pose_total.dot(st.pose_covariance).dot(R_pose_total.T)
 
     @property
     def pxyxy(self):
         if self.pose_mean is None:
-             return self.kps_pos
+             return self.raw_pixel_kps.flatten()
+        curr_xy = self.mean[:2]
+        curr_wh = self.mean[2:4]
+        curr_scale = np.sqrt(curr_wh[0]**2 + curr_wh[1]**2) + 1e-6
         M = self.shared_kalman_pose.ndim
-        return self.pose_mean[:M].copy()
-    
+        rel_vecs = self.pose_mean[:M].reshape(20, 2)
+        pixel_kps = np.zeros((21, 2), dtype=np.float32)
+        anchor_off = self.static_wrist_rel_to_box if self.state == TrackState.Lost else self.wrist_rel_to_box
+        pixel_kps[0] = curr_xy + anchor_off * curr_scale
+        for i, (p, c) in enumerate(PTrack.BONE_CONNECTIONS):
+            pixel_kps[c] = pixel_kps[p] + rel_vecs[i] * curr_scale
+        return pixel_kps.flatten()
+
     @property
     def result(self):
         coords = self.xyxy if self.angle is None else self.xywha
         kps = self.pxyxy.tolist()
-        kps_score = self.kps_score.tolist()
+        kps_score = self.raw_pixel_kps_score.tolist()
         output_list = [
             *coords.tolist(),
             self.track_id,
@@ -203,35 +223,217 @@ class PoseTracker(BOTSORT):
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = KalmanFilterPose()
         self.pose_gate_thresh = getattr(args, 'pose_gate_thresh', 60.0) 
+        self.first_match_thresh = getattr(args, 'first_match_thresh', 0.8)
+        self.second_match_thresh = getattr(args, 'second_match_thresh', 0.5)
+        self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.7)
 
-    def encode_skeleton(self, pxy_21, pscore_21, xywh):
-        scale = np.sqrt(xywh[2]**2 + xywh[3]**2) + 1e-6
-        rel_pos = [(pxy_21[c] - pxy_21[p]) / scale for p, c in BONE_CONNECTIONS]
-        rel_score = [min(pscore_21[p], pscore_21[c]) for p, c in BONE_CONNECTIONS]
-        return np.array(rel_pos).flatten(), np.array(rel_score)
+        # for get_dists
+        self.W_POSE = 0.6
+        self.W_REID = 0.3
+        self.W_IOU  = 0.1
     
     def init_track(self, dets, poses, img=None):
         if len(dets) == 0: 
             return []
         bboxes = dets.xywhr if hasattr(dets, "xywhr") else dets.xywh
-        bboxes_with_idx = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
-
+        
         features_keep = []
         if self.args.with_reid and self.encoder is not None and img is not None:
+            bboxes_with_idx = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
             features_keep = self.encoder(img, bboxes_with_idx)
 
         detections = []
-        for i, (xywh, score, cls) in enumerate(zip(bboxes, dets.conf, dets.cls)):
-            pxy_rel, pscore_rel = self.encode_skeleton(poses.xy[i], poses.conf[i], xywh)
+        for i, (xywh, score, cls, pxy, pscore) in enumerate(zip(bboxes, dets.conf, dets.cls, dets.keypoints.xy, dets.keypoints.conf)):
             feat = features_keep[i] if (features_keep is not None and len(features_keep) > i) else None
-            track = PTrack(xywh, score, cls, pxy_rel, pscore_rel, feat)
+            track = PTrack(xywh, score, cls, pxy, pscore, feat)
             track.pose_kalman_filter = self.pose_kalman_filter
             track.kalman_filter = self.kalman_filter
             detections.append(track)
         return detections
     
+    def update(self, dets, poses, img, feats):
+        self.frame_id += 1
+
+        pose_scores = np.mean(poses.conf, axis=1)
+        combined_scores = 0.5 * dets.conf + 0.5 * pose_scores
+
+        mask_high = combined_scores >= self.args.track_high_thresh
+        mask_second = (combined_scores < self.args.track_high_thresh) & (combined_scores > self.args.track_low_thresh)
+
+        feats_high = feats[mask_high] if feats is not None else None
+        feats_second = feats[mask_second] if feats is not None else None
+
+        detections = self.init_track(
+            dets.xywh[mask_high], dets.conf[mask_high], dets.cls[mask_high],
+            poses.xy[mask_high], poses.conf[mask_high], feats_high
+        )
+        detections_second = self.init_track(
+            dets.xywh[mask_second], dets.conf[mask_second], dets.cls[mask_second],
+            poses.xy[mask_second], poses.conf[mask_second], feats_second
+        )
+
+        unconfirmed = [t for t in self.tracked_stracks if not t.is_activated]
+        tracked_stracks = [t for t in self.tracked_stracks if t.is_activated]
+        strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
+
+        PTrack.multi_predict(strack_pool)
+        if hasattr(self, "gmc") and img is not None:
+            warp = self.gmc.apply(img, dets.xyxy[mask_high])
+            PTrack.multi_gmc(strack_pool, warp)
+            PTrack.multi_gmc(unconfirmed, warp)
+
+        # First Association
+        dists = self.get_dists(strack_pool, detections)
+        matches, u_track, u_det = matching.linear_assignment(dists, self.first_match_thresh)
+        for itracked, idet in matches:
+            track = strack_pool[itracked]
+            det = detections[idet]
+            if track.state == TrackState.Tracked:
+                track.update(det, self.frame_id)
+            else:
+                track.re_activate(det, self.frame_id, new_id=False)
+        
+        # Second Association
+        # r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+        r_strack_pool = [strack_pool[i] for i in u_track]
+        dists_second = self.get_iou_dists(r_strack_pool, detections_second)
+        matches_second, u_track_second, u_det_second = matching.linear_assignment(dists_second, self.second_match_thresh)
+
+        for itracked, idet in matches_second:
+            track = r_strack_pool[itracked]
+            det = detections_second[idet]
+            if track.state == TrackState.Tracked:
+                track.update(det, self.frame_id)
+            else:
+                track.re_activate(det, self.frame_id, new_id=False)
+
+        for it in u_track_second:
+            track = r_strack_pool[it]
+            if track.state == TrackState.Tracked:
+                track.mark_lost()
+
+        # Third for unconfirmed tracks and remaining detections
+        detections_remaining = [detections[i] for i in u_det]
+        dists_unconfirmed = self.get_dists(unconfirmed, detections_remaining)
+        matches_unconf, u_unconf, u_det_unconf = matching.linear_assignment(dists_unconfirmed, self.unconf_match_thresh)
+
+        for itracked, idet in matches_unconf:
+            unconfirmed[itracked].update(detections_remaining[idet], self.frame_id)
+        
+        for it in u_unconf:
+            unconfirmed[it].mark_removed()
+
+        for inew in u_det_unconf:
+            track = detections_remaining[inew]
+            # no need for pose score since new tracks
+            if track.score < self.args.new_track_thresh:
+                continue
+            track.activate(self.kalman_filter, self.pose_kalman_filter, self.frame_id)
+            self.tracked_stracks.append(track)
+        
+        # Fourth for time out lost tracks
+        for track in self.lost_stracks:
+            if self.frame_id - track.end_frame > self.max_time_lost:
+                track.mark_removed()
+
+        self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
+        self.lost_stracks = [t for t in self.lost_stracks if t.state == TrackState.Lost]
+        self.removed_stracks = [t for t in self.removed_stracks if t.state == TrackState.Removed]
+
+        return [x.result for x in self.tracked_stracks if x.is_activated]
+        # if visualize
+        # return [x.result for x in self.tracked_stracks if x.is_activated or x.state == TrackState.Lost]
+    
+    def get_iou_dists(self, tracks, detections):
+        M, N = len(tracks), len(detections)
+        dists = np.ones((M, N), dtype=np.float32)
+        
+        if M == 0 or N == 0:
+            return dists
+        
+        det_means = np.asarray([d.mean for d in detections])
+        for i, track in enumerate(tracks):
+            iou_inertial = matching.iou_distance([track], detections)[0]
+            if track.state == TrackState.Lost and track.static_mean is not None:
+                dt = self.frame_id - track.end_frame
+                growth = min(1.0 + 0.02 * dt, 1.4)
+                expanded_static_mean = track.static_mean.copy()
+                expanded_static_mean[2:4] *= growth
+                iou_static = matching.iou_distance(expanded_static_mean, det_means)
+                dists[i] = np.minimum(iou_inertial, iou_static)
+            else:
+                dists[i] = iou_inertial
+        return dists
+
+
     def get_dists(self, tracks, detections):
- 
+        M, N = len(tracks), len(detections)
+        dists = np.ones((M, N), dtype=np.float32)
+
+        det_means = np.asarray([d.mean for d in detections])       # (N, 4) [cx, cy, w, h]
+        det_poses = np.asarray([d.pose for d in detections])       # (N, 40) 
+        det_pose_scores = np.asarray([d.pose_score for d in detections]) # (N, 20)
+
+        for i, track in enumerate(tracks):
+            iou_inertial = matching.iou_distance([track], detections)[0]
+            d_pose_inertial = self.pose_kalman_filter.gating_distance(
+                track.pose_mean, track.pose_covariance, det_poses, det_pscores)
+            
+            if track.state == TrackState.Lost and track.static_mean is not None:
+                # Pose Gating for static
+                d_pose_static = self.pose_kalman_filter.gating_distance(
+                    track.static_pose_mean, track.static_pose_covariance, det_poses, det_pose_scores
+                )
+                gating_dists = np.minimum(d_pose_inertial, d_pose_static)
+                # Box iou for static
+                dt = self.frame_id - track.end_frame
+                growth = min(1.0 + 0.02 * dt, 1.4)
+                expanded_static_mean = track.static_mean.copy()
+                expanded_static_mean[2:4] *= growth
+                
+                iou_static = self.iou_distance_raw(expanded_static_mean, det_means)
+                iou_dists = np.minimum(iou_inertial, iou_static)
+            else:
+                gating_dists = d_pose_inertial
+                iou_dists = iou_inertial
+
+            pose_sim = self.batch_cosine_similarity(track.pose, det_poses, det_pose_scores)
+            pose_disim = (1.0 - pose_sim) / 2.0
+
+            if self.args.with_reid and track.curr_feat is not None:
+                reid_dists = matching.embedding_distance([track], detections)[0]
+            else:
+                reid_dists = np.ones(N, dtype=np.float32)
+
+
+            for j in range(N):
+                if iou_dists[j] < 0.85 and gating_dists[j] < self.pose_gate_thresh:
+                    dists[i, j] = (pose_disim[j] * self.W_POSE + 
+                                   reid_dists[j] * self.W_REID + 
+                                   iou_dists[j]  * self.W_IOU)
+                else:
+                    dists[i, j] = 1.0
+        return dists
+    
+    def batch_cosine_similarity(self, track_pose, det_poses, det_pose_scores):
+        N = det_poses.shape[0]
+        if N == 0:
+            return np.array([], dtype=np.float32)
+
+        t_v = track_pose.reshape(20, 2)
+        d_vs = det_poses.reshape(-1, 20, 2)
+
+        t_v_unit = t_v / (np.linalg.norm(t_v, axis=1, keepdims=True) + 1e-6)
+        d_vs_unit = d_vs / (np.linalg.norm(d_vs, axis=2, keepdims=True) + 1e-6)
+
+        cos_matrix = np.einsum('jk,ijk->ij', t_v_unit, d_vs_unit)
+        weights = det_pose_scores
+        weights_sum = np.sum(weights, axis=1, keepdims=True) + 1e-6
+
+        weighted_cos_sim = np.sum(cos_matrix * weights, axis=1, keepdims=True) / weights_sum
+
+        return np.clip(weighted_cos_sim.flatten(), -1.0, 1.0)
+
 
 # class PoseTracker(BOTSORT):
 #     def __init__(self, args, frame_rate = 30):
