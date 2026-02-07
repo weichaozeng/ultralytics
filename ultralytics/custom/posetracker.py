@@ -263,7 +263,7 @@ class PoseTracker(BOTSORT):
     
     def update(self, dets, poses, img, feats):
         self.frame_id += 1
-
+        print("11111")
         pose_scores = np.mean(poses.conf, axis=1)
         combined_scores = 0.5 * dets.conf + 0.5 * pose_scores
 
@@ -272,7 +272,7 @@ class PoseTracker(BOTSORT):
 
         feats_high = feats[mask_high] if feats is not None else None
         feats_second = feats[mask_second] if feats is not None else None
-
+        print("22222")
         detections = self.init_track(
             dets.xywh[mask_high], dets.conf[mask_high], dets.cls[mask_high],
             poses.xy[mask_high], poses.conf[mask_high], feats_high
@@ -281,7 +281,7 @@ class PoseTracker(BOTSORT):
             dets.xywh[mask_second], dets.conf[mask_second], dets.cls[mask_second],
             poses.xy[mask_second], poses.conf[mask_second], feats_second
         )
-
+        print("33333")
         unconfirmed = [t for t in self.tracked_stracks if not t.is_activated]
         tracked_stracks = [t for t in self.tracked_stracks if t.is_activated]
         strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
