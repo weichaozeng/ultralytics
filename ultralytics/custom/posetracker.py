@@ -232,23 +232,35 @@ class PoseTracker(BOTSORT):
         self.W_REID = 0.3
         self.W_IOU  = 0.1
     
-    def init_track(self, dets, poses, img=None):
-        if len(dets) == 0: 
+    def init_track(self, bboxes, scores, clses, poses_xy, poses_conf, feats=None):
+        """
+        bboxes: (N, 4) or (N, 5)
+        scores: (N,)
+        clses: (N,)
+        poses_xy: (N, 21, 2)
+        poses_conf: (N, 21)
+        feats: (N, D) or None
+        """
+        if len(bboxes) == 0:
             return []
-        bboxes = dets.xywhr if hasattr(dets, "xywhr") else dets.xywh
-        
-        features_keep = []
-        if self.args.with_reid and self.encoder is not None and img is not None:
-            bboxes_with_idx = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
-            features_keep = self.encoder(img, bboxes_with_idx)
 
         detections = []
-        for i, (xywh, score, cls, pxy, pscore) in enumerate(zip(bboxes, dets.conf, dets.cls, dets.keypoints.xy, dets.keypoints.conf)):
-            feat = features_keep[i] if (features_keep is not None and len(features_keep) > i) else None
-            track = PTrack(xywh, score, cls, pxy, pscore, feat)
+        for i in range(len(bboxes)):
+            feat = feats[i] if feats is not None else None
+            # PTrack(xywh, score, cls, pxy, pscore, feat)
+            track = PTrack(
+                xywh=bboxes[i],
+                score=scores[i],
+                cls=int(clses[i]),
+                pxy=poses_xy[i],
+                pscore=poses_conf[i],
+                feat=feat
+            )
             track.pose_kalman_filter = self.pose_kalman_filter
             track.kalman_filter = self.kalman_filter
+            
             detections.append(track)
+            
         return detections
     
     def update(self, dets, poses, img, feats):
