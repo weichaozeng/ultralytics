@@ -202,10 +202,10 @@ class PTrack(BOTrack):
         kps_score = self.raw_pixel_kps_score.tolist()
         output_list = [
             *coords.tolist(),
-            self.track_id,
-            self.score,
-            self.cls,
-            self.idx,
+            int(self.track_id),
+            float(self.score),
+            int(self.cls),
+            float(self.idx),
             *kps,
             *kps_score
         ]
