@@ -130,8 +130,10 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
             tracks = tracker.update(det, result.orig_img, getattr(result, "feats", None))
         if len(tracks) == 0:
             continue
-
+        
+        print(getattr(tracker, 'W_POSE', None))
         if getattr(tracker, 'W_POSE', None):
+            print("0000")
             idx = tracks[:, -64].astype(int)
             print("1111")
             predictor.results[i] = result[idx]
