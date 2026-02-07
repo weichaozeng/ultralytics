@@ -255,6 +255,7 @@ class PoseTracker(BOTSORT):
         return detections
     
     def update(self, dets, poses, img, feats):
+        print("1111")
         self.frame_id += 1
         pose_scores = np.mean(poses.conf, axis=1)
         combined_scores = 0.5 * dets.conf + 0.5 * pose_scores
@@ -272,17 +273,17 @@ class PoseTracker(BOTSORT):
             dets.xywh[mask_second], dets.conf[mask_second], dets.cls[mask_second],
             poses.xy[mask_second], poses.conf[mask_second], feats_second
         )
-        print("1111")
+
         unconfirmed = [t for t in self.tracked_stracks if not t.is_activated]
         tracked_stracks = [t for t in self.tracked_stracks if t.is_activated]
         strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
-        print("2222")
+
         PTrack.multi_predict(strack_pool)
         if hasattr(self, "gmc") and img is not None:
             warp = self.gmc.apply(img, dets.xyxy[mask_high])
             PTrack.multi_gmc(strack_pool, warp)
             PTrack.multi_gmc(unconfirmed, warp)
-        print("3333")
+        print("2222")
         # First Association
         dists = self.get_dists(strack_pool, detections)
         matches, u_track, u_det = matching.linear_assignment(dists, self.first_match_thresh)
@@ -340,7 +341,7 @@ class PoseTracker(BOTSORT):
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
         self.lost_stracks = [t for t in self.lost_stracks if t.state == TrackState.Lost]
         self.removed_stracks = [t for t in self.removed_stracks if t.state == TrackState.Removed]
-        print("4444")
+
         return [x.result for x in self.tracked_stracks if x.is_activated]
         # if visualize
         # return [x.result for x in self.tracked_stracks if x.is_activated or x.state == TrackState.Lost]
