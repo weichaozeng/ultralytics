@@ -360,7 +360,7 @@ class PoseTracker(BOTSORT):
                 growth = min(1.0 + 0.02 * dt, 1.4)
                 expanded_static_mean = track.static_mean.copy()
                 expanded_static_mean[2:4] *= growth
-                iou_static = matching.iou_distance(expanded_static_mean, det_means)
+                iou_static = matching.iou_distance(expanded_static_mean, det_means)[0]
                 dists[i] = np.minimum(iou_inertial, iou_static)
             else:
                 dists[i] = iou_inertial
