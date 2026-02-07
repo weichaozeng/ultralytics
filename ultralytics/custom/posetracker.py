@@ -41,11 +41,12 @@ class PTrack(BOTrack):
         _rel_pose, _rel_pose_score = self._encode_to_relative(pxy, pscore, self.obs_scale)
         print("22222")
         super().__init__(xywh, score, cls, feat, feat_history)
+        print("33333")
         self.pose = _rel_pose            
         self.pose_score = _rel_pose_score 
         self.raw_pixel_kps = pxy.copy()
         self.raw_pixel_kps_score = pscore.copy()
-        print("33333")
+
         # handedness 0: left, 1: right
         self.handedness = float(cls)
         self.handedness_weight_sum = 0.5 * score + 0.5 * np.mean(pscore)
