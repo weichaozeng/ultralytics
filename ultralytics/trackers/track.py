@@ -124,7 +124,7 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
         det = (result.obb if is_obb else result.boxes).cpu().numpy()
         pose = result.keypoints.cpu().numpy() if hasattr(result, 'keypoints') else None
 
-        if getattr(tracker, 'pose_weight', None):
+        if getattr(tracker, 'pose_kalman_filter', None):
             tracks = tracker.update(det, pose, result.orig_img, getattr(result, "feats", None))
         else:
             tracks = tracker.update(det, result.orig_img, getattr(result, "feats", None))
