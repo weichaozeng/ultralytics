@@ -341,9 +341,9 @@ class PoseTracker(BOTSORT):
         self.lost_stracks = [t for t in self.lost_stracks if t.state == TrackState.Lost]
         self.removed_stracks = [t for t in self.removed_stracks if t.state == TrackState.Removed]
 
-        return [x.result for x in self.tracked_stracks if x.is_activated]
+        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
         # if visualize
-        # return [x.result for x in self.tracked_stracks if x.is_activated or x.state == TrackState.Lost]
+        # return np.asarray([x.result for x in self.tracked_stracks if x.is_activated or x.state == TrackState.Lost], dtype=np.float32)
     
     def get_iou_dists(self, tracks, detections):
         M, N = len(tracks), len(detections)
@@ -619,7 +619,7 @@ class PoseTracker(BOTSORT):
 #         if len(self.removed_stracks) > 1000:
 #             self.removed_stracks = self.removed_stracks[-999:]
         
-#         return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+#         return √[x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
 
     
 #     def multi_predict(self, tracks: list[PTrack]):
