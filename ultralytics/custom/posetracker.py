@@ -340,7 +340,7 @@ class PoseTracker(BOTSORT):
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
         self.lost_stracks = [t for t in self.lost_stracks if t.state == TrackState.Lost]
         self.removed_stracks = [t for t in self.removed_stracks if t.state == TrackState.Removed]
-
+        print("4444")
         return [x.result for x in self.tracked_stracks if x.is_activated]
         # if visualize
         # return [x.result for x in self.tracked_stracks if x.is_activated or x.state == TrackState.Lost]
