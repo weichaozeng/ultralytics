@@ -34,12 +34,12 @@ class PTrack(BOTrack):
 
     def __init__(self, xywh: np.ndarray, score: float, cls: int, pxy: np.ndarray, pscore: np.ndarray, feat: np.ndarray | None = None, feat_history: int = 50
     ):
-
+        print("11111")
         self.obs_scale = np.sqrt(xywh[2]**2 + xywh[3]**2) + 1e-6
         self.wrist_rel_to_box = (pxy[0] - xywh[:2]) / self.obs_scale
 
         _rel_pose, _rel_pose_score = self._encode_to_relative(pxy, pscore, self.obs_scale)
-
+        print("22222")
         super().__init__(xywh, score, cls, feat, feat_history)
         self.pose = _rel_pose            
         self.pose_score = _rel_pose_score 
@@ -242,7 +242,6 @@ class PoseTracker(BOTSORT):
 
         detections = []
         bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
-        print("111111")
         for i in range(len(bboxes)):
             feat = feats[i] if feats is not None else None
             
@@ -255,7 +254,6 @@ class PoseTracker(BOTSORT):
                 pscore=poses_conf[i],
                 feat=feat
             )
-            print("22222")
             track.pose_kalman_filter = self.pose_kalman_filter
             track.kalman_filter = self.kalman_filter
             
