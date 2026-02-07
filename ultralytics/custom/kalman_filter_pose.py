@@ -227,8 +227,8 @@ class KalmanFilterPose:
         
         return projected_mean, projected_cov
     
-    def update(self, mean, covariance, measurement, confidences):
-        projected_mean, projected_cov = self.project(mean, covariance, confidences)
+    def update(self, mean, covariance, measurement, confidence):
+        projected_mean, projected_cov = self.project(mean, covariance, confidence)
         chol_factor, lower = scipy.linalg.cho_factor(projected_cov, lower=True, check_finite=False)
         P_HT = np.dot(covariance, self._update_mat.T)
         kalman_gain = scipy.linalg.cho_solve((chol_factor, lower), P_HT.T).T
@@ -264,7 +264,9 @@ class KalmanFilterPose:
         """
         measurements: (M, 40)
         """
+        print("1111")
         projected_mean, projected_cov = self.project(mean, covariance, confidence=None)
+        print("2222")
         r_std = np.full(40, self._std_weight_measurement) 
         R_static = np.diag(np.square(r_std))
         S = projected_cov + R_static
@@ -277,6 +279,7 @@ class KalmanFilterPose:
                 cholesky_factor = np.linalg.cholesky(S)
                 z = scipy.linalg.solve_triangular(
                     cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
+                print("3333")
                 return np.sum(z * z, axis=0) # (M,)
             except np.linalg.LinAlgError:
                 return np.sum(d**2, axis=1)

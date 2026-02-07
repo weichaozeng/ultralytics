@@ -374,7 +374,6 @@ class PoseTracker(BOTSORT):
         det_means = np.asarray([d.mean for d in detections])       # (N, 4) [cx, cy, w, h]
         det_poses = np.asarray([d.pose for d in detections])       # (N, 40) 
         det_pose_scores = np.asarray([d.pose_score for d in detections]) # (N, 20)
-        print(det_poses.shape, det_pose_scores.shape)
 
         for i, track in enumerate(tracks):
             iou_inertial = matching.iou_distance([track], detections)[0]
