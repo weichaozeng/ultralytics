@@ -241,8 +241,10 @@ class PoseTracker(BOTSORT):
             return []
 
         detections = []
+        bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
         for i in range(len(bboxes)):
             feat = feats[i] if feats is not None else None
+            
             # PTrack(xywh, score, cls, pxy, pscore, feat)
             track = PTrack(
                 xywh=bboxes[i],
