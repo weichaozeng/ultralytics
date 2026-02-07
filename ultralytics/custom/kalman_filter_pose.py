@@ -264,6 +264,7 @@ class KalmanFilterPose:
         """
         measurements: (M, 40)
         """
+        if len(measurements) == 0: return np.array([])
         projected_mean, projected_cov = self.project(mean, covariance, confidence=None)
         r_std = np.full(40, self._std_weight_measurement) 
         R_static = np.diag(np.square(r_std))

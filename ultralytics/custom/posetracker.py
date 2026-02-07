@@ -284,6 +284,7 @@ class PoseTracker(BOTSORT):
             PTrack.multi_gmc(unconfirmed, warp)
 
         # First Association
+
         dists = self.get_dists(strack_pool, detections)
         matches, u_track, u_det = matching.linear_assignment(dists, self.first_match_thresh)
         for itracked, idet in matches:
