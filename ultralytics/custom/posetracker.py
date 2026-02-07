@@ -35,10 +35,6 @@ class PTrack(BOTrack):
     def __init__(self, xywh: np.ndarray, score: float, cls: int, pxy: np.ndarray, pscore: np.ndarray, feat: np.ndarray | None = None, feat_history: int = 50
     ):
 
-        M = self.shared_kalman_pose.ndim 
-        assert pxy.size == M, f"Expected {M} dimensions for pxy but got {pxy.size}"
-        assert pscore.size == M // 2, f"Expected {M // 2} scores but got {pscore.size}"
-
         self.obs_scale = np.sqrt(xywh[2]**2 + xywh[3]**2) + 1e-6
         self.wrist_rel_to_box = (pxy[0] - xywh[:2]) / self.obs_scale
 
@@ -234,7 +230,7 @@ class PoseTracker(BOTSORT):
     
     def init_track(self, bboxes, scores, clses, poses_xy, poses_conf, feats=None):
         """
-        bboxes: (N, 4) or (N, 5)
+        bboxes: (N, 4)
         scores: (N,)
         clses: (N,)
         poses_xy: (N, 21, 2)
@@ -389,7 +385,7 @@ class PoseTracker(BOTSORT):
         for i, track in enumerate(tracks):
             iou_inertial = matching.iou_distance([track], detections)[0]
             d_pose_inertial = self.pose_kalman_filter.gating_distance(
-                track.pose_mean, track.pose_covariance, det_poses, det_pscores)
+                track.pose_mean, track.pose_covariance, det_poses, det_pose_scores)
             
             if track.state == TrackState.Lost and track.static_mean is not None:
                 # Pose Gating for static
