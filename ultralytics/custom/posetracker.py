@@ -172,7 +172,7 @@ class PTrack(BOTrack):
         # Pose
         pose_tracks = [t for t in tracks if t.pose_mean is not None]
         if pose_tracks:
-            M = PTrack.shared_kalman_pose.ndim
+            M = PTrack.shared_kalman_pose.ndim_obs
             R_rel = np.kron(np.eye(M // 2, dtype=float), R)
             R_pose_total = np.kron(np.eye(2, dtype=float), R_rel)
             for st in pose_tracks:
@@ -186,7 +186,7 @@ class PTrack(BOTrack):
         curr_xy = self.mean[:2]
         curr_wh = self.mean[2:4]
         curr_scale = np.sqrt(curr_wh[0]**2 + curr_wh[1]**2) + 1e-6
-        M = self.shared_kalman_pose.ndim
+        M = self.shared_kalman_pose.ndim_obs
         rel_vecs = self.pose_mean[:M].reshape(20, 2)
         pixel_kps = np.zeros((21, 2), dtype=np.float32)
         anchor_off = self.static_wrist_rel_to_box if self.state == TrackState.Lost else self.wrist_rel_to_box
