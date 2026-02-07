@@ -132,7 +132,7 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
             continue
 
 
-        if getattr(tracker, 'pose_weight', None):
+        if getattr(tracker, 'pose_kalman_filter', None):
             idx = tracks[:, -64].astype(int)
             predictor.results[i] = result[idx]
             kps_pos_start = -63

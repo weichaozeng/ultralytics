@@ -255,7 +255,6 @@ class PoseTracker(BOTSORT):
         return detections
     
     def update(self, dets, poses, img, feats):
-        print("1111")
         self.frame_id += 1
         pose_scores = np.mean(poses.conf, axis=1)
         combined_scores = 0.5 * dets.conf + 0.5 * pose_scores
@@ -283,7 +282,7 @@ class PoseTracker(BOTSORT):
             warp = self.gmc.apply(img, dets.xyxy[mask_high])
             PTrack.multi_gmc(strack_pool, warp)
             PTrack.multi_gmc(unconfirmed, warp)
-        print("2222")
+
         # First Association
         dists = self.get_dists(strack_pool, detections)
         matches, u_track, u_det = matching.linear_assignment(dists, self.first_match_thresh)
