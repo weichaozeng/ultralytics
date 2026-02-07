@@ -226,23 +226,18 @@ class PoseTracker(BOTSORT):
         self.W_REID = 0.3
         self.W_IOU  = 0.1
     
-    def init_track(self, bboxes, scores, clses, poses_xy, poses_conf, feats=None):
-        """
-        bboxes: (N, 4)
-        scores: (N,)
-        clses: (N,)
-        poses_xy: (N, 21, 2)
-        poses_conf: (N, 21)
-        feats: (N, D) or None
-        """
+    def init_track(self, bboxes, scores, clses, poses_xy, poses_conf, img):
+
         if len(bboxes) == 0:
             return []
 
         detections = []
         bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
-        for i in range(len(bboxes)):
-            feat = feats[i] if feats is not None else None
-            
+        features_keep = []
+        if self.args.with_reid and self.encoder is not None:
+            features_keep = self.encoder(img, bboxes)
+        
+        for i in range(len(bboxes)):   
             # PTrack(xywh, score, cls, pxy, pscore, feat)
             track = PTrack(
                 xywh=bboxes[i],
@@ -250,7 +245,7 @@ class PoseTracker(BOTSORT):
                 cls=int(clses[i]),
                 pxy=poses_xy[i],
                 pscore=poses_conf[i],
-                feat=feat
+                feat=features_keep[i] if features_keep else None
             )
             track.pose_kalman_filter = self.pose_kalman_filter
             track.kalman_filter = self.kalman_filter
@@ -267,8 +262,8 @@ class PoseTracker(BOTSORT):
         mask_high = combined_scores >= self.args.track_high_thresh
         mask_second = (combined_scores < self.args.track_high_thresh) & (combined_scores > self.args.track_low_thresh)
 
-        feats_high = feats[mask_high] if feats is not None else None
-        feats_second = feats[mask_second] if feats is not None else None
+        feats_high = feats[mask_high] if feats is not None and len(feats) else img
+        feats_second = feats[mask_second] if feats is not None and len(feats) else img
         detections = self.init_track(
             dets.xywh[mask_high], dets.conf[mask_high], dets.cls[mask_high],
             poses.xy[mask_high], poses.conf[mask_high], feats_high
