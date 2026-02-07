@@ -222,9 +222,9 @@ class PoseTracker(BOTSORT):
         self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.5)
 
         # for get_dists
-        self.W_POSE = 0.6
-        self.W_REID = 0.3
-        self.W_IOU  = 0.1
+        self.W_POSE = 0.3
+        self.W_REID = 0.1
+        self.W_IOU  = 0.6
     
     def init_track(self, bboxes, scores, clses, poses_xy, poses_conf, img):
 
