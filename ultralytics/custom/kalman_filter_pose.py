@@ -272,6 +272,7 @@ class KalmanFilterPose:
         S = projected_cov + R_static
         
         # d = z - z_hat
+        print(measurements.shape, projected_mean.shape, projected_cov.shape, R_static.shape)
         d = measurements - projected_mean # (M, 40)
         
         if metric == "maha":
