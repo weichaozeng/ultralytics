@@ -272,17 +272,17 @@ class PoseTracker(BOTSORT):
             dets.xywh[mask_second], dets.conf[mask_second], dets.cls[mask_second],
             poses.xy[mask_second], poses.conf[mask_second], feats_second
         )
-
+        print("1111")
         unconfirmed = [t for t in self.tracked_stracks if not t.is_activated]
         tracked_stracks = [t for t in self.tracked_stracks if t.is_activated]
         strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
-
+        print("2222")
         PTrack.multi_predict(strack_pool)
         if hasattr(self, "gmc") and img is not None:
             warp = self.gmc.apply(img, dets.xyxy[mask_high])
             PTrack.multi_gmc(strack_pool, warp)
             PTrack.multi_gmc(unconfirmed, warp)
-
+        print("3333")
         # First Association
         dists = self.get_dists(strack_pool, detections)
         matches, u_track, u_det = matching.linear_assignment(dists, self.first_match_thresh)
@@ -356,14 +356,12 @@ class PoseTracker(BOTSORT):
         for i, track in enumerate(tracks):
             iou_inertial = matching.iou_distance([track], detections)[0]
             if track.state == TrackState.Lost and track.static_mean is not None:
-                print("1111")
                 dt = self.frame_id - track.end_frame
                 growth = min(1.0 + 0.02 * dt, 1.4)
                 expanded_static_mean = track.static_mean.copy()
                 expanded_static_mean[2:4] *= growth
                 iou_static = matching.iou_distance(expanded_static_mean, det_means)[0]
                 dists[i] = np.minimum(iou_inertial, iou_static)
-                print("2222")
             else:
                 dists[i] = iou_inertial
         return dists
