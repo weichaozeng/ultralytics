@@ -191,8 +191,9 @@ class BOTSORT(BYTETracker):
             >>> bot_sort = BOTSORT(args, frame_rate=30)
         """
         super().__init__(args, frame_rate)
+        print("11111")
         self.gmc = GMC(method=args.gmc_method)
-
+        print("33333")
         # ReID module
         self.proximity_thresh = args.proximity_thresh
         self.appearance_thresh = args.appearance_thresh

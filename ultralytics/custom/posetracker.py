@@ -34,14 +34,11 @@ class PTrack(BOTrack):
 
     def __init__(self, xywh: np.ndarray, score: float, cls: int, pxy: np.ndarray, pscore: np.ndarray, feat: np.ndarray | None = None, feat_history: int = 50
     ):
-        print("11111")
         self.obs_scale = np.sqrt(xywh[2]**2 + xywh[3]**2) + 1e-6
         self.wrist_rel_to_box = (pxy[0] - xywh[:2]) / self.obs_scale
 
         _rel_pose, _rel_pose_score = self._encode_to_relative(pxy, pscore, self.obs_scale)
-        print("22222")
         super().__init__(xywh, score, cls, feat, feat_history)
-        print("33333")
         self.pose = _rel_pose            
         self.pose_score = _rel_pose_score 
         self.raw_pixel_kps = pxy.copy()
