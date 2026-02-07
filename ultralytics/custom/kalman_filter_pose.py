@@ -215,22 +215,17 @@ class KalmanFilterPose:
 
         return mean, covariance
     
-    def project(self, mean, covariance, confidences):
-        # R
-        conf_expanded = np.repeat(confidences, 2)
-        conf_expanded = np.clip(conf_expanded, 1e-4, 1.0)
-        r_std = self._std_weight_measurement / conf_expanded
-        innovation_cov = np.diag(np.square(r_std))
-
-        # z = H * x
+    def project(self, mean, covariance, confidence=None):
         projected_mean = np.dot(self._update_mat, mean)
-
-        # S = H * P * H.T + R
         projected_cov = np.linalg.multi_dot((self._update_mat, covariance, self._update_mat.T))
         
-        print(self._update_mat.shape, covariance.shape, innovation_cov.shape)
-
-        return projected_mean, projected_cov + innovation_cov
+        if confidence is not None:
+            assert len(confidence) == 20
+            conf_expanded = np.repeat(confidence, 2)
+            R = np.diag(np.square(self._std_weight_measurement / np.clip(conf_expanded, 1e-4, 1.0)))
+            return projected_mean, projected_cov + R
+        
+        return projected_mean, projected_cov
     
     def update(self, mean, covariance, measurement, confidences):
         projected_mean, projected_cov = self.project(mean, covariance, confidences)
@@ -265,23 +260,28 @@ class KalmanFilterPose:
 
         return mean, covariance
     
-    def gating_distance(self, mean, covariance, measurements, confidences, metric="maha"):
+    def gating_distance(self, mean, covariance, measurements,  metric="maha"):
         """
         measurements: (M, 40)
         """
-        projected_mean, projected_cov = self.project(mean, covariance, confidences)
+        projected_mean, projected_cov = self.project(mean, covariance, confidences=None)
+        r_std = np.full(40, self._std_weight_measurement) 
+        R_static = np.diag(np.square(r_std))
+        S = projected_cov + R_static
         
         # d = z - z_hat
         d = measurements - projected_mean # (M, 40)
         
-        if metric == "gaussian":
+        if metric == "maha":
+            try:
+                cholesky_factor = np.linalg.cholesky(S)
+                z = scipy.linalg.solve_triangular(
+                    cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
+                return np.sum(z * z, axis=0) # (M,)
+            except np.linalg.LinAlgError:
+                return np.sum(d**2, axis=1)
+        else:
             return np.sum(d**2, axis=1)
-        elif metric == "maha":
-            cholesky_factor = np.linalg.cholesky(projected_cov)
-            z = scipy.linalg.solve_triangular(
-                cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
-            return np.sum(z * z, axis=0) # (M,)
-
 ################################################################
 
 class KalmanFilterPose_Polar:
