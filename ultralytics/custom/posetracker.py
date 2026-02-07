@@ -377,9 +377,10 @@ class PoseTracker(BOTSORT):
 
         for i, track in enumerate(tracks):
             iou_inertial = matching.iou_distance([track], detections)[0]
+            print("1111")
             d_pose_inertial = self.pose_kalman_filter.gating_distance(
                 track.pose_mean, track.pose_covariance, det_poses, det_pose_scores)
-            
+            print("2222")
             if track.state == TrackState.Lost and track.static_mean is not None:
                 # Pose Gating for static
                 d_pose_static = self.pose_kalman_filter.gating_distance(
