@@ -219,7 +219,7 @@ class PoseTracker(BOTSORT):
         self.pose_gate_thresh = getattr(args, 'pose_gate_thresh', 160.0) 
         self.first_match_thresh = getattr(args, 'first_match_thresh', 0.5)
         self.second_match_thresh = getattr(args, 'second_match_thresh', 0.3)
-        self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.5)
+        self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.3)
 
         # for get_dists
         self.W_POSE = 0.3
