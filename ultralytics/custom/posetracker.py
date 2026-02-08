@@ -372,8 +372,10 @@ class PoseTracker(BOTSORT):
 
         # return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
         # if visualize
-        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated or x.state == TrackState.Lost], dtype=np.float32)
-    
+        res = np.asarray([x.result for x in self.tracked_stracks if x.is_activated or x.state == TrackState.Lost], dtype=np.float32)
+        print(f"frame id {self.frame_id} has {len(res)} vis tracks.")
+        return res
+
     def get_iou_dists(self, tracks, detections):
         M, N = len(tracks), len(detections)
         dists = np.ones((M, N), dtype=np.float32)
