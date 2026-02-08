@@ -92,6 +92,8 @@ def iou_distance(atracks: list, btracks: list) -> np.ndarray:
     atlbrs = get_coords(atracks)
     btlbrs = get_coords(btracks)
     print("222222")
+    print(atlbrs)
+    print(btlbrs)
     ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
     if len(atlbrs) and len(btlbrs):
         if len(atlbrs[0]) == 5 and len(btlbrs[0]) == 5:
