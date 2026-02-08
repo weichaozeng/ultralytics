@@ -375,16 +375,16 @@ class PoseTracker(BOTSORT):
         if M == 0 or N == 0:
             return dists
         
-        det_means = np.asarray([d.mean for d in detections])
+        det_xywh = np.asarray([d.xywh for d in detections], dtype=np.float32)
         for i, track in enumerate(tracks):
             iou_inertial = matching.iou_distance([track], detections)[0]
             if track.state == TrackState.Lost and track.static_mean is not None:
                 dt = self.frame_id - track.end_frame
                 growth = min(1.0 + 0.02 * dt, 1.4)
-                expanded_static_mean = track.static_mean.copy()
-                expanded_static_mean[2:4] *= growth
-                print("???")
-                iou_static = matching.iou_distance(expanded_static_mean, det_means)[0]
+                expanded_static_xywh = track.static_mean[:4].copy()
+                expanded_static_xywh[2:4] *= growth
+                expanded_static_xywh = expanded_static_xywh.reshape(1, 4)
+                iou_static = matching.iou_distance(expanded_static_xywh, det_xywh)[0]
                 dists[i] = np.minimum(iou_inertial, iou_static)
             else:
                 dists[i] = iou_inertial
@@ -398,8 +398,8 @@ class PoseTracker(BOTSORT):
             return dists
 
         
-        det_means_list = [d.xywh for d in detections]       # (N, 4) [cx, cy, w, h]
-        det_means = np.asarray([d.xywh for d in detections])
+             
+        det_xywhs = np.asarray([d.xywh for d in detections])        # (N, 4) [cx, cy, w, h]
         det_poses = np.asarray([d.pose for d in detections])       # (N, 40) 
         det_pose_scores = np.asarray([d.pose_score for d in detections]) # (N, 20)
 
@@ -411,10 +411,11 @@ class PoseTracker(BOTSORT):
             reid_matrix = np.ones((M, N), dtype=np.float32)
         for i, track in enumerate(tracks):
             bbox_maha_dists = self.kalman_filter.gating_distance(
-                track.mean, track.covariance, det_means, metric='maha'
+                track.mean, track.covariance, det_xywhs, metric='maha'
             )
             if track.state == TrackState.Lost and track.static_mean is not None:
-                static_iou_dists = matching.iou_distance([track.static_mean], det_means_list)[0]
+                static_xywh = track.static_mean[:4].reshape(1, 4)
+                static_iou_dists = matching.iou_distance(static_xywh, det_xywhs)[0]
                 iou_dists_refined = np.minimum(iou_matrix[i], static_iou_dists)
             else:
                 iou_dists_refined = iou_matrix[i]
