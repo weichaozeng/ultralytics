@@ -216,7 +216,7 @@ class PoseTracker(BOTSORT):
     def __init__(self, args, frame_rate=30):
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = KalmanFilterPose()
-        self.box_gate_thresh = getattr(args, 'box_gate_thresh', 40) 
+        self.box_gate_thresh = getattr(args, 'box_gate_thresh', 13.277) 
         self.first_match_thresh = getattr(args, 'first_match_thresh', 0.9)
         self.second_match_thresh = getattr(args, 'second_match_thresh', 0.6)
         self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.6)
@@ -261,7 +261,7 @@ class PoseTracker(BOTSORT):
         self.frame_id += 1
         print(self.frame_id)
         print(f"dets: {len(dets)}")
-        if self.frame_id in [54, 55, 62, 63]:
+        if self.frame_id in [55, 62, 63]:
             print("here")
     
         activated_stracks = []  
@@ -461,6 +461,9 @@ class PoseTracker(BOTSORT):
         N = det_poses.shape[0]
         if N == 0:
             return np.array([], dtype=np.float32)
+        # weighted for importancy of pose direction
+        finger_decay = np.array([1.0, 0.8, 0.6, 0.4], dtype=np.float32)
+        pos_weights = np.tile(finger_decay, 5)
 
         t_v = track_pose.reshape(20, 2)
         d_vs = det_poses.reshape(-1, 20, 2)
@@ -469,10 +472,10 @@ class PoseTracker(BOTSORT):
         d_vs_unit = d_vs / (np.linalg.norm(d_vs, axis=2, keepdims=True) + 1e-6)
 
         cos_matrix = np.einsum('jk,ijk->ij', t_v_unit, d_vs_unit)
-        weights = det_pose_scores
-        weights_sum = np.sum(weights, axis=1, keepdims=True) + 1e-6
+        combined_weights = det_pose_scores * pos_weights
+        weights_sum = np.sum(combined_weights, axis=1, keepdims=True) + 1e-6
 
-        weighted_cos_sim = np.sum(cos_matrix * weights, axis=1, keepdims=True) / weights_sum
+        weighted_cos_sim = np.sum(cos_matrix * combined_weights, axis=1, keepdims=True) / weights_sum
 
         return np.clip(weighted_cos_sim.flatten(), -1.0, 1.0)
     
