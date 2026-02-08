@@ -283,7 +283,6 @@ class PoseTracker(BOTSORT):
         unconfirmed = [t for t in self.tracked_stracks if not t.is_activated]
         tracked_stracks = [t for t in self.tracked_stracks if t.is_activated]
         strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
-
         PTrack.multi_predict(strack_pool)
         if hasattr(self, "gmc") and img is not None:
             warp = self.gmc.apply(img, dets.xyxy[mask_high])
@@ -353,6 +352,7 @@ class PoseTracker(BOTSORT):
                 track.mark_removed()
                 removed_stracks.append(track)
 
+        self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, activated_stracks)
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, refind_stracks)
 
