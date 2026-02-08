@@ -289,11 +289,8 @@ class PoseTracker(BOTSORT):
             PTrack.multi_gmc(unconfirmed, warp)
 
         # First Association
-        print("00000")
         dists = self.get_dists(strack_pool, detections)
-        print("11111")
         matches, u_track, u_det = matching.linear_assignment(dists, self.first_match_thresh)
-        print("22222")
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
@@ -413,11 +410,13 @@ class PoseTracker(BOTSORT):
             bbox_maha_dists = self.kalman_filter.gating_distance(
                 track.mean, track.covariance, det_means, metric='maha'
             )
+            print("11111")
             if track.state == TrackState.Lost and track.static_mean is not None:
                 static_iou_dists = matching.iou_distance(track.static_mean, det_means)[0]
                 iou_dists_refined = np.minimum(iou_matrix[i], static_iou_dists)
             else:
                 iou_dists_refined = iou_matrix[i]
+            print("22222")
             pose_sim = self.batch_cosine_similarity(track.pose, det_poses, det_pose_scores)
             pose_disim = (1.0 - pose_sim) / 2.0
 
