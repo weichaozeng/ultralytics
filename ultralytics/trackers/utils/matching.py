@@ -88,10 +88,10 @@ def iou_distance(atracks: list, btracks: list) -> np.ndarray:
         if isinstance(tracks[0], np.ndarray):
             return tracks
         return [t.xywha if getattr(t, 'angle', None) is not None else t.xyxy for t in tracks]
-
+    print("11111")
     atlbrs = get_coords(atracks)
     btlbrs = get_coords(btracks)
-
+    print("222222")
     ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
     if len(atlbrs) and len(btlbrs):
         if len(atlbrs[0]) == 5 and len(btlbrs[0]) == 5:
@@ -105,6 +105,7 @@ def iou_distance(atracks: list, btracks: list) -> np.ndarray:
                 np.ascontiguousarray(btlbrs, dtype=np.float32),
                 iou=True,
             )
+    print("33333")
     return 1 - ious  # cost matrix
 
 
