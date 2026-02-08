@@ -289,20 +289,21 @@ class PoseTracker(BOTSORT):
             PTrack.multi_gmc(unconfirmed, warp)
 
         # First Association
+        print("00000")
         dists = self.get_dists(strack_pool, detections)
-        matches, u_track, u_det = matching.linear_assignment(dists, self.first_match_thresh)
         print("11111")
+        matches, u_track, u_det = matching.linear_assignment(dists, self.first_match_thresh)
+        print("22222")
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
-            print("22222")
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
                 activated_stracks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
-        print("33333")
+
 
         # Second Association
         # r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
