@@ -316,7 +316,7 @@ class PoseTracker(BOTSORT):
 
         # Third for unconfirmed tracks and remaining detections
         detections_remaining = [detections[i] for i in u_det]
-        dists_unconfirmed = self.get_dists(unconfirmed, detections_remaining)
+        dists_unconfirmed = self.get_iou_dists(unconfirmed, detections_remaining)
         matches_unconf, u_unconf, u_det_unconf = matching.linear_assignment(dists_unconfirmed, self.unconf_match_thresh)
 
         for itracked, idet in matches_unconf:
