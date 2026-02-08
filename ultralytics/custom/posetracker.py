@@ -298,6 +298,7 @@ class PoseTracker(BOTSORT):
                 track.update(det, self.frame_id)
                 activated_stracks.append(track)
             else:
+                print("1111")
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
