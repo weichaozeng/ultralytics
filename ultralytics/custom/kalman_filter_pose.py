@@ -260,34 +260,36 @@ class KalmanFilterPose:
 
         return mean, covariance
     
-    def gating_distance(self, mean, covariance, measurements,  metric="maha"):
-        """
-        measurements: (M, 40)
-        """
-        if len(measurements) == 0: return np.array([])
-        projected_mean, projected_cov = self.project(mean, covariance, confidence=None)
-        r_std = np.full(40, self._std_weight_measurement) 
-        R_static = np.diag(np.square(r_std))
-        S = projected_cov + R_static
+    # def gating_distance(self, mean, covariance, measurements,  metric="maha"):
+    #     """
+    #     measurements: (M, 40)
+    #     """
+    #     if len(measurements) == 0: return np.array([])
+    #     projected_mean, projected_cov = self.project(mean, covariance, confidence=None)
+    #     r_std = np.full(40, self._std_weight_measurement) 
+    #     R_static = np.diag(np.square(r_std))
+    #     S = projected_cov + R_static
         
-        # d = z - z_hat
-        d = measurements - projected_mean # (M, 40)
+    #     # d = z - z_hat
+    #     d = measurements - projected_mean # (M, 40)
         
-        if metric == "maha":
-            try:
-                cholesky_factor = np.linalg.cholesky(S)
-                z = scipy.linalg.solve_triangular(
-                    cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
-                return np.sum(z * z, axis=0) # (M,)
-            except np.linalg.LinAlgError:
-                return np.sum(d**2, axis=1)
-        else:
-            return np.sum(d**2, axis=1)
+    #     if metric == "maha":
+    #         try:
+    #             cholesky_factor = np.linalg.cholesky(S)
+    #             z = scipy.linalg.solve_triangular(
+    #                 cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
+    #             return np.sum(z * z, axis=0) # (M,)
+    #         except np.linalg.LinAlgError:
+    #             return np.sum(d**2, axis=1)
+    #     else:
+    #         return np.sum(d**2, axis=1)
 ################################################################
+
 
 class KalmanFilterPose_Polar:
     def __init__(self):
         # 20: (P_child - P_parent), 4: (rho, theta, v_rho, v_theta)
+        raise NotImplementedError()
         self.ndim_state = 80
         self.ndim_obs = 40
         self.dt = 1.0
@@ -419,20 +421,20 @@ class KalmanFilterPose_Polar:
 
         return mean, covariance
     
-    def gating_distance(self, mean, covariance, measurements, confidences, metric="maha"):
-        """
-        measurements: (M, 40)
-        confidences: (20,) 
-        """
-        projected_mean, projected_cov, _ = self.project(mean, covariance, confidences)
+    # def gating_distance(self, mean, covariance, measurements, confidences, metric="maha"):
+    #     """
+    #     measurements: (M, 40)
+    #     confidences: (20,) 
+    #     """
+    #     projected_mean, projected_cov, _ = self.project(mean, covariance, confidences)
         
-        d = measurements - projected_mean # (M, 40)
+    #     d = measurements - projected_mean # (M, 40)
         
-        if metric == "maha":
+    #     if metric == "maha":
  
-            cholesky_factor = np.linalg.cholesky(projected_cov)
-            z = scipy.linalg.solve_triangular(
-                cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
-            return np.sum(z * z, axis=0)
+    #         cholesky_factor = np.linalg.cholesky(projected_cov)
+    #         z = scipy.linalg.solve_triangular(
+    #             cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
+    #         return np.sum(z * z, axis=0)
         
-        return np.sum(d**2, axis=1)
+    #     return np.sum(d**2, axis=1)

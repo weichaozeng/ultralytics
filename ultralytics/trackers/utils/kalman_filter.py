@@ -56,8 +56,12 @@ class KalmanFilterXYAH:
         self._update_mat = np.eye(ndim, 2 * ndim)
 
         # Motion and observation uncertainty are chosen relative to the current state estimate
-        self._std_weight_position = 1.0 / 20
-        self._std_weight_velocity = 1.0 / 160
+        # self._std_weight_position = 1.0 / 20
+        # self._std_weight_velocity = 1.0 / 160
+
+        # Modify for quick move
+        self._std_weight_position = 1.0 / 5   
+        self._std_weight_velocity = 1.0 / 20  
 
     def initiate(self, measurement: np.ndarray):
         """Create a track from an unassociated measurement.

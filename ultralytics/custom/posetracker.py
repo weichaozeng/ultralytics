@@ -216,7 +216,7 @@ class PoseTracker(BOTSORT):
     def __init__(self, args, frame_rate=30):
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = KalmanFilterPose()
-        self.box_gate_thresh = getattr(args, 'box_gate_thresh', 9.488) 
+        self.box_gate_thresh = getattr(args, 'box_gate_thresh', 40) 
         self.first_match_thresh = getattr(args, 'first_match_thresh', 0.9)
         self.second_match_thresh = getattr(args, 'second_match_thresh', 0.6)
         self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.6)
@@ -435,15 +435,26 @@ class PoseTracker(BOTSORT):
                 iou_dist = iou_dists_refined[j]
                 maha_dist = bbox_maha_dists[j]
                 reid_dist = reid_matrix[i, j]
-                if iou_dist < 0.9 or maha_dist < self.box_gate_thresh:
+
+                in_gate = maha_dist < self.box_gate_thresh
+                has_iou = iou_dist < 0.9
+                pose_reliable = pose_disim[j] < 0.3
+
+                if in_gate or has_iou or pose_reliable:
                     is_interacting = np.sum(iou_matrix[:, j] < 0.7) > 1
-                    box_dist = min(iou_dist, maha_dist / self.box_gate_thresh)
+                    if in_gate:
+                        box_dist = min(iou_dist, maha_dist / self.box_gate_thresh)
+                    elif has_iou:
+                        box_dist = min(0.99, box_dist * 1.1)
+                    else:
+                        box_dist = min(0.99, iou_dist * 1.3)
+
                     if not is_interacting:
                         dists[i, j] = box_dist * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_dist * self.W_REID
                     else:
                         dists[i, j] = box_dist * self.W_IOU + pose_disim[j] * self.W_POSE + reid_dist * self.W_REID
                 else:
-                    dists[i, j] = iou_dist
+                    dists[i, j] = 1.0
         return dists
     
     def batch_cosine_similarity(self, track_pose, det_poses, det_pose_scores):
