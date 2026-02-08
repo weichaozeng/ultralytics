@@ -396,7 +396,9 @@ class PoseTracker(BOTSORT):
         if M == 0 or N == 0: 
             return dists
 
-        det_means = np.asarray([d.xywh for d in detections])       # (N, 4) [cx, cy, w, h]
+        
+        det_means_list = [d.xywh for d in detections]       # (N, 4) [cx, cy, w, h]
+        det_means = np.asarray([d.xywh for d in detections])
         det_poses = np.asarray([d.pose for d in detections])       # (N, 40) 
         det_pose_scores = np.asarray([d.pose_score for d in detections]) # (N, 20)
 
@@ -411,7 +413,7 @@ class PoseTracker(BOTSORT):
                 track.mean, track.covariance, det_means, metric='maha'
             )
             if track.state == TrackState.Lost and track.static_mean is not None:
-                static_iou_dists = matching.iou_distance([track.static_mean], det_means)[0]
+                static_iou_dists = matching.iou_distance([track.static_mean], det_means_list)[0]
                 iou_dists_refined = np.minimum(iou_matrix[i], static_iou_dists)
             else:
                 iou_dists_refined = iou_matrix[i]
