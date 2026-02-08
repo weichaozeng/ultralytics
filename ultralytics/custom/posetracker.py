@@ -370,18 +370,18 @@ class PoseTracker(BOTSORT):
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]
 
-        # return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
         
-        # if visualize
-        all_tracks = self.tracked_stracks + self.lost_stracks
-        res = np.asarray(
-            [x.result for x in all_tracks if x.is_activated or x.state == TrackState.Lost], 
-            dtype=np.float32
-        )
-        if self.frame_id == 7:
-            print(res)
-        print(f"frame id {self.frame_id} has {len(res)} vis tracks.")
-        return res
+        # # if visualize
+        # all_tracks = self.tracked_stracks + self.lost_stracks
+        # res = np.asarray(
+        #     [x.result for x in all_tracks if x.is_activated or x.state == TrackState.Lost], 
+        #     dtype=np.float32
+        # )
+        # if self.frame_id == 7:
+        #     print(res)
+        # print(f"frame id {self.frame_id} has {len(res)} vis tracks.")
+        # return res
 
     def get_iou_dists(self, tracks, detections):
         M, N = len(tracks), len(detections)
