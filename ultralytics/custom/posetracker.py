@@ -256,6 +256,7 @@ class PoseTracker(BOTSORT):
     
     def update(self, dets, poses, img, feats):
         self.frame_id += 1
+        print(self.frame_id)
         pose_scores = np.mean(poses.conf, axis=1)
         combined_scores = 0.5 * dets.conf + 0.5 * pose_scores
 
