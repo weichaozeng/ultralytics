@@ -374,7 +374,7 @@ class PoseTracker(BOTSORT):
         if M == 0 or N == 0: 
             return dists
 
-        det_means = np.asarray([d.mean for d in detections])       # (N, 4) [cx, cy, w, h]
+        det_means = np.asarray([d.xywh for d in detections])       # (N, 4) [cx, cy, w, h]
         det_poses = np.asarray([d.pose for d in detections])       # (N, 40) 
         det_pose_scores = np.asarray([d.pose_score for d in detections]) # (N, 20)
 
@@ -385,28 +385,30 @@ class PoseTracker(BOTSORT):
         else:
             reid_matrix = np.ones((M, N), dtype=np.float32)
         for i, track in enumerate(tracks):
-            print(track.mean.shape, track.covariance.shape, det_means.shape)
             bbox_maha_dists = self.kalman_filter.gating_distance(
                 track.mean, track.covariance, det_means, metric='maha'
             )
-            print("111")
+            if track.state == TrackState.Lost and track.static_mean is not None:
+                static_iou_dists = self.iou_distance_raw(track.static_mean, det_means)
+                iou_dists_refined = np.minimum(iou_matrix[i], static_iou_dists)
+            else:
+                iou_dists_refined = iou_matrix[i]
             pose_sim = self.batch_cosine_similarity(track.pose, det_poses, det_pose_scores)
             pose_disim = (1.0 - pose_sim) / 2.0
+            
             for j in range(N):
-                iou_dist = iou_matrix[i, j]
+                iou_dist = iou_dists_refined[i, j]
                 maha_dist = bbox_maha_dists[j]
                 reid_dist = reid_matrix[i, j]
-                print("2222")
                 if iou_dist < 0.9 or maha_dist < self.box_gate_thresh:
                     is_interacting = np.sum(iou_matrix[:, j] < 0.7) > 1
                     box_dist = min(iou_dist, maha_dist / self.box_gate_thresh)
-                    print("3333")
                     if not is_interacting:
                         dists[i, j] = box_dist * 0.85 + pose_disim[j] * 0.1 + reid_dist * 0.05
                     else:
                         dists[i, j] = box_dist * self.W_IOU + pose_disim[j] * self.W_POSE + reid_dist * self.W_REID
-            else:
-                dists[i, j] = iou_dist
+                else:
+                    dists[i, j] = iou_dist
         return dists
     
     def batch_cosine_similarity(self, track_pose, det_poses, det_pose_scores):
