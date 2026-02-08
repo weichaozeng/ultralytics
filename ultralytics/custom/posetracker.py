@@ -216,15 +216,15 @@ class PoseTracker(BOTSORT):
     def __init__(self, args, frame_rate=30):
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = KalmanFilterPose()
-        self.pose_gate_thresh = getattr(args, 'pose_gate_thresh', 160.0) 
+        self.pose_gate_thresh = getattr(args, 'box_gate_thresh', 9.488) 
         self.first_match_thresh = getattr(args, 'first_match_thresh', 0.5)
         self.second_match_thresh = getattr(args, 'second_match_thresh', 0.3)
         self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.3)
 
-        # for get_dists
-        self.W_POSE = 0.3
+        # for interacting in get_dists
+        self.W_POSE = 0.6
         self.W_REID = 0.1
-        self.W_IOU  = 0.6
+        self.W_IOU  = 0.3
     
     def init_track(self, bboxes, scores, clses, poses_xy, poses_conf, img):
 
@@ -371,48 +371,39 @@ class PoseTracker(BOTSORT):
     def get_dists(self, tracks, detections):
         M, N = len(tracks), len(detections)
         dists = np.ones((M, N), dtype=np.float32)
+        if M == 0 or N == 0: 
+            return dists
 
         det_means = np.asarray([d.mean for d in detections])       # (N, 4) [cx, cy, w, h]
         det_poses = np.asarray([d.pose for d in detections])       # (N, 40) 
         det_pose_scores = np.asarray([d.pose_score for d in detections]) # (N, 20)
 
-        for i, track in enumerate(tracks):
-            iou_inertial = matching.iou_distance([track], detections)[0]
-            d_pose_inertial = self.pose_kalman_filter.gating_distance(
-                track.pose_mean, track.pose_covariance, det_poses)
-            if track.state == TrackState.Lost and track.static_mean is not None:
-                # Pose Gating for static
-                d_pose_static = self.pose_kalman_filter.gating_distance(track.static_pose_mean, track.static_pose_covariance, det_poses)
-                
-                gating_dists = np.minimum(d_pose_inertial, d_pose_static)
-                # Box iou for static
-                dt = self.frame_id - track.end_frame
-                growth = min(1.0 + 0.02 * dt, 1.4)
-                expanded_static_mean = track.static_mean.copy()
-                expanded_static_mean[2:4] *= growth
-                
-                iou_static = self.iou_distance_raw(expanded_static_mean, det_means)
-                iou_dists = np.minimum(iou_inertial, iou_static)
-            else:
-                gating_dists = d_pose_inertial
-                iou_dists = iou_inertial
+        iou_matrix = matching.iou_distance(tracks, detections)
+        if self.args.with_reid:
+            reid_matrix = matching.embedding_distance(tracks, detections)
+        else:
+            reid_matrix = np.ones((M, N), dtype=np.float32)
 
+        for i, track in enumerate(tracks):
+            bbox_maha_dists = self.kalman_filter.gating_distance(
+                track.mean, track.covariance, det_means, metric='maha'
+            )
             pose_sim = self.batch_cosine_similarity(track.pose, det_poses, det_pose_scores)
             pose_disim = (1.0 - pose_sim) / 2.0
-
-            if self.args.with_reid and track.curr_feat is not None:
-                reid_dists = matching.embedding_distance([track], detections)[0]
-            else:
-                reid_dists = np.ones(N, dtype=np.float32)
-
-
             for j in range(N):
-                if iou_dists[j] < 0.85 and gating_dists[j] < self.pose_gate_thresh:
-                    dists[i, j] = (pose_disim[j] * self.W_POSE + 
-                                   reid_dists[j] * self.W_REID + 
-                                   iou_dists[j]  * self.W_IOU)
-                else:
-                    dists[i, j] = 1.0
+                iou_dist = iou_matrix[i, j]
+                maha_dist = bbox_maha_dists[j]
+                reid_dist = reid_matrix[i, j]
+
+                if iou_dist < 0.9 or maha_dist < self.box_gate_thresh:
+                    is_interacting = np.sum(iou_matrix[:, j] < 0.7) > 1
+                    box_dist = min(iou_dist, maha_dist / self.box_gate_thresh)
+                    if not is_interacting:
+                        dists[i, j] = box_dist * 0.85 + pose_disim[j] * 0.1 + reid_dist * 0.05
+                    else:
+                        dists[i, j] = box_dist * self.W_IOU + pose_disim[j] * self.W_POSE + reid_dist * self.W_REID
+            else:
+                dists[i, j] = iou_dist
         return dists
     
     def batch_cosine_similarity(self, track_pose, det_poses, det_pose_scores):
