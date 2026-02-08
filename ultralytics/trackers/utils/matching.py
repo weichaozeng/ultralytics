@@ -84,15 +84,8 @@ def iou_distance(atracks: list, btracks: list) -> np.ndarray:
         if isinstance(tracks[0], np.ndarray):
             return np.asarray(tracks)
         return [t.xywha if t.angle is not None else t.xyxy for t in tracks]
-        
-    print("11111")
-    print(atracks)
-    print(btracks)
     atlbrs = get_coords(atracks)
     btlbrs = get_coords(btracks)
-    print("222222")
-    print(atlbrs)
-    print(btlbrs)
     ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
     if len(atlbrs) and len(btlbrs):
         if len(atlbrs[0]) == 5 and len(btlbrs[0]) == 5:
