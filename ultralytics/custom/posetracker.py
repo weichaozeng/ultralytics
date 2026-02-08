@@ -397,7 +397,7 @@ class PoseTracker(BOTSORT):
             pose_disim = (1.0 - pose_sim) / 2.0
 
             for j in range(N):
-                iou_dist = iou_dists_refined[i, j]
+                iou_dist = iou_dists_refined[j]
                 maha_dist = bbox_maha_dists[j]
                 reid_dist = reid_matrix[i, j]
                 if iou_dist < 0.9 or maha_dist < self.box_gate_thresh:
