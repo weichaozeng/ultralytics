@@ -99,7 +99,6 @@ def iou_distance(atracks: list, btracks: list) -> np.ndarray:
                 np.ascontiguousarray(btlbrs, dtype=np.float32),
                 iou=True,
             )
-    print("33333")
     return 1 - ious  # cost matrix
 
 
