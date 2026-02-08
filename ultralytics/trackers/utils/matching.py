@@ -76,12 +76,21 @@ def iou_distance(atracks: list, btracks: list) -> np.ndarray:
         >>> btracks = [np.array([5, 5, 15, 15]), np.array([25, 25, 35, 35])]
         >>> cost_matrix = iou_distance(atracks, btracks)
     """
-    if (atracks and isinstance(atracks[0], np.ndarray)) or (btracks and isinstance(btracks[0], np.ndarray)):
-        atlbrs = atracks
-        btlbrs = btracks
-    else:
-        atlbrs = [track.xywha if track.angle is not None else track.xyxy for track in atracks]
-        btlbrs = [track.xywha if track.angle is not None else track.xyxy for track in btracks]
+    # if (atracks and isinstance(atracks[0], np.ndarray)) or (btracks and isinstance(btracks[0], np.ndarray)):
+    #     atlbrs = atracks
+    #     btlbrs = btracks
+    # else:
+    #     atlbrs = [track.xywha if track.angle is not None else track.xyxy for track in atracks]
+    #     btlbrs = [track.xywha if track.angle is not None else track.xyxy for track in btracks]
+    def get_coords(tracks):
+        if not tracks:
+            return []
+        if isinstance(tracks[0], np.ndarray):
+            return tracks
+        return [t.xywha if getattr(t, 'angle', None) is not None else t.xyxy for t in tracks]
+
+    atlbrs = get_coords(atracks)
+    btlbrs = get_coords(btracks)
 
     ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
     if len(atlbrs) and len(btlbrs):
