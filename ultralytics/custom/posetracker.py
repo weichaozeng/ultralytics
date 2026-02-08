@@ -378,15 +378,14 @@ class PoseTracker(BOTSORT):
         det_poses = np.asarray([d.pose for d in detections])       # (N, 40) 
         det_pose_scores = np.asarray([d.pose_score for d in detections]) # (N, 20)
 
-        print("-1-1-1-1")
         iou_matrix = matching.iou_distance(tracks, detections)
         if self.args.with_reid:
             reid_matrix = matching.embedding_distance(tracks, detections) / 2.0
             reid_matrix[reid_matrix > (1 - self.appearance_thresh)] = 1.0
         else:
             reid_matrix = np.ones((M, N), dtype=np.float32)
-        print("0000")
         for i, track in enumerate(tracks):
+            print(track.mean.shape, track.covariance.shape, det_means.shape)
             bbox_maha_dists = self.kalman_filter.gating_distance(
                 track.mean, track.covariance, det_means, metric='maha'
             )
