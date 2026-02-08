@@ -372,7 +372,11 @@ class PoseTracker(BOTSORT):
 
         # return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
         # if visualize
-        res = np.asarray([x.result for x in (self.tracked_stracks and self.lost_stracks) if x.is_activated or x.state == TrackState.Lost], dtype=np.float32)
+        all_tracks = self.tracked_stracks + self.lost_stracks
+        res = np.asarray(
+            [x.result for x in all_tracks if x.is_activated or x.state == TrackState.Lost], 
+            dtype=np.float32
+        )
         print(f"frame id {self.frame_id} has {len(res)} vis tracks.")
         return res
 
