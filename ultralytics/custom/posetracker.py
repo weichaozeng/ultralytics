@@ -445,7 +445,7 @@ class PoseTracker(BOTSORT):
                     if in_gate:
                         box_dist = min(iou_dist, maha_dist / self.box_gate_thresh)
                     elif has_iou:
-                        box_dist = min(0.99, box_dist * 1.1)
+                        box_dist = min(0.99, iou_dist * 1.1)
                     else:
                         box_dist = min(0.99, iou_dist * 1.3)
 
