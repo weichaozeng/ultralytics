@@ -380,7 +380,8 @@ class PoseTracker(BOTSORT):
 
         iou_matrix = matching.iou_distance(tracks, detections)
         if self.args.with_reid:
-            reid_matrix = matching.embedding_distance(tracks, detections)
+            reid_matrix = matching.embedding_distance(tracks, detections) / 2.0
+            reid_matrix[reid_matrix > (1 - self.appearance_thresh)] = 1.0
         else:
             reid_matrix = np.ones((M, N), dtype=np.float32)
 
@@ -388,16 +389,18 @@ class PoseTracker(BOTSORT):
             bbox_maha_dists = self.kalman_filter.gating_distance(
                 track.mean, track.covariance, det_means, metric='maha'
             )
+            print("111")
             pose_sim = self.batch_cosine_similarity(track.pose, det_poses, det_pose_scores)
             pose_disim = (1.0 - pose_sim) / 2.0
             for j in range(N):
                 iou_dist = iou_matrix[i, j]
                 maha_dist = bbox_maha_dists[j]
                 reid_dist = reid_matrix[i, j]
-
+                print("2222")
                 if iou_dist < 0.9 or maha_dist < self.box_gate_thresh:
                     is_interacting = np.sum(iou_matrix[:, j] < 0.7) > 1
                     box_dist = min(iou_dist, maha_dist / self.box_gate_thresh)
+                    print("3333")
                     if not is_interacting:
                         dists[i, j] = box_dist * 0.85 + pose_disim[j] * 0.1 + reid_dist * 0.05
                     else:
