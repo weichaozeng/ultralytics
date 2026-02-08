@@ -279,7 +279,6 @@ class PoseTracker(BOTSORT):
             dets.xywh[mask_second], dets.conf[mask_second], dets.cls[mask_second],
             poses.xy[mask_second], poses.conf[mask_second], feats_second
         )
-        print("000000")
         unconfirmed = [t for t in self.tracked_stracks if not t.is_activated]
         tracked_stracks = [t for t in self.tracked_stracks if t.is_activated]
         strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
@@ -290,7 +289,6 @@ class PoseTracker(BOTSORT):
             PTrack.multi_gmc(unconfirmed, warp)
 
         # First Association
-        print("11111")
         dists = self.get_dists(strack_pool, detections)
         matches, u_track, u_det = matching.linear_assignment(dists, self.first_match_thresh)
         for itracked, idet in matches:
@@ -302,7 +300,7 @@ class PoseTracker(BOTSORT):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
-        print("22222")
+
         # Second Association
         # r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         r_strack_pool = [strack_pool[i] for i in u_track]
@@ -324,7 +322,7 @@ class PoseTracker(BOTSORT):
             if track.state == TrackState.Tracked:
                 track.mark_lost()
                 lost_stracks.append(track)
-        print("33333")
+
         # Third for unconfirmed tracks and remaining detections
         detections_remaining = [detections[i] for i in u_det]
         dists_unconfirmed = self.get_iou_dists(unconfirmed, detections_remaining)
@@ -347,7 +345,6 @@ class PoseTracker(BOTSORT):
             activated_stracks.append(track)
         
         # Fourth for time out lost tracks
-        print("44444")
         for track in self.lost_stracks:
             if self.frame_id - track.end_frame > self.max_time_lost:
                 track.mark_removed()
@@ -362,7 +359,6 @@ class PoseTracker(BOTSORT):
         self.lost_stracks = self.sub_stracks(self.lost_stracks, removed_stracks)
 
         # self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
-        print("55555")
         self.removed_stracks.extend(removed_stracks)
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]
