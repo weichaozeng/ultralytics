@@ -257,7 +257,8 @@ class PoseTracker(BOTSORT):
     def update(self, dets, poses, img, feats):
         self.frame_id += 1
         print(self.frame_id)
-
+        print(f"dets: {len(dets)}")
+    
         activated_stracks = []  
         refind_stracks = []    
         lost_stracks = []      
