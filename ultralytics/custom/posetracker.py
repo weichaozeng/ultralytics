@@ -257,6 +257,12 @@ class PoseTracker(BOTSORT):
     def update(self, dets, poses, img, feats):
         self.frame_id += 1
         print(self.frame_id)
+
+        activated_stracks = []  
+        refind_stracks = []    
+        lost_stracks = []      
+        removed_stracks = [] 
+
         pose_scores = np.mean(poses.conf, axis=1)
         combined_scores = 0.5 * dets.conf + 0.5 * pose_scores
 
@@ -293,8 +299,10 @@ class PoseTracker(BOTSORT):
             det = detections[idet]
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
+                activated_stracks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
+                refind_stracks.append(track)
         
         # Second Association
         # r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
@@ -307,13 +315,16 @@ class PoseTracker(BOTSORT):
             det = detections_second[idet]
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
+                activated_stracks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
+                refind_stracks.append(track)
 
         for it in u_track_second:
             track = r_strack_pool[it]
             if track.state == TrackState.Tracked:
                 track.mark_lost()
+                lost_stracks.append(track)
 
         # Third for unconfirmed tracks and remaining detections
         detections_remaining = [detections[i] for i in u_det]
@@ -322,9 +333,11 @@ class PoseTracker(BOTSORT):
 
         for itracked, idet in matches_unconf:
             unconfirmed[itracked].update(detections_remaining[idet], self.frame_id)
-        
+            activated_stracks.append(unconfirmed[itracked])
+
         for it in u_unconf:
             unconfirmed[it].mark_removed()
+            removed_stracks.append(unconfirmed[it])
 
         for inew in u_det_unconf:
             track = detections_remaining[inew]
@@ -332,16 +345,26 @@ class PoseTracker(BOTSORT):
             if track.score < self.args.new_track_thresh:
                 continue
             track.activate(self.kalman_filter, self.pose_kalman_filter, self.frame_id)
-            self.tracked_stracks.append(track)
+            activated_stracks.append(track)
         
         # Fourth for time out lost tracks
         for track in self.lost_stracks:
             if self.frame_id - track.end_frame > self.max_time_lost:
                 track.mark_removed()
+                removed_stracks.append(track)
 
-        self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
-        self.lost_stracks = [t for t in self.lost_stracks if t.state == TrackState.Lost]
-        self.removed_stracks = [t for t in self.removed_stracks if t.state == TrackState.Removed]
+        self.tracked_stracks = self.joint_stracks(self.tracked_stracks, activated_stracks)
+        self.tracked_stracks = self.joint_stracks(self.tracked_stracks, refind_stracks)
+
+        self.lost_stracks = self.sub_stracks(self.lost_stracks, self.tracked_stracks)
+        self.lost_stracks.extend(lost_stracks)
+        self.lost_stracks = self.sub_stracks(self.lost_stracks, removed_stracks)
+
+        # self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
+
+        self.removed_stracks.extend(removed_stracks)
+        if len(self.removed_stracks) > 1000:
+            self.removed_stracks = self.removed_stracks[-999:]
 
         return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
         # if visualize
@@ -615,7 +638,7 @@ class PoseTracker(BOTSORT):
 #         if len(self.removed_stracks) > 1000:
 #             self.removed_stracks = self.removed_stracks[-999:]
         
-#         return √[x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+#         return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
 
     
 #     def multi_predict(self, tracks: list[PTrack]):
