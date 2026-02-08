@@ -217,11 +217,14 @@ class PoseTracker(BOTSORT):
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = KalmanFilterPose()
         self.box_gate_thresh = getattr(args, 'box_gate_thresh', 9.488) 
-        self.first_match_thresh = getattr(args, 'first_match_thresh', 0.8)
+        self.first_match_thresh = getattr(args, 'first_match_thresh', 0.9)
         self.second_match_thresh = getattr(args, 'second_match_thresh', 0.6)
         self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.6)
 
-        # for interacting in get_dists
+        self.WO_POSE = 0.2
+        self.WO_REID = 0.05
+        self.WO_IOU = 0.75
+        # with interacting in get_dists
         self.W_POSE = 0.6
         self.W_REID = 0.1
         self.W_IOU  = 0.3
@@ -436,7 +439,7 @@ class PoseTracker(BOTSORT):
                     is_interacting = np.sum(iou_matrix[:, j] < 0.7) > 1
                     box_dist = min(iou_dist, maha_dist / self.box_gate_thresh)
                     if not is_interacting:
-                        dists[i, j] = box_dist * 0.85 + pose_disim[j] * 0.1 + reid_dist * 0.05
+                        dists[i, j] = box_dist * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_dist * self.W_REID
                     else:
                         dists[i, j] = box_dist * self.W_IOU + pose_disim[j] * self.W_POSE + reid_dist * self.W_REID
                 else:
