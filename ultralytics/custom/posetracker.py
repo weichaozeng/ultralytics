@@ -389,13 +389,13 @@ class PoseTracker(BOTSORT):
                 track.mean, track.covariance, det_means, metric='maha'
             )
             if track.state == TrackState.Lost and track.static_mean is not None:
-                static_iou_dists = self.iou_distance_raw(track.static_mean, det_means)
+                static_iou_dists = matching.iou_distance(track.static_mean, det_means)[0]
                 iou_dists_refined = np.minimum(iou_matrix[i], static_iou_dists)
             else:
                 iou_dists_refined = iou_matrix[i]
             pose_sim = self.batch_cosine_similarity(track.pose, det_poses, det_pose_scores)
             pose_disim = (1.0 - pose_sim) / 2.0
-            
+
             for j in range(N):
                 iou_dist = iou_dists_refined[i, j]
                 maha_dist = bbox_maha_dists[j]
