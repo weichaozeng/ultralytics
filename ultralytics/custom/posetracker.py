@@ -458,7 +458,7 @@ class PoseTracker(BOTSORT):
                     is_lost = track.state == TrackState.Lost
                     if is_lost:
                         if in_gate:
-                            box_dist = 0.8 * iou_dist + 0.2 * (maha_dist / self.box_gate_thresh)
+                            box_dist = 0.5 * iou_dist + 0.5 * (maha_dist / self.box_gate_thresh)
                         else:
                             box_dist = min(0.99, iou_dist * 1.2)
                     elif is_interacting:
@@ -482,7 +482,7 @@ class PoseTracker(BOTSORT):
         if N == 0:
             return np.array([], dtype=np.float32)
         # bone importancy
-        finger_decay = np.array([1.0, 0.1, 0.1, 0.1], dtype=np.float32)
+        finger_decay = np.array([1.0, 0.5, 0.3, 0.1], dtype=np.float32)
         pos_weights = np.tile(finger_decay, 5)
 
         # length-based gating
