@@ -71,9 +71,11 @@ class PTrack(BOTrack):
         super().mark_lost()
         if self.mean is not None:
             self.static_mean = self.mean.copy()
+            self.static_mean[4:] = 0
             self.static_covariance = self.covariance.copy()
         if self.pose_mean is not None:
             self.static_pose_mean = self.pose_mean.copy()
+            self.static_pose_mean[20:] = 0
             self.static_pose_covariance = self.pose_covariance.copy()
             self.static_wrist_rel_to_box = self.wrist_rel_to_box.copy()
 
@@ -102,6 +104,8 @@ class PTrack(BOTrack):
         self.pose, self.pose_score = rel_pose, rel_score
         self.raw_pixel_kps = new_det.raw_pixel_kps.copy()
         self.raw_pixel_kps_score = new_det.raw_pixel_kps_score.copy()
+        self.wrist_rel_to_box = new_det.wrist_rel_to_box.copy()
+
         self.static_mean = self.static_pose_mean = self.static_wrist_rel_to_box = None
         self.static_covariance = self.static_pose_covariance = None
 
@@ -470,18 +474,23 @@ class PoseTracker(BOTSORT):
         N = det_poses.shape[0]
         if N == 0:
             return np.array([], dtype=np.float32)
-        # weighted for importancy of pose direction
-        finger_decay = np.array([1.0, 0.8, 0.6, 0.4], dtype=np.float32)
+        # bone importancy
+        finger_decay = np.array([1.0, 0.5, 0.3, 0.1], dtype=np.float32)
         pos_weights = np.tile(finger_decay, 5)
 
+        # length-based gating
         t_v = track_pose.reshape(20, 2)
         d_vs = det_poses.reshape(-1, 20, 2)
 
         t_v_unit = t_v / (np.linalg.norm(t_v, axis=1, keepdims=True) + 1e-6)
         d_vs_unit = d_vs / (np.linalg.norm(d_vs, axis=2, keepdims=True) + 1e-6)
 
+        d_lens = np.linalg.norm(d_vs, axis=2)  # (N, 20)
+        max_lens = np.max(d_lens, axis=1, keepdims=True) + 1e-6 # (N, 1)
+        len_weights = np.clip(d_lens / (max_lens * 0.5), 0.1, 1.0)
+
         cos_matrix = np.einsum('jk,ijk->ij', t_v_unit, d_vs_unit)
-        combined_weights = det_pose_scores * pos_weights
+        combined_weights = det_pose_scores * pos_weights * len_weights
         weights_sum = np.sum(combined_weights, axis=1, keepdims=True) + 1e-6
 
         weighted_cos_sim = np.sum(cos_matrix * combined_weights, axis=1, keepdims=True) / weights_sum
