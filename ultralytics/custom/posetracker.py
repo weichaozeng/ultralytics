@@ -452,10 +452,9 @@ class PoseTracker(BOTSORT):
                 reid_dist = reid_matrix[i, j]
 
                 in_gate = maha_dist < self.box_gate_thresh
-                has_iou = iou_dist < 0.9
                 pose_reliable = pose_disim[j] < 0.3
 
-                if in_gate or has_iou or pose_reliable:
+                if in_gate or pose_reliable:
                     is_interacting = np.sum(iou_matrix[:, j] < 0.7) > 1
                     is_lost = track.state == TrackState.Lost
                     if is_lost:
