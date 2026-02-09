@@ -443,6 +443,8 @@ class PoseTracker(BOTSORT):
                 iou_dists_refined = iou_matrix[i]
             pose_sim = self.batch_cosine_similarity(track.pose, det_poses, det_pose_scores)
             pose_disim = (1.0 - pose_sim) / 2.0
+            if self.frame_id == 54:
+                print(pose_disim)
 
             for j in range(N):
                 iou_dist = iou_dists_refined[j]
