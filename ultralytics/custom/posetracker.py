@@ -475,7 +475,7 @@ class PoseTracker(BOTSORT):
         if N == 0:
             return np.array([], dtype=np.float32)
         # bone importancy
-        finger_decay = np.array([1.0, 0.5, 0.3, 0.1], dtype=np.float32)
+        finger_decay = np.array([1.0, 0.1, 0.1, 0.1], dtype=np.float32)
         pos_weights = np.tile(finger_decay, 5)
 
         # length-based gating
