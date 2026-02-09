@@ -477,6 +477,8 @@ class PoseTracker(BOTSORT):
                         dists[i, j] = box_dist * self.W_IOU + pose_disim[j] * self.W_POSE + reid_dist * self.W_REID
                 else:
                     dists[i, j] = 1.0
+        if self.frame_id == 54:
+            print(dists)
         return dists
     
     def batch_cosine_similarity(self, track_pose, det_poses, det_pose_scores):
