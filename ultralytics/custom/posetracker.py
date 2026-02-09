@@ -265,7 +265,7 @@ class PoseTracker(BOTSORT):
         self.frame_id += 1
         print(self.frame_id)
         print(f"dets: {len(dets)}")
-        if self.frame_id in [52, 53, 54, 55, 56]:
+        if self.frame_id in [53, 54, 55, 56]:
             print("here")
     
         activated_stracks = []  
@@ -455,12 +455,19 @@ class PoseTracker(BOTSORT):
 
                 if in_gate or has_iou or pose_reliable:
                     is_interacting = np.sum(iou_matrix[:, j] < 0.7) > 1
-                    if in_gate:
-                        box_dist = min(iou_dist, maha_dist / self.box_gate_thresh)
-                    elif has_iou:
-                        box_dist = min(0.99, iou_dist * 1.1)
+                    is_lost = track.state == TrackState.Lost
+                    if is_lost:
+                        if in_gate:
+                            box_dist = 0.8 * iou_dist + 0.2 * (maha_dist / self.box_gate_thresh)
+                        else:
+                            box_dist = min(0.99, iou_dist * 1.2)
+                    elif is_interacting:
+                        if pose_reliable:
+                            box_dist = iou_dist * 0.9
+                        else:
+                             box_dist = iou_dist
                     else:
-                        box_dist = min(0.99, iou_dist * 1.3)
+                        box_dist = iou_dist
 
                     if not is_interacting:
                         dists[i, j] = box_dist * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_dist * self.W_REID
