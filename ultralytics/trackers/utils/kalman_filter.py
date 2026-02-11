@@ -497,7 +497,7 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
         only_position: bool = False,
         metric: str = "maha",
         parallel_gain = 0.5, 
-        ortho_gain = 2.0,
+        ortho_gain = 5.0,
     ) -> np.ndarray:
       
         mean_proj, cov_proj = self.project(mean, covariance)
@@ -509,7 +509,7 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
 
         vx, vy = mean[4], mean[5]
         speed = np.sqrt(vx**2 + vy**2)
-        if speed > 1e-3: 
+        if speed > 10: 
             v_unit = np.array([vx / speed, vy / speed])
             v_ortho = np.array([vy / speed, -vx / speed])
 
