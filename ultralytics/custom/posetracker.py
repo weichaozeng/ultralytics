@@ -445,6 +445,7 @@ class PoseTracker(BOTSORT):
             pose_disim = (1.0 - pose_sim) / 2.0
             if self.frame_id == 54:
                 print(pose_disim)
+                print(bbox_maha_dists)
 
             for j in range(N):
                 iou_dist = iou_dists_refined[j]
@@ -459,7 +460,7 @@ class PoseTracker(BOTSORT):
                     is_lost = track.state == TrackState.Lost
                     if is_lost:
                         if in_gate:
-                            box_dist = 0.5 * iou_dist + 0.5 * (maha_dist / self.box_gate_thresh)
+                            box_dist = 0.5 * iou_dist + 0.5 * max(0.1, maha_dist / self.box_gate_thresh)
                         else:
                             box_dist = min(0.99, iou_dist * 1.2)
                     elif is_interacting:

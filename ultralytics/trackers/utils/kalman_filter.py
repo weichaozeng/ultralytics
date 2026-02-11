@@ -487,3 +487,45 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
             >>> new_mean, new_covariance = kf.update(mean, covariance, measurement)
         """
         return super().update(mean, covariance, measurement)
+
+
+    def gating_distance(
+        self,
+        mean: np.ndarray,
+        covariance: np.ndarray,
+        measurements: np.ndarray,
+        only_position: bool = False,
+        metric: str = "maha",
+        parallel_gain = 0.5, 
+        ortho_gain = 2.0,
+    ) -> np.ndarray:
+      
+        mean_proj, cov_proj = self.project(mean, covariance)
+        if only_position:
+            mean_proj, cov_proj = mean_proj[:2], cov_proj[:2, :2]
+            measurements = measurements[:, :2]
+        
+        d = measurements - mean_proj
+
+        vx, vy = mean[4], mean[5]
+        speed = np.sqrt(vx**2 + vy**2)
+        if speed > 1e-3: 
+            v_unit = np.array([vx / speed, vy / speed])
+            v_ortho = np.array([vy / speed, -vx / speed])
+
+            d_pos = d[:, :2]
+            proj_parallel = np.dot(d_pos, v_unit)  # (N,)
+            proj_ortho = np.dot(d_pos, v_ortho)    # (N,)
+
+            d_pos_new = (proj_parallel[:, None] * v_unit * parallel_gain + 
+                     proj_ortho[:, None] * v_ortho * ortho_gain)
+            d[:, :2] = d_pos_new
+        
+        if metric == "gaussian":
+            return np.sum(d * d, axis=1)
+        elif metric == "maha":
+            cholesky_factor = np.linalg.cholesky(cov_proj)
+            z = scipy.linalg.solve_triangular(cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
+            return np.sum(z * z, axis=0)  # square maha
+        else:
+            raise ValueError("Invalid distance metric")
