@@ -484,8 +484,6 @@ class PoseTracker(BOTSORT):
                 for k, idx in enumerate(potential_matches):
                     if k == min_pose_idx and current_pose_disims[k] < 0.25:
                         dists[idx, j] = current_pose_disims[k]
-                    else:
-                        dists[idx, j] = max(dists[idx, j], 0.9)
         # if self.frame_id == 54: 
         #     print(dists)
         return dists
