@@ -263,10 +263,10 @@ class PoseTracker(BOTSORT):
     
     def update(self, dets, poses, img, feats):
         self.frame_id += 1
-        # print(self.frame_id)
-        # print(f"dets: {len(dets)}")
-        # if self.frame_id in [53, 54, 55, 56]:
-        #     print("here")
+        print(self.frame_id)
+        print(f"dets: {len(dets)}")
+        if self.frame_id in [70, 71, 324, 325]:
+            print("here")
     
         activated_stracks = []  
         refind_stracks = []    
@@ -459,8 +459,8 @@ class PoseTracker(BOTSORT):
                 if in_gate or pose_reliable:
                     if track.state == TrackState.Tracked:
                         dists[i, j] = iou_dists_refined[j] * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
-                    elif pose_unreliable:
-                        dists[i, j] = 1.0
+                    # elif pose_unreliable:
+                    #     dists[i, j] = 1.0
                     else:
                         m_dist = max(0.1, bbox_maha_dists[j] / self.box_gate_thresh)
                         box_score = (iou_dists_refined[j] + m_dist) / 2
