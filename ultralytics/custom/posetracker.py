@@ -473,11 +473,19 @@ class PoseTracker(BOTSORT):
         for j in range(N):
             potential_matches = np.where(dists[:, j] < 0.9)[0]
             if len(potential_matches) > 1:
-                for idx in potential_matches:
-                    if pose_disim_matrix[idx, j] < 0.15:
-                        dists[idx, j] = pose_disim_matrix[idx, j]
-                    elif pose_disim_matrix[idx, j] > 0.5:
-                        dists[idx, j] = 1.0
+                # for idx in potential_matches:
+                #     if pose_disim_matrix[idx, j] < 0.15:
+                #         dists[idx, j] = pose_disim_matrix[idx, j]
+                #     elif pose_disim_matrix[idx, j] > 0.5:
+                #         dists[idx, j] = 1.0
+                # modify
+                current_pose_disims = pose_disim_matrix[potential_matches, j]
+                min_pose_idx = np.argmin(current_pose_disims)
+                for k, idx in enumerate(potential_matches):
+                    if k == min_pose_idx and current_pose_disims[k] < 0.25:
+                        dists[idx, j] = current_pose_disims[k]
+                    else:
+                        dists[idx, j] = max(dists[idx, j], 0.9)
         # if self.frame_id == 54: 
         #     print(dists)
         return dists
