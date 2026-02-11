@@ -486,7 +486,7 @@ class PoseTracker(BOTSORT):
                     is_track_own_best = (j == np.argmin(pose_disim_matrix[idx, :]))
                     if this_pose_val == min_pose_val and this_pose_val < 0.1:
                         dists[idx, j] = this_pose_val
-                    elif this_pose_val > 0.5:
+                    elif this_pose_val > 0.8:
                         if this_pose_val > min_pose_val and not is_track_own_best:
                             dists[idx, j] = 1.0
                         else:
