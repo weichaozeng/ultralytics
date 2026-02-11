@@ -454,7 +454,7 @@ class PoseTracker(BOTSORT):
 
 
             for j in range(N):
-                if pixel_dists[j] > dead_lines[j] and pose_disim[j] > 0.15:
+                if pixel_dists[j] > dead_lines[j]:
                     continue
                 in_gate = bbox_maha_dists[j] < self.box_gate_thresh
                 pose_reliable = pose_disim[j] < 0.25
