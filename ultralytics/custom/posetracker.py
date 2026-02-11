@@ -221,9 +221,9 @@ class PoseTracker(BOTSORT):
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = KalmanFilterPose()
         self.box_gate_thresh = getattr(args, 'box_gate_thresh', 9.488) 
-        self.first_match_thresh = getattr(args, 'first_match_thresh', 0.6)
-        self.second_match_thresh = getattr(args, 'second_match_thresh', 0.6)
-        self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.6)
+        self.first_match_thresh = getattr(args, 'first_match_thresh', 0.62)
+        self.second_match_thresh = getattr(args, 'second_match_thresh', 0.62)
+        self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.62)
 
         self.WO_POSE = 0.2
         self.WO_REID = 0.05
@@ -450,7 +450,7 @@ class PoseTracker(BOTSORT):
             pose_disim_matrix[i, :] = pose_disim
             
             pixel_dists = np.linalg.norm(det_xywhs[:, :2] - track.mean[:2], axis=1)
-            dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * 5.0
+            dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * 3.0
 
 
             for j in range(N):
@@ -460,7 +460,7 @@ class PoseTracker(BOTSORT):
                 in_gate = bbox_maha_dists[j] < self.box_gate_thresh
                 pose_reliable = pose_disim[j] < 0.25
                 if has_iou or in_gate or pose_reliable:
-                    box_score = min(iou_dists_refined[j], bbox_maha_dists[j] / self.box_gate_thresh)
+                    box_score = min(iou_dists_refined[j], max(bbox_maha_dists[j] / self.box_gate_thresh, 0.5))
                     # if track.state == TrackState.Tracked:
                     #     dists[i, j] = box_score * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
                     # else:
@@ -471,7 +471,7 @@ class PoseTracker(BOTSORT):
                     dists[i, j] = min(dist_WO, dist_W)
             
         for j in range(N):
-            potential_matches = np.where(dists[:, j] < 0.6)[0]
+            potential_matches = np.where(dists[:, j] < 0.62)[0]
             if len(potential_matches) > 1:
                 # for idx in potential_matches:
                 #     if pose_disim_matrix[idx, j] < 0.15:
