@@ -221,7 +221,7 @@ class PoseTracker(BOTSORT):
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = KalmanFilterPose()
         self.box_gate_thresh = getattr(args, 'box_gate_thresh', 9.488) 
-        self.first_match_thresh = getattr(args, 'first_match_thresh', 0.9)
+        self.first_match_thresh = getattr(args, 'first_match_thresh', 0.6)
         self.second_match_thresh = getattr(args, 'second_match_thresh', 0.6)
         self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.6)
 
@@ -471,7 +471,7 @@ class PoseTracker(BOTSORT):
                     dists[i, j] = min(dist_WO, dist_W)
             
         for j in range(N):
-            potential_matches = np.where(dists[:, j] < 0.9)[0]
+            potential_matches = np.where(dists[:, j] < 0.6)[0]
             if len(potential_matches) > 1:
                 # for idx in potential_matches:
                 #     if pose_disim_matrix[idx, j] < 0.15:
