@@ -422,6 +422,7 @@ class PoseTracker(BOTSORT):
         det_pose_scores = np.array([d.pose_score for d in detections], dtype=np.float32) # (N, 20)
 
         iou_matrix = matching.iou_distance(tracks, detections)
+        pose_disim_matrix = np.ones((M, N), dtype=np.float32)
         if self.args.with_reid:
             reid_matrix = matching.embedding_distance(tracks, detections) / 2.0
             reid_matrix[reid_matrix > (1 - self.appearance_thresh)] = 1.0
@@ -443,40 +444,30 @@ class PoseTracker(BOTSORT):
                 iou_dists_refined = iou_matrix[i]
             pose_sim = self.batch_cosine_similarity(track.pose, det_poses, det_pose_scores)
             pose_disim = (1.0 - pose_sim) / 2.0
-            if self.frame_id == 54:
-                print(pose_disim)
-                print(bbox_maha_dists)
+            pose_disim_matrix[i, :] = pose_disim
+            
+            pixel_dists = np.linalg.norm(det_xywhs[:, :2] - track.mean[:2], axis=1)
+            dead_lines = min(track.mean[3], det_xywhs[:, 3]) * 5.0
+
 
             for j in range(N):
-                iou_dist = iou_dists_refined[j]
-                maha_dist = bbox_maha_dists[j]
-                reid_dist = reid_matrix[i, j]
-
-                in_gate = maha_dist < self.box_gate_thresh
-                pose_reliable = pose_disim[j] < 0.3
-
+                if pixel_dists[j] > dead_lines[j] and pose_disim[j] > 0.15:
+                    continue
+                in_gate = bbox_maha_dists[j] < self.box_gate_thresh
+                pose_reliable = pose_disim[j] < 0.25
                 if in_gate or pose_reliable:
-                    is_interacting = np.sum(iou_matrix[:, j] < 0.7) > 1
-                    is_lost = track.state == TrackState.Lost
-                    if is_lost:
-                        if in_gate:
-                            box_dist = 0.5 * iou_dist + 0.5 * max(0.1, maha_dist / self.box_gate_thresh)
-                        else:
-                            box_dist = min(0.99, iou_dist * 1.2)
-                    elif is_interacting:
-                        if pose_reliable:
-                            box_dist = iou_dist * 0.9
-                        else:
-                             box_dist = iou_dist
+                    if track.state == TrackState.Tracked:
+                        dists[i, j] = iou_dists_refined[j] * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
                     else:
-                        box_dist = iou_dist
-
-                    if not is_interacting:
-                        dists[i, j] = box_dist * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_dist * self.W_REID
-                    else:
-                        dists[i, j] = box_dist * self.W_IOU + pose_disim[j] * self.W_POSE + reid_dist * self.W_REID
-                else:
-                    dists[i, j] = 1.0
+                        m_dist = max(0.1, bbox_maha_dists[j] / self.box_gate_thresh)
+                        box_score = (iou_dists_refined[j] + m_dist) / 2
+                        dists[i, j] = box_score * self.W_IOU + pose_disim[j] * self.W_POSE + reid_matrix[i, j] * self.W_REID
+            
+        for j in range(N):
+            potential_matches = np.where(dists[:, j] < 0.6)[0]
+            if len(potential_matches) > 1:
+                for idx in potential_matches:
+                    dists[idx, j] = pose_disim_matrix[idx, j]
         if self.frame_id == 54:
             print(dists)
         return dists
