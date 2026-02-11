@@ -433,6 +433,9 @@ class PoseTracker(BOTSORT):
                 track.mean, track.covariance, det_xywhs, metric='maha'
             )
             pose_sim = self.batch_cosine_similarity(track.pose_mean[:40], det_poses, det_pose_scores)
+            pixel_dists = np.linalg.norm(det_xywhs[:, :2] - track.mean[:2], axis=1)
+            dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * 3.0
+
             if track.state == TrackState.Lost and track.static_mean is not None:
                 dt = self.frame_id - track.end_frame
                 growth = min(1.0 + 0.02 * dt, 1.4)
@@ -443,18 +446,19 @@ class PoseTracker(BOTSORT):
                 iou_dists_refined = np.minimum(iou_matrix[i], static_iou_dists)
                 static_pose_sim = self.batch_cosine_similarity(track.static_pose_mean[:40], det_poses, det_pose_scores)
                 pose_sim = np.maximum(pose_sim, static_pose_sim)
+                static_pixel_dists = np.linalg.norm(det_xywhs[:, :2] - track.static_mean[:2], axis=1)
+                static_dead_lines = np.minimum(track.static_mean[3], det_xywhs[:, 3]) * 3.0
             else:
                 iou_dists_refined = iou_matrix[i]
+                static_pixel_dists = np.ones(det_xywhs[:, 3])
+                static_dead_lines = np.zeros(det_xywhs[:, 3])
+                
            
             pose_disim = (1.0 - pose_sim) / 2.0
             pose_disim_matrix[i, :] = pose_disim
             
-            pixel_dists = np.linalg.norm(det_xywhs[:, :2] - track.mean[:2], axis=1)
-            dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * 3.0
-
-
             for j in range(N):
-                if pixel_dists[j] > dead_lines[j]:
+                if pixel_dists[j] > dead_lines[j] and static_pixel_dists[j] > static_dead_lines[j]:
                     continue
                 has_iou = iou_dists_refined[j] < 1.0
                 in_gate = bbox_maha_dists[j] < self.box_gate_thresh
@@ -484,7 +488,7 @@ class PoseTracker(BOTSORT):
                 for k, idx in enumerate(potential_matches):
                     this_pose_val = current_pose_disims[k]
                     is_track_own_best = (j == np.argmin(pose_disim_matrix[idx, :]))
-                    if this_pose_val == min_pose_val and this_pose_val < 0.1:
+                    if this_pose_val == min_pose_val and this_pose_val < 0.2:
                         dists[idx, j] = this_pose_val
                     elif this_pose_val > 0.8:
                         if this_pose_val > min_pose_val and not is_track_own_best:
