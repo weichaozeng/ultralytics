@@ -455,24 +455,23 @@ class PoseTracker(BOTSORT):
                     continue
                 in_gate = bbox_maha_dists[j] < self.box_gate_thresh
                 pose_reliable = pose_disim[j] < 0.25
-                pose_unreliable = pose_disim[j] > 0.5
                 if in_gate or pose_reliable:
                     if track.state == TrackState.Tracked:
                         dists[i, j] = iou_dists_refined[j] * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
-                    # elif pose_unreliable:
-                    #     dists[i, j] = 1.0
                     else:
                         m_dist = max(0.1, bbox_maha_dists[j] / self.box_gate_thresh)
                         box_score = (iou_dists_refined[j] + m_dist) / 2
                         dists[i, j] = box_score * self.W_IOU + pose_disim[j] * self.W_POSE + reid_matrix[i, j] * self.W_REID
             
         for j in range(N):
-            potential_matches = np.where(dists[:, j] < 0.6)[0]
+            potential_matches = np.where(dists[:, j] < 0.8)[0]
             if len(potential_matches) > 1:
                 for idx in potential_matches:
                     if pose_disim_matrix[idx, j] < 0.15:
                         dists[idx, j] = pose_disim_matrix[idx, j]
-        # if self.frame_id == 54:
+                    elif pose_disim_matrix[idx, j] > 0.5:
+                        dists[idx, j] = 1.0
+        # if self.frame_id == 54: 
         #     print(dists)
         return dists
     
