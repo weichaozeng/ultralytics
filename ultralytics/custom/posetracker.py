@@ -447,7 +447,7 @@ class PoseTracker(BOTSORT):
             pose_disim_matrix[i, :] = pose_disim
             
             pixel_dists = np.linalg.norm(det_xywhs[:, :2] - track.mean[:2], axis=1)
-            dead_lines = min(track.mean[3], det_xywhs[:, 3]) * 5.0
+            dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * 5.0
 
 
             for j in range(N):
@@ -467,7 +467,8 @@ class PoseTracker(BOTSORT):
             potential_matches = np.where(dists[:, j] < 0.6)[0]
             if len(potential_matches) > 1:
                 for idx in potential_matches:
-                    dists[idx, j] = pose_disim_matrix[idx, j]
+                    if pose_disim_matrix[idx, j] < 0.15:
+                        dists[idx, j] = pose_disim_matrix[idx, j]
         if self.frame_id == 54:
             print(dists)
         return dists
