@@ -467,7 +467,7 @@ class PoseTracker(BOTSORT):
                         dists[i, j] = box_score * self.W_IOU + pose_disim[j] * self.W_POSE + reid_matrix[i, j] * self.W_REID
             
         for j in range(N):
-            potential_matches = np.where(dists[:, j] < 0.8)[0]
+            potential_matches = np.where(dists[:, j] < 0.9)[0]
             if len(potential_matches) > 1:
                 for idx in potential_matches:
                     if pose_disim_matrix[idx, j] < 0.15:
