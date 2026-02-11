@@ -459,12 +459,15 @@ class PoseTracker(BOTSORT):
                 in_gate = bbox_maha_dists[j] < self.box_gate_thresh
                 pose_reliable = pose_disim[j] < 0.25
                 if in_gate or pose_reliable:
-                    if track.state == TrackState.Tracked:
-                        dists[i, j] = iou_dists_refined[j] * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
-                    else:
-                        m_dist = max(0.1, bbox_maha_dists[j] / self.box_gate_thresh)
-                        box_score = (iou_dists_refined[j] + m_dist) / 2
-                        dists[i, j] = box_score * self.W_IOU + pose_disim[j] * self.W_POSE + reid_matrix[i, j] * self.W_REID
+                    box_score = min(iou_dists_refined[j], bbox_maha_dists[j] / self.box_gate_thresh)
+                    # if track.state == TrackState.Tracked:
+                    #     dists[i, j] = box_score * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
+                    # else:
+                    #     dists[i, j] = box_score * self.W_IOU + pose_disim[j] * self.W_POSE + reid_matrix[i, j] * self.W_REID
+                    # modify
+                    dist_WO = box_score * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
+                    dist_W = box_score * self.W_IOU + pose_disim[j] * self.W_POSE + reid_matrix[i, j] * self.W_REID
+                    dists[i, j] = min(dist_WO, dist_W)
             
         for j in range(N):
             potential_matches = np.where(dists[:, j] < 0.9)[0]
