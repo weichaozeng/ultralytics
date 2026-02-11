@@ -263,10 +263,10 @@ class PoseTracker(BOTSORT):
     
     def update(self, dets, poses, img, feats):
         self.frame_id += 1
-        print(self.frame_id)
-        print(f"dets: {len(dets)}")
-        if self.frame_id in [53, 54, 55, 56]:
-            print("here")
+        # print(self.frame_id)
+        # print(f"dets: {len(dets)}")
+        # if self.frame_id in [53, 54, 55, 56]:
+        #     print("here")
     
         activated_stracks = []  
         refind_stracks = []    
@@ -472,8 +472,8 @@ class PoseTracker(BOTSORT):
                 for idx in potential_matches:
                     if pose_disim_matrix[idx, j] < 0.15:
                         dists[idx, j] = pose_disim_matrix[idx, j]
-        if self.frame_id == 54:
-            print(dists)
+        # if self.frame_id == 54:
+        #     print(dists)
         return dists
     
     def batch_cosine_similarity(self, track_pose, det_poses, det_pose_scores):
