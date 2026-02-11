@@ -441,7 +441,7 @@ class PoseTracker(BOTSORT):
                 s_xyxy = self.xywh2xyxy(s_xywh)
                 static_iou_dists = matching.iou_distance(s_xyxy, det_xyxys)[0]
                 iou_dists_refined = np.minimum(iou_matrix[i], static_iou_dists)
-                static_pose_sim = self.batch_cosine_similarity(track.pose_mean_static[:40], det_poses, det_pose_scores)
+                static_pose_sim = self.batch_cosine_similarity(track.static_pose_mean[:40], det_poses, det_pose_scores)
             else:
                 iou_dists_refined = iou_matrix[i]
            
