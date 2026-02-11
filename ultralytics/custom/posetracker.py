@@ -450,8 +450,8 @@ class PoseTracker(BOTSORT):
                 static_dead_lines = np.minimum(track.static_mean[3], det_xywhs[:, 3]) * 3.0
             else:
                 iou_dists_refined = iou_matrix[i]
-                static_pixel_dists = np.ones(det_xywhs[:, 3])
-                static_dead_lines = np.zeros(det_xywhs[:, 3])
+                static_pixel_dists = np.ones(det_xywhs[:, 3].shape)
+                static_dead_lines = np.zeros(det_xywhs[:, 3].shape)
                 
            
             pose_disim = (1.0 - pose_sim) / 2.0
