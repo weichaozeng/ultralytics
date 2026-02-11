@@ -432,6 +432,7 @@ class PoseTracker(BOTSORT):
             bbox_maha_dists = self.kalman_filter.gating_distance(
                 track.mean, track.covariance, det_xywhs, metric='maha'
             )
+            pose_sim = self.batch_cosine_similarity(track.pose_mean[:40], det_poses, det_pose_scores)
             if track.state == TrackState.Lost and track.static_mean is not None:
                 dt = self.frame_id - track.end_frame
                 growth = min(1.0 + 0.02 * dt, 1.4)
@@ -440,9 +441,10 @@ class PoseTracker(BOTSORT):
                 s_xyxy = self.xywh2xyxy(s_xywh)
                 static_iou_dists = matching.iou_distance(s_xyxy, det_xyxys)[0]
                 iou_dists_refined = np.minimum(iou_matrix[i], static_iou_dists)
+                static_pose_sim = self.batch_cosine_similarity(track.pose_mean_static[:40], det_poses, det_pose_scores)
             else:
                 iou_dists_refined = iou_matrix[i]
-            pose_sim = self.batch_cosine_similarity(track.pose, det_poses, det_pose_scores)
+           
             pose_disim = (1.0 - pose_sim) / 2.0
             pose_disim_matrix[i, :] = pose_disim
             
