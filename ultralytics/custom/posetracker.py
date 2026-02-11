@@ -220,7 +220,7 @@ class PoseTracker(BOTSORT):
     def __init__(self, args, frame_rate=30):
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = KalmanFilterPose()
-        self.box_gate_thresh = getattr(args, 'box_gate_thresh', 9.488) 
+        self.box_gate_thresh = getattr(args, 'box_gate_thresh', 20) # 9.488 
         self.first_match_thresh = getattr(args, 'first_match_thresh', 0.6)
         self.second_match_thresh = getattr(args, 'second_match_thresh', 0.6)
         self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.6)
