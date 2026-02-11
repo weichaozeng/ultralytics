@@ -455,7 +455,7 @@ class PoseTracker(BOTSORT):
                     continue
                 in_gate = bbox_maha_dists[j] < self.box_gate_thresh
                 pose_reliable = pose_disim[j] < 0.25
-                pose_unreliable = pose_disim[j] > 0.8
+                pose_unreliable = pose_disim[j] > 0.5
                 if in_gate or pose_reliable:
                     if track.state == TrackState.Tracked:
                         dists[i, j] = iou_dists_refined[j] * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
