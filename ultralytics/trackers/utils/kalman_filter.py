@@ -61,7 +61,7 @@ class KalmanFilterXYAH:
 
         # Modify for quick move
         self._std_weight_position = 1.0 / 10   
-        self._std_weight_velocity = 1.0 / 40  
+        self._std_weight_velocity = 1.0 / 20 #1.0 / 40  
 
     def initiate(self, measurement: np.ndarray):
         """Create a track from an unassociated measurement.
