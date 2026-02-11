@@ -265,7 +265,7 @@ class PoseTracker(BOTSORT):
         self.frame_id += 1
         print(self.frame_id)
         print(f"dets: {len(dets)}")
-        if self.frame_id in [451]:
+        if self.frame_id in [450, 451]:
             print("here")
     
         activated_stracks = []  
