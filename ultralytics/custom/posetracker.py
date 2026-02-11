@@ -456,9 +456,10 @@ class PoseTracker(BOTSORT):
             for j in range(N):
                 if pixel_dists[j] > dead_lines[j]:
                     continue
+                has_iou = iou_dists_refined[j] < 1.0
                 in_gate = bbox_maha_dists[j] < self.box_gate_thresh
                 pose_reliable = pose_disim[j] < 0.25
-                if in_gate or pose_reliable:
+                if has_iou or in_gate or pose_reliable:
                     box_score = min(iou_dists_refined[j], bbox_maha_dists[j] / self.box_gate_thresh)
                     # if track.state == TrackState.Tracked:
                     #     dists[i, j] = box_score * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
