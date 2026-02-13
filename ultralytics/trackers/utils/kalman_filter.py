@@ -530,7 +530,7 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
     #     else:
     #         raise ValueError("Invalid distance metric")
         
-    def gating_distance(self, mean, covariance, measurements, only_position=False):
+    def gating_distance(self, mean, covariance, measurements, only_position=False, metric: str = "maha"):
         mean_proj, cov_proj = self.project(mean, covariance)
         vx, vy = mean[4], mean[5]
         speed = np.sqrt(vx**2 + vy**2)
@@ -544,9 +544,14 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
             d = d[:, :2]
             cov_proj = cov_proj[:2, :2]
 
-        try:
-            L = np.linalg.cholesky(cov_proj)
-            z = scipy.linalg.solve_triangular(L, d.T, lower=True)
-            return np.sum(z * z, axis=0)
-        except np.linalg.LinAlgError: 
-            return np.linalg.norm(d, axis=1)
+
+        if metric == "gaussian":
+            return np.sum(d * d, axis=1)
+        elif metric == "maha":
+            try:
+                L = np.linalg.cholesky(cov_proj)
+                z = scipy.linalg.solve_triangular(L, d.T, lower=True)
+                return np.sum(z * z, axis=0)
+            except np.linalg.LinAlgError: 
+                print(f"Fail for maha gating.")
+                return np.sum(d * d, axis=1)
