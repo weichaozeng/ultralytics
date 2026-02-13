@@ -222,8 +222,8 @@ class PoseTracker(BOTSORT):
         self.pose_kalman_filter = KalmanFilterPose()
         self.box_gate_thresh = getattr(args, 'box_gate_thresh', 9.488) 
         self.first_match_thresh = getattr(args, 'first_match_thresh', 0.62)
-        self.second_match_thresh = getattr(args, 'second_match_thresh', 0.62)
-        self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.62)
+        self.second_match_thresh = getattr(args, 'second_match_thresh', 0.90)
+        self.unconf_match_thresh = getattr(args, 'unconf_match_thresh', 0.90)
 
         self.WO_POSE = 0.2
         self.WO_REID = 0.05
@@ -475,14 +475,8 @@ class PoseTracker(BOTSORT):
                     dists[i, j] = min(dist_WO, dist_W)
             
         for j in range(N):
-            potential_matches = np.where(dists[:, j] < 0.62)[0]
+            potential_matches = np.where(dists[:, j] < self.second_match_thresh)[0]
             if len(potential_matches) > 1:
-                # for idx in potential_matches:
-                #     if pose_disim_matrix[idx, j] < 0.15:
-                #         dists[idx, j] = pose_disim_matrix[idx, j]
-                #     elif pose_disim_matrix[idx, j] > 0.5:
-                #         dists[idx, j] = 1.0
-                # modify
                 current_pose_disims = pose_disim_matrix[potential_matches, j]
                 min_pose_val = np.min(current_pose_disims)
                 for k, idx in enumerate(potential_matches):
@@ -493,8 +487,19 @@ class PoseTracker(BOTSORT):
                     elif this_pose_val > 0.8:
                         if this_pose_val > min_pose_val and not is_track_own_best:
                             dists[idx, j] = 1.0
-                        else:
-                            pass
+            elif len(potential_matches) == 1:
+                idx = potential_matches[0]
+                track = tracks[idx]
+                if self.first_match_thresh <= dists[idx, j] < self.second_match_thresh:
+                    innovation_vec = det_xywhs[j, :2] - track.mean[:2]
+                    velocity_vec = track.mean[4:6]
+                    speed = np.linalg.norm(velocity_vec)
+                    if speed > 5:
+                        cos_sim = -1
+                        if speed > 5:
+                            cos_sim = np.dot(innovation_vec, velocity_vec) / (np.linalg.norm(innovation_vec) * speed + 1e-6)
+                        if cos_sim > 0.7 and pose_disim_matrix[idx, j] < 0.75:
+                            dists[idx, j] = dists[idx, j] - 0.3 * cos_sim
         # if self.frame_id == 54: 
         #     print(dists)
         return dists
