@@ -489,43 +489,64 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
         return super().update(mean, covariance, measurement)
 
 
-    def gating_distance(
-        self,
-        mean: np.ndarray,
-        covariance: np.ndarray,
-        measurements: np.ndarray,
-        only_position: bool = False,
-        metric: str = "maha",
-        parallel_gain = 0.5, 
-        ortho_gain = 5.0,
-    ) -> np.ndarray:
+    # def gating_distance(
+    #     self,
+    #     mean: np.ndarray,
+    #     covariance: np.ndarray,
+    #     measurements: np.ndarray,
+    #     only_position: bool = False,
+    #     metric: str = "maha",
+    #     parallel_gain = 0.5, 
+    #     ortho_gain = 5.0,
+    # ) -> np.ndarray:
       
-        mean_proj, cov_proj = self.project(mean, covariance)
-        if only_position:
-            mean_proj, cov_proj = mean_proj[:2], cov_proj[:2, :2]
-            measurements = measurements[:, :2]
+    #     mean_proj, cov_proj = self.project(mean, covariance)
+    #     if only_position:
+    #         mean_proj, cov_proj = mean_proj[:2], cov_proj[:2, :2]
+    #         measurements = measurements[:, :2]
         
-        d = measurements - mean_proj
+    #     d = measurements - mean_proj
 
+    #     vx, vy = mean[4], mean[5]
+    #     speed = np.sqrt(vx**2 + vy**2)
+    #     if speed > 5: 
+    #         v_unit = np.array([vx / speed, vy / speed])
+    #         v_ortho = np.array([vy / speed, -vx / speed])
+
+    #         d_pos = d[:, :2]
+    #         proj_parallel = np.dot(d_pos, v_unit)  # (N,)
+    #         proj_ortho = np.dot(d_pos, v_ortho)    # (N,)
+
+    #         d_pos_new = (proj_parallel[:, None] * v_unit * parallel_gain + 
+    #                  proj_ortho[:, None] * v_ortho * ortho_gain)
+    #         d[:, :2] = d_pos_new
+        
+    #     if metric == "gaussian":
+    #         return np.sum(d * d, axis=1)
+    #     elif metric == "maha":
+    #         cholesky_factor = np.linalg.cholesky(cov_proj)
+    #         z = scipy.linalg.solve_triangular(cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
+    #         return np.sum(z * z, axis=0)  # square maha
+    #     else:
+    #         raise ValueError("Invalid distance metric")
+        
+    def gating_distance(self, mean, covariance, measurements, only_position=False):
+        mean_proj, cov_proj = self.project(mean, covariance)
         vx, vy = mean[4], mean[5]
         speed = np.sqrt(vx**2 + vy**2)
-        if speed > 5: 
+        if speed > 8: 
             v_unit = np.array([vx / speed, vy / speed])
-            v_ortho = np.array([vy / speed, -vx / speed])
 
-            d_pos = d[:, :2]
-            proj_parallel = np.dot(d_pos, v_unit)  # (N,)
-            proj_ortho = np.dot(d_pos, v_ortho)    # (N,)
+            cov_proj[:2, :2] += np.outer(v_unit, v_unit) * (speed * 1.5)
 
-            d_pos_new = (proj_parallel[:, None] * v_unit * parallel_gain + 
-                     proj_ortho[:, None] * v_ortho * ortho_gain)
-            d[:, :2] = d_pos_new
-        
-        if metric == "gaussian":
-            return np.sum(d * d, axis=1)
-        elif metric == "maha":
-            cholesky_factor = np.linalg.cholesky(cov_proj)
-            z = scipy.linalg.solve_triangular(cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
-            return np.sum(z * z, axis=0)  # square maha
-        else:
-            raise ValueError("Invalid distance metric")
+        d = measurements - mean_proj
+        if only_position:
+            d = d[:, :2]
+            cov_proj = cov_proj[:2, :2]
+
+        try:
+            L = np.linalg.cholesky(cov_proj)
+            z = scipy.linalg.solve_triangular(L, d.T, lower=True)
+            return np.sum(z * z, axis=0)
+        except np.linalg.LinAlgError: 
+            return np.linalg.norm(d, axis=1)
