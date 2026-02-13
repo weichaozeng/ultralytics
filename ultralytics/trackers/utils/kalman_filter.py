@@ -509,7 +509,7 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
 
         vx, vy = mean[4], mean[5]
         speed = np.sqrt(vx**2 + vy**2)
-        if speed > 10: 
+        if speed > 5: 
             v_unit = np.array([vx / speed, vy / speed])
             v_ortho = np.array([vy / speed, -vx / speed])
 
