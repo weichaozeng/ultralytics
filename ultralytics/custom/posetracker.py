@@ -482,11 +482,17 @@ class PoseTracker(BOTSORT):
                 for k, idx in enumerate(potential_matches):
                     this_pose_val = current_pose_disims[k]
                     is_track_own_best = (j == np.argmin(pose_disim_matrix[idx, :]))
-                    if this_pose_val == min_pose_val and this_pose_val < 0.2:
-                        dists[idx, j] = this_pose_val
-                    elif this_pose_val > 0.8:
-                        if this_pose_val > min_pose_val and not is_track_own_best:
-                            dists[idx, j] = 1.0
+                    # if this_pose_val == min_pose_val and this_pose_val < 0.2:
+                    #     dists[idx, j] = this_pose_val
+                    # elif this_pose_val > 0.8:
+                    #     if this_pose_val > min_pose_val and not is_track_own_best:
+                    #         dists[idx, j] = 1.0
+                    if this_pose_val == min_pose_val:
+                        if this_pose_val < 0.2:
+                            dists[idx, j] = max(0.1, dists[idx, j] - 0.2)
+                    else:
+                        if this_pose_val > 0.4:
+                            dists[idx, j] = min(0.9, dists[idx, j] + 0.2)
             elif len(potential_matches) == 1:
                 idx = potential_matches[0]
                 track = tracks[idx]
