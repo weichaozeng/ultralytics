@@ -471,7 +471,6 @@ class PoseTracker(BOTSORT):
                             box_score = min(iou_dists_refined[j], max(bbox_maha_dists[j] / self.box_gate_thresh, pose_disim[j]))
                     else:
                         box_score = iou_dists_refined[j]
-                    
                     # if track.state == TrackState.Tracked:
                     #     dists[i, j] = box_score * self.WO_IOU + pose_disim[j] * self.WO_POSE + reid_matrix[i, j] * self.WO_REID
                     # else:
