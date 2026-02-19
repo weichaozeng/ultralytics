@@ -222,21 +222,49 @@ class KalmanFilterPose:
         if confidence is not None:
             assert len(confidence) == 20
             conf_expanded = np.repeat(confidence, 2)
-            R = np.diag(np.square(self._std_weight_measurement / np.clip(conf_expanded, 1e-4, 1.0)))
-            return projected_mean, projected_cov + R
-        
-        return projected_mean, projected_cov
+            r_diag = np.square(self._std_weight_measurement / np.clip(conf_expanded, 1e-2, 1.0))
+            R = np.diag(r_diag)
+        else:
+            R = np.eye(self.ndim_obs) * (self._std_weight_measurement**2)
+            
+        return projected_mean, projected_cov + R, R
     
     def update(self, mean, covariance, measurement, confidence):
-        projected_mean, projected_cov = self.project(mean, covariance, confidence)
-        chol_factor, lower = scipy.linalg.cho_factor(projected_cov, lower=True, check_finite=False)
-        P_HT = np.dot(covariance, self._update_mat.T)
-        kalman_gain = scipy.linalg.cho_solve((chol_factor, lower), P_HT.T).T
-        innovation = measurement.flatten() - projected_mean
-        new_mean = mean + np.dot(kalman_gain, innovation)
-        new_covariance = covariance - np.linalg.multi_dot((kalman_gain, projected_cov, kalman_gain.T))
+        # projected_mean, projected_cov = self.project(mean, covariance, confidence)
+        # chol_factor, lower = scipy.linalg.cho_factor(projected_cov, lower=True, check_finite=False)
+        # P_HT = np.dot(covariance, self._update_mat.T)
+        # kalman_gain = scipy.linalg.cho_solve((chol_factor, lower), P_HT.T).T
+        # innovation = measurement.flatten() - projected_mean
+        # new_mean = mean + np.dot(kalman_gain, innovation)
+        # new_covariance = covariance - np.linalg.multi_dot((kalman_gain, projected_cov, kalman_gain.T))
 
-        return new_mean, new_covariance
+        # return new_mean, new_covariance
+
+        projected_mean, S, R = self.project(mean, covariance, confidence)
+        if not np.all(np.isfinite(S)):
+            return mean, covariance
+            
+        eps = 1e-6
+        S.flat[::S.shape[0] + 1] += eps
+        
+        try:
+            chol_factor, lower = scipy.linalg.cho_factor(S, lower=True, check_finite=False)
+            P_HT = np.dot(covariance, self._update_mat.T)
+            kalman_gain = scipy.linalg.cho_solve((chol_factor, lower), P_HT.T).T
+
+            innovation = measurement.flatten() - projected_mean
+            new_mean = mean + np.dot(kalman_gain, innovation)
+            
+            I = np.eye(self.ndim_state)
+            I_KH = I - np.dot(kalman_gain, self._update_mat)
+            
+            new_covariance = np.linalg.multi_dot((I_KH, covariance, I_KH.T)) + \
+                             np.linalg.multi_dot((kalman_gain, R, kalman_gain.T))
+            
+            return new_mean, new_covariance
+
+        except (np.linalg.LinAlgError, ValueError):
+            return mean, covariance
     
     def multi_predict(self, mean, covariance):
         """
