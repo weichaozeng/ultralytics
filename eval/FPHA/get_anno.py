@@ -26,7 +26,7 @@ for person_id in os.listdir(root):
             save_bbox_files.append(os.path.join(root, person_id, action_id, rep, '2d_bbox.txt'))
             
 
-for i in range(tqdm(len(anno_files))):
+for i in tqdm(range(len(anno_files))):
     file_skeleton = anno_files[i]
 
     data = np.loadtxt(file_skeleton, dtype=str)
