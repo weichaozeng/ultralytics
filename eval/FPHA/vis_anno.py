@@ -4,9 +4,9 @@ import os
 import glob
 
 
-person_id = 'Subject_4'
-action_id = 'handshake'
-rep = '3'
+person_id = 'Subject_6'
+action_id = 'receive_coin'
+rep = '2'
 root = '/home/zvc/Data/FPHA/'
 
 folder_frame = os.path.join(root, 'Video_files', person_id, action_id, rep)
