@@ -54,7 +54,7 @@ all_poses = np.loadtxt(file_pose)
 image_files = sorted(glob.glob(os.path.join(rgb_folder, '*.jpeg')))
 
 if not image_files:
-    print(f"错误: 在 {rgb_folder} 中没有找到 .jpeg 图像！")
+    print(f"Error: cannot find .jpeg file in {rgb_folder}.")
     exit()
 
 
@@ -65,7 +65,7 @@ height, width, layers = first_frame.shape
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_video_path, fourcc, 30.0, (width, height))
 
-print(f"开始生成视频，共 {len(image_files)} 帧...")
+print(f"Start annotating, all {len(image_files)} frames...")
 
 
 for i, img_path in enumerate(image_files):
@@ -106,7 +106,7 @@ for i, img_path in enumerate(image_files):
     video_writer.write(img)
 
     if (i + 1) % 50 == 0:
-        print(f"已处理 {i + 1} / {len(image_files)} 帧")
+        print(f"Alread {i + 1} / {len(image_files)}")
 
 video_writer.release()
-print(f"视频生成完毕！已保存至: {output_video_path}")
+print(f"Done! Save to: {output_video_path}")
