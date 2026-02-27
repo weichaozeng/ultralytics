@@ -7,9 +7,13 @@ anno_files = []
 save_kp_files = []
 save_bbox_files = []
 
+
 fx_c, fy_c = 1395.749023, 1395.749268
 u0_c, v0_c = 935.732544, 540.681030
 
+
+IMG_WIDTH = 1920
+IMG_HEIGHT = 1080
 
 M = np.array([
     [ 0.999988496304,   -0.00468848412856,  0.000982563360594, 25.7  ],
@@ -25,10 +29,8 @@ for person_id in os.listdir(root):
             save_kp_files.append(os.path.join(root, person_id, action_id, rep, '2d_keypoints.txt'))
             save_bbox_files.append(os.path.join(root, person_id, action_id, rep, '2d_bbox.txt'))
             
-
 for i in tqdm(range(len(anno_files))):
     file_skeleton = anno_files[i]
-
     data = np.loadtxt(file_skeleton, dtype=str)
 
     keypoints_results = []
@@ -39,13 +41,11 @@ for i in tqdm(range(len(anno_files))):
         pose_3d = row[1:].astype(float)
         jointLocations = pose_3d.reshape((21, 3))
         
-
         joints_homogeneous = np.hstack((jointLocations, np.ones((21, 1))))
         joints_tf = (M @ joints_homogeneous.T).T
         u_c = u0_c + fx_c * joints_tf[:, 0] / joints_tf[:, 2]
         v_c = v0_c + fy_c * joints_tf[:, 1] / joints_tf[:, 2]
         
-
         kp_2d_flat = np.empty(42, dtype=float)
         kp_2d_flat[0::2] = u_c
         kp_2d_flat[1::2] = v_c
@@ -57,12 +57,36 @@ for i in tqdm(range(len(anno_files))):
         u_min, u_max = np.min(u_c), np.max(u_c)
         v_min, v_max = np.min(v_c), np.max(v_c)
         
-        w = u_max - u_min
-        h = v_max - v_min
-        cx = u_min + w / 2.0
-        cy = v_min + h / 2.0
+
+        w_raw = u_max - u_min
+        h_raw = v_max - v_min
+        cx = u_min + w_raw / 2.0
+        cy = v_min + h_raw / 2.0
         
-        bbox_results.append(f"{frame_id} {cx:.2f} {cy:.2f} {w:.2f} {h:.2f}\n")
+
+        scale = 1.2
+        w_padded = w_raw * scale
+        h_padded = h_raw * scale
+        
+
+        new_u_min = cx - w_padded / 2.0
+        new_u_max = cx + w_padded / 2.0
+        new_v_min = cy - h_padded / 2.0
+        new_v_max = cy + h_padded / 2.0
+        
+
+        new_u_min = max(0.0, min(new_u_min, IMG_WIDTH))
+        new_u_max = max(0.0, min(new_u_max, IMG_WIDTH))
+        new_v_min = max(0.0, min(new_v_min, IMG_HEIGHT))
+        new_v_max = max(0.0, min(new_v_max, IMG_HEIGHT))
+        
+
+        w_final = new_u_max - new_u_min
+        h_final = new_v_max - new_v_min
+        cx_final = new_u_min + w_final / 2.0
+        cy_final = new_v_min + h_final / 2.0
+        
+        bbox_results.append(f"{frame_id} {cx_final:.2f} {cy_final:.2f} {w_final:.2f} {h_final:.2f}\n")
 
     with open(save_kp_files[i], 'w') as f_kp:
         f_kp.writelines(keypoints_results)
