@@ -115,9 +115,9 @@ def main(args):
                     if args.tracker == "posetrack":
                         result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False, tracker="./ultralytics/custom/posetrack.yaml")
                     elif args.tracker == "bytetrack":
-                        result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False, tracker="./ultralytics/cfg/bytetrack.yaml")
+                        result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False, tracker="./ultralytics/cfg/trackers/bytetrack.yaml")
                     elif args.tracker == "botsort":
-                        result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False, tracker="./ultralytics/cfg/botsort.yaml")
+                        result = model.track(frame_cv2, conf=args.det_thresh, persist=True, verbose=False, tracker="./ultralytics/cfg/trackers/botsort.yaml")
                     else:
                         raise ValueError(f"Unsupported tracker type: {args.tracker}")
                     
