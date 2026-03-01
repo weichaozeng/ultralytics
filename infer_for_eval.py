@@ -174,8 +174,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FPHA Tracking Inference")
     parser.add_argument("--in_dir", type=str, default="/home/zvc/Data/FPHA/Video_files")
-    parser.add_argument("--save_dir", type=str, default="/home/zvc/Project/FPHA/Tracking_Results/ByteTrack_0.4")
-    parser.add_argument("--det_thresh", type=float, default=0.4)
+    parser.add_argument("--save_dir", type=str, default="/home/zvc/Project/FPHA/Tracking_Results/ByteTrack_0.5")
+    parser.add_argument("--det_thresh", type=float, default=0.5)
     parser.add_argument("--ckpt", type=str, default="weights/detector.pt")
     parser.add_argument("--tracker", type=str, default="bytetrack", choices=["posetrack", "bytetrack", "botsort"])
 
