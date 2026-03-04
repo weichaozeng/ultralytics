@@ -219,9 +219,9 @@ def draw_pose(img_cv2, pose, thresh=0.5, K=21):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference")
-    parser.add_argument("--in_dir", type=str, default="example_data/FPHA/symlink")
-    parser.add_argument("--in_type", type=str, choices=["video", "rgb", "color", ""], default="color")
-    parser.add_argument("--save_dir", type=str, default="example_out/pa_nms_posetrack/FPHA_58/")
+    parser.add_argument("--in_dir", type=str, default="example_data/FPHA/videos_3")
+    parser.add_argument("--in_type", type=str, choices=["video", "rgb", "color", ""], default="video")
+    parser.add_argument("--save_dir", type=str, default="example_out/pa_nms_posetrack/videos_3/")
     parser.add_argument("--save_type", type=str, default="video", choices=["video", "rgb"])
     parser.add_argument("--det_thresh", type=float, default=0.4)
     parser.add_argument("--ckpt", type=str, default="weights/detector.pt")
