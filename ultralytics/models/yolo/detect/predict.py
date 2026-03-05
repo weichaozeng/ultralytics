@@ -63,7 +63,7 @@ class DetectionPredictor(BasePredictor):
         preds = nms_func(
             preds,
             self.args.conf,
-            self.args.iou,
+            0.45, # self.args.iou,
             self.args.classes,
             True, # self.args.agnostic_nms,
             max_det=self.args.max_det,
