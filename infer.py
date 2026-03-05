@@ -91,9 +91,9 @@ def detect_track(args, model, frames, tracker):
     results = []
     i = 0
     for frame_cv2 in frames:
-            print(i)
-            if i in [36, 37]:
-                print("here")
+            # print(i)
+            # if i in [36, 37]:
+            #     print("here")
             i += 1
             with torch.no_grad():
                 with autocast():
