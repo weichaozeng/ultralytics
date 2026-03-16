@@ -127,6 +127,7 @@ def plot_poses_vertically(kps_tensor, dissim_scores):
 
     plt.tight_layout()
     plt.show()
+    plt.savefig("pose_dissimilarity_comparison.png", dpi=300)
 
 # ==========================================
 # 5. 主执行逻辑
