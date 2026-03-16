@@ -85,7 +85,7 @@ def calculate_dissim(kps):
 # ==========================================
 # 4. 3D 可视化绘制 (加入初始手残影对比)
 # ==========================================
-def plot_poses_vertically(kps_tensor, dissim_scores):
+def plot_poses_vertically(kps_tensor, dissim_scores, save_path="pose_dissim_result.png"):
     B = kps_tensor.shape[0]
     fig = plt.figure(figsize=(4, 3 * B))
     
@@ -126,8 +126,9 @@ def plot_poses_vertically(kps_tensor, dissim_scores):
         ax.set_title(f"Pose {i} | Dis_sim vs Initial: {dissim_scores[i]:.4f}", color=title_color, fontsize=12)
 
     plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
-    plt.savefig("pose_dissimilarity_comparison.png", dpi=300)
+
 
 # ==========================================
 # 5. 主执行逻辑
