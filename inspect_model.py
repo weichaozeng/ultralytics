@@ -60,7 +60,7 @@ def _safe_getattr(obj: Any, name: str, default=None):
 def main():
     ap = argparse.ArgumentParser(description="Inspect Ultralytics YOLO .pt (print structure only)")
     ap.add_argument("--ckpt", type=str, required=True, help="Path to .pt checkpoint")
-    ap.add_argument("--imgsz", type=int, default=640, help="Dummy forward image size")
+    ap.add_argument("--imgsz", type=int, default=None, help="Dummy forward image size (required with --dummy-forward)")
     ap.add_argument("--device", type=str, default="cpu", help="cpu | 0 | 0,1 ...")
     ap.add_argument("--half", action="store_true", help="Use fp16 for dummy forward (if supported)")
     ap.add_argument("--dummy-forward", action="store_true", help="Run a dummy forward pass to print output shapes")
@@ -154,6 +154,18 @@ def main():
         print("=" * 88)
         return
 
+    if args.imgsz is None:
+        print("Dummy forward requested but --imgsz was not provided.")
+        print("Example: python ultralytics/inspect_model.py --ckpt weights/detector.pt --dummy-forward --imgsz 640")
+        print("=" * 88)
+        return
+
+    if args.imgsz is None:
+        print("Dummy forward requested but --imgsz was not provided.")
+        print("Example: python ultralytics/inspect_model.py --ckpt weights/detector.pt --dummy-forward --imgsz 640")
+        print("=" * 88)
+        return
+
     device = args.device
     try:
         yolo.to(device)
@@ -171,7 +183,12 @@ def main():
     if isinstance(yaml_dict, dict) and isinstance(yaml_dict.get("ch"), int):
         ch = int(yaml_dict["ch"])
 
-    x = torch.zeros(1, ch, args.imgsz, args.imgsz, device=next(m.parameters()).device)
+    try:
+        param_device = next(m.parameters()).device
+    except StopIteration:
+        param_device = torch.device("cpu")
+
+    x = torch.zeros(1, ch, args.imgsz, args.imgsz, device=param_device)
     if args.half:
         x = x.half()
 
