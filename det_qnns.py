@@ -218,6 +218,8 @@ def _iter_cubes_from_path(in_path: Path, *, packed_reduce: str = "any") -> Itera
 def main():
     ap = argparse.ArgumentParser(description="SPAD cube -> reconstructed frames -> YOLO pose tracking")
     ap.add_argument("--in_path", type=str, required=True, help="Directory of .npy cubes or a .npy file")
+    ap.add_argument("--in_glob", type=str, default=None,
+                    help="Optional glob (e.g. '*') when --in_path is a root folder containing many dataset subfolders")
     ap.add_argument("--save_dir", type=str, required=True, help="Directory to save visualized frames")
     ap.add_argument("--ckpt", type=str, default="weights/detector.pt")
     ap.add_argument("--det_thresh", type=float, default=0.4)
@@ -247,6 +249,19 @@ def main():
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    # Support root folder with multiple datasets: iterate subfolders when --in_glob is set.
+    if in_path.is_dir() and args.in_glob:
+        dataset_paths = [p for p in sorted(in_path.glob(args.in_glob)) if p.is_dir()]
+        if not dataset_paths:
+            raise FileNotFoundError(f"No dataset subfolders matched: {in_path}/{args.in_glob}")
+    else:
+        dataset_paths = [in_path]
+
+    # Save under save_dir/<dataset_name>/...
+    dataset_name = in_path.name if in_path.is_dir() else in_path.stem
+    save_dir = save_dir / dataset_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+
     model = YOLO(args.ckpt)
 
     tracker_cfg = f"{args.tracker}.yaml" if args.tracker in ("bytetrack", "botsort") else "botsort.yaml"
@@ -261,26 +276,29 @@ def main():
         "quantile": args.quantile,
         "min_filter_size": args.min_filter_size,
     }
-
-    cube_iter = list(_iter_cubes_from_path(in_path, packed_reduce=args.packed_reduce))
-
-    # Process each cube (each cube yields T' reconstructed frames, each then yields a YOLO result).
-    # We store results and also render per reconstructed frame.
     global_frame_idx = 0
 
-    for cube_idx, cube in enumerate(tqdm(cube_iter, desc="Processing cubes")):
-        # Reset SPAD state at the start of each big cube/sequence.
-        # We do this by setting spad_clear_states=True only for the first chunk call.
-        first_chunk = True
+    for dataset_path in dataset_paths:
+        dataset_name = dataset_path.name if dataset_path.is_dir() else dataset_path.stem
+        out_dir = save_dir / dataset_name
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Split big cube into temporal chunks (optional) and call track() sequentially.
-        T = cube.shape[2]
-        chunk_t = int(args.cube_chunk_t) if int(args.cube_chunk_t) > 0 else T
-        stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
+        cube_iter = list(_iter_cubes_from_path(dataset_path, packed_reduce=args.packed_reduce))
 
-        for t0 in range(0, T, stride):
-            t1 = min(T, t0 + chunk_t)
-            cube_chunk = cube[:, :, t0:t1]
+        # Process each cube (each cube yields T' reconstructed frames, each then yields a YOLO result).
+        for cube_idx, cube in enumerate(tqdm(cube_iter, desc=f"Processing cubes [{dataset_name}]")):
+
+            # Reset SPAD state at the start of each big cube/sequence.
+            # We do this by setting spad_clear_states=True only for the first chunk call.
+            first_chunk = True
+
+            # Split big cube into temporal chunks (optional) and call track() sequentially.
+            T = cube.shape[2]
+            chunk_t = int(args.cube_chunk_t) if int(args.cube_chunk_t) > 0 else T
+            stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
+            for t0 in range(0, T, stride):
+                t1 = min(T, t0 + chunk_t)
+                cube_chunk = cube[:, :, t0:t1]
 
             results = model.track(
                 cube_chunk,
@@ -344,7 +362,7 @@ def main():
                         if poses is not None:
                             vis = draw_pose(vis, poses[j])
 
-                out_path = save_dir / f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
+                out_path = out_dir / f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
                 cv2.imwrite(str(out_path), vis)
                 global_frame_idx += 1
 

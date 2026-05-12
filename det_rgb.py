@@ -149,6 +149,8 @@ def _load_rgb_frames(in_path: Path) -> np.ndarray:
 def main():
     ap = argparse.ArgumentParser(description="RGB frames (.npy) -> YOLO pose tracking")
     ap.add_argument("--in_path", type=str, required=True, help="Directory containing frames.npy or a frames.npy path")
+    ap.add_argument("--in_glob", type=str, default=None,
+                    help="Optional glob (e.g. '*') when --in_path is a root folder containing many dataset subfolders")
     ap.add_argument("--save_dir", type=str, default="rgb_25fps", help="Directory to save visualized frames")
     ap.add_argument("--ckpt", type=str, default="weights/detector.pt")
     ap.add_argument("--det_thresh", type=float, default=0.4)
@@ -159,58 +161,68 @@ def main():
     in_path = Path(args.in_path)
     if not in_path.exists():
         raise FileNotFoundError(f"Input path not found: {in_path}")
-
     save_dir = Path(args.save_dir)
     # As requested, default save folder name is rgb_25fps
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    frames_rgb = _load_rgb_frames(in_path)  # (N,H,W,3) RGB
+    # Support root folder with multiple datasets: iterate subfolders when --in_glob is set.
+    if in_path.is_dir() and args.in_glob:
+        dataset_paths = [p for p in sorted(in_path.glob(args.in_glob)) if p.is_dir()]
+        if not dataset_paths:
+            raise FileNotFoundError(f"No dataset subfolders matched: {in_path}/{args.in_glob}")
+    else:
+        dataset_paths = [in_path]
+  # (N,H,W,3) RGB
 
     model = YOLO(args.ckpt)
     tracker_cfg = f"{args.tracker}.yaml" if args.tracker in ("bytetrack", "botsort") else "botsort.yaml"
 
-    # Convert RGB->BGR for OpenCV drawing; Ultralytics accepts np arrays, but we keep a BGR copy for rendering.
-    frames_bgr = frames_rgb[..., ::-1].copy()
-
     global_frame_idx = 0
-    for i in tqdm(range(frames_bgr.shape[0]), desc="Processing RGB frames"):
-        frame_bgr = frames_bgr[i]
+    for dataset_path in dataset_paths:
+        dataset_name = dataset_path.name if dataset_path.is_dir() else dataset_path.stem
+        out_dir = save_dir / dataset_name
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Track on a single frame. Use persist=True so IDs continue across frames.
-        results = model.track(
-            frame_bgr,
-            conf=args.det_thresh,
-            persist=True,
-            tracker=tracker_cfg,
-            verbose=False,
-        )
+        frames_rgb = _load_rgb_frames(dataset_path)  # (N,H,W,3) RGB
+        frames_bgr = frames_rgb[..., ::-1].copy()
 
-        # Ultralytics returns a list (len==1 for single-frame input)
-        r = results[0]
-        vis = frame_bgr.copy()
+        for i in tqdm(range(frames_bgr.shape[0]), desc=f"Processing RGB frames [{dataset_name}]"):
+            frame_bgr = frames_bgr[i]
 
-        if r.boxes is not None and r.boxes.id is not None:
-            track_id = r.boxes.id.cpu().numpy()
-            boxes = r.boxes.xyxy.cpu().numpy()
-            box_confs = r.boxes.conf.cpu().numpy()
-            handedness = r.boxes.cls.cpu().numpy()
+            results = model.track(
+                frame_bgr,
+                conf=args.det_thresh,
+                persist=True,
+                tracker=tracker_cfg,
+                verbose=False,
+            )
 
-            if hasattr(r, "keypoints") and r.keypoints is not None:
-                poses = r.keypoints.xy.cpu().numpy()  # (n,K,2)
-                pose_confs = r.keypoints.conf.cpu().numpy()  # (n,K)
-                poses = np.concatenate([poses, pose_confs[..., None]], axis=2)  # (n,K,3)
-            else:
-                poses = None
+            r = results[0]
+            vis = frame_bgr.copy()
 
-            for j, tid in enumerate(track_id):
-                box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
-                vis = draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
-                if poses is not None:
-                    vis = draw_pose(vis, poses[j])
+            if r.boxes is not None and r.boxes.id is not None:
+                track_id = r.boxes.id.cpu().numpy()
+                boxes = r.boxes.xyxy.cpu().numpy()
+                box_confs = r.boxes.conf.cpu().numpy()
+                handedness = r.boxes.cls.cpu().numpy()
 
-        out_path = save_dir / f"frame{global_frame_idx:07d}.png"
-        cv2.imwrite(str(out_path), vis)
-        global_frame_idx += 1
+                if hasattr(r, "keypoints") and r.keypoints is not None:
+                    poses = r.keypoints.xy.cpu().numpy()
+                    pose_confs = r.keypoints.conf.cpu().numpy()
+                    poses = np.concatenate([poses, pose_confs[..., None]], axis=2)
+                else:
+                    poses = None
+
+                for j, tid in enumerate(track_id):
+                    box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
+                    vis = draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
+                    if poses is not None:
+                        vis = draw_pose(vis, poses[j])
+
+            out_path = out_dir / f"frame{global_frame_idx:07d}.png"
+            cv2.imwrite(str(out_path), vis)
+            global_frame_idx += 1
+
 
 
 if __name__ == "__main__":
