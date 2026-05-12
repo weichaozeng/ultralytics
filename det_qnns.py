@@ -284,7 +284,6 @@ def main():
         for cube_idx, cube in enumerate(tqdm(cube_iter, desc=f"Processing cubes [{dataset_name}]")):
 
             # Reset SPAD state at the start of each big cube/sequence.
-            # We do this by setting spad_clear_states=True only for the first chunk call.
             first_chunk = True
 
             # Split big cube into temporal chunks (optional) and call track() sequentially.
@@ -294,72 +293,68 @@ def main():
             for t0 in range(0, T, stride):
                 t1 = min(T, t0 + chunk_t)
                 cube_chunk = cube[:, :, t0:t1]
+                if cube_chunk.shape[2] == 0:
+                    continue
 
-            results = model.track(
-                cube_chunk,
-                conf=args.det_thresh,
-                persist=True,
-                tracker=tracker_cfg,
-                verbose=False,
-                predictor=SPADPosePredictor,
-                spad=True,
-                spad_pre="bayes",
-                spad_clear_states=first_chunk,
-                spad_bayes_kwargs=spad_bayes_kwargs,
-                spad_collapse="frames",
-            )
-            _result_i = 0  # reset per chunk
-            first_chunk = False
+                results = model.track(
+                    cube_chunk,
+                    conf=args.det_thresh,
+                    persist=True,
+                    tracker=tracker_cfg,
+                    verbose=False,
+                    predictor=SPADPosePredictor,
+                    spad=True,
+                    spad_pre="bayes",
+                    spad_clear_states=first_chunk,
+                    spad_bayes_kwargs=spad_bayes_kwargs,
+                    spad_collapse="frames",
+                )
+                first_chunk = False
 
-            # 可视化背景：
-            # - sum: 对当前 chunk 在时间维求和（快，但信息粗）
-            # - recon: 使用 SPADPosePredictor 内部缓存的 PerPixelBayesian 重建帧（更直观）
-            recon_frames = None
-            if args.vis_bg == "recon":
-                try:
-                    # 注意：predictor 是由 Ultralytics 内部实例化的；这里通过 model.predictor 取最近一次调用的实例
-                    recon_frames = getattr(getattr(model, "predictor", None), "last_recon_frames_u8", None)
-                except Exception:
-                    recon_frames = None
+                # 可视化背景：sum 或 recon
+                recon_frames = None
+                if args.vis_bg == "recon":
+                    try:
+                        recon_frames = getattr(getattr(model, "predictor", None), "last_recon_frames_u8", None)
+                    except Exception:
+                        recon_frames = None
 
-            if args.vis_bg == "sum" or recon_frames is None:
-                bg = cube_chunk.astype(np.float32).sum(axis=2)
-                bg = bg / (bg.max() + 1e-6)
-                bg_u8 = (bg * 255.0).round().astype(np.uint8)
-                bg_bgr = np.repeat(bg_u8[:, :, None], 3, axis=2)
-            # recon_frames 已经是 HxWx3 uint8 list，与 results 一一对应
+                bg_bgr = None
+                if args.vis_bg == "sum" or recon_frames is None:
+                    bg = cube_chunk.astype(np.float32).sum(axis=2)
+                    bg = bg / (bg.max() + 1e-6)
+                    bg_u8 = (bg * 255.0).round().astype(np.uint8)
+                    bg_bgr = np.repeat(bg_u8[:, :, None], 3, axis=2)
 
-            for r in results:
-                # 逐帧选择背景：recon 模式下用对应的重建帧；否则用 bg_bgr(summed)
-                # 这里用 enumerate 取索引更稳妥，但不重排结构：用一个计数器
-                if args.vis_bg == "recon" and recon_frames is not None and _result_i < len(recon_frames):
-                    vis = recon_frames[_result_i].copy()
-                else:
-                    vis = bg_bgr.copy()
-                _result_i += 1
-
-                if r.boxes is not None and r.boxes.id is not None:
-                    track_id = r.boxes.id.cpu().numpy()
-                    boxes = r.boxes.xyxy.cpu().numpy()
-                    box_confs = r.boxes.conf.cpu().numpy()
-                    handedness = r.boxes.cls.cpu().numpy()
-
-                    if hasattr(r, "keypoints") and r.keypoints is not None:
-                        poses = r.keypoints.xy.cpu().numpy()  # (n,K,2)
-                        pose_confs = r.keypoints.conf.cpu().numpy()  # (n,K)
-                        poses = np.concatenate([poses, pose_confs[..., None]], axis=2)  # (n,K,3)
+                for i, r in enumerate(results):
+                    if args.vis_bg == "recon" and recon_frames is not None and i < len(recon_frames):
+                        vis = recon_frames[i].copy()
                     else:
-                        poses = None
+                        vis = bg_bgr.copy() if bg_bgr is not None else np.zeros((cube_chunk.shape[0], cube_chunk.shape[1], 3), dtype=np.uint8)
 
-                    for j, tid in enumerate(track_id):
-                        box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
-                        vis = draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
-                        if poses is not None:
-                            vis = draw_pose(vis, poses[j])
+                    if r.boxes is not None and r.boxes.id is not None:
+                        track_id = r.boxes.id.cpu().numpy()
+                        boxes = r.boxes.xyxy.cpu().numpy()
+                        box_confs = r.boxes.conf.cpu().numpy()
+                        handedness = r.boxes.cls.cpu().numpy()
 
-                out_path = out_dir / f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
-                cv2.imwrite(str(out_path), vis)
-                global_frame_idx += 1
+                        if hasattr(r, "keypoints") and r.keypoints is not None:
+                            poses = r.keypoints.xy.cpu().numpy()  # (n,K,2)
+                            pose_confs = r.keypoints.conf.cpu().numpy()  # (n,K)
+                            poses = np.concatenate([poses, pose_confs[..., None]], axis=2)  # (n,K,3)
+                        else:
+                            poses = None
+
+                        for j, tid in enumerate(track_id):
+                            box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
+                            vis = draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
+                            if poses is not None:
+                                vis = draw_pose(vis, poses[j])
+
+                    out_path = out_dir / f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
+                    cv2.imwrite(str(out_path), vis)
+                    global_frame_idx += 1
+
 
 if __name__ == "__main__":
     main()
