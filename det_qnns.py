@@ -47,6 +47,12 @@ from ultralytics import YOLO
 from ultralytics.models.yolo.pose.spad_predict import SPADPosePredictor
 
 
+
+def _np_load(path: Path) -> np.ndarray:
+    """Load .npy with memory mapping (keeps most data on disk)."""
+    return np.load(path, mmap_mode='r')
+
+
 # ----------------------------
 # Visualization (copied from det.py)
 # ----------------------------
@@ -192,11 +198,11 @@ def _iter_cubes_from_path(in_path: Path, *, packed_reduce: str = "any") -> Itera
         if not files:
             raise FileNotFoundError(f"No .npy files found in directory: {in_path}")
         for p in files:
-            yield _accept_or_convert(np.load(p), src=p)
+            yield _accept_or_convert(_np_load(p), src=p)
         return
 
     if in_path.suffix.lower() == ".npy":
-        arr = np.load(in_path)
+        arr = _np_load(in_path)
         if arr.ndim == 3:
             yield arr
             return
