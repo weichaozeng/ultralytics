@@ -168,6 +168,21 @@ class SPADPosePredictor(PosePredictor):
             )
             recons_np = recons.detach().float().cpu().numpy()  # (H,W,T')
 
+            # If subsampling > (t1-t0), integrator may produce T'==0. Avoid returning an empty list.
+            if recons_np.shape[2] == 0:
+                # Best-effort causal fallback: use current EMA as a single frame if available.
+                try:
+                    ema = getattr(self.perpixel_bayes, 'ema', None)
+                    if ema is not None:
+                        recons_np = ema.detach().float().cpu().numpy()[:, :, None]
+                    else:
+                        raise AttributeError
+                except Exception:
+                    # Last resort: sum the photon chunk (still causal) to produce one frame.
+                    img = photon.detach().float().cpu().numpy().sum(axis=2)
+                    recons_np = img[:, :, None]
+
+
             if self.spad_collapse == "sum":
                 img = recons_np.sum(axis=2)
                 img01 = self._normalize_frame_per_frame(img)
