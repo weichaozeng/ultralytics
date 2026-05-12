@@ -257,11 +257,6 @@ def main():
     else:
         dataset_paths = [in_path]
 
-    # Save under save_dir/<dataset_name>/...
-    dataset_name = in_path.name if in_path.is_dir() else in_path.stem
-    save_dir = save_dir / dataset_name
-    save_dir.mkdir(parents=True, exist_ok=True)
-
     model = YOLO(args.ckpt)
 
     tracker_cfg = f"{args.tracker}.yaml" if args.tracker in ("bytetrack", "botsort") else "botsort.yaml"
