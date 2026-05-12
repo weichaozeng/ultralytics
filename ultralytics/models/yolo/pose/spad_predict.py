@@ -28,13 +28,15 @@ import numpy as np
 import torch
 
 from ultralytics.models.yolo.pose.predict import PosePredictor
+from ultralytics.utils import DEFAULT_CFG
 
 
 class SPADPosePredictor(PosePredictor):
     """PosePredictor with an optional SPAD preprocessing stage."""
 
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
-        super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
+        # Ultralytics BasePredictor expects `cfg` to be a dict/path; passing None will crash in get_cfg().
+        super().__init__(cfg=DEFAULT_CFG if cfg is None else cfg, overrides=overrides, _callbacks=_callbacks)
 
         # Toggle: enabled when `spad=True` is passed via overrides/kwargs (see Model.predict())
         self.spad_enabled = bool(getattr(self.args, "spad", False))
