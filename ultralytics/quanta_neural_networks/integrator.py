@@ -5,8 +5,8 @@ import torch.nn.functional as F
 from jaxtyping import Bool, Float
 from torch import Tensor
 
-from quanta_neural_networks.ops.array_ops import torch_quantile
-from quanta_neural_networks.ops.image import nearest_neighbor_inpaint
+from .ops.array_ops import torch_quantile
+from .ops.image import nearest_neighbor_inpaint
 
 
 class PerPixelBayesian(nn.Module):
