@@ -128,3 +128,13 @@ cfg: # (str, optional) path to a config.yaml that overrides defaults
 
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: botsort.yaml # (str) tracker config file: botsort.yaml or bytetrack.yaml
+
+# SPAD/QNN (custom) ---------------------------------------------------------------------------------------------------
+spad: False # (bool) enable SPAD photon-cube preprocessing pipeline
+spad_pre: perpixelbayesian # (str) SPAD preprocessor name, e.g. 'perpixelbayesian'
+spad_clear_states: False # (bool) reset SPAD preprocessor state at sequence start
+spad_bayes_kwargs: {} # (dict) kwargs forwarded to PerPixelBayesian/process_photon_cube (normalize forced False in SPAD pipeline)
+spad_collapse: recon # (str) how to turn cube into frames, e.g. 'recon' or other future modes
+spad_chunk_t: # (int, optional) chunk length in T for streaming large cubes
+spad_t_offset: 0 # (int) absolute T offset for causal alignment/debugging
+
