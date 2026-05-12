@@ -135,23 +135,64 @@ def draw_pose(img_bgr: np.ndarray, pose_kpts: np.ndarray, thresh: float = 0.5, k
 # Data loading utilities
 # ----------------------------
 
-def _iter_cubes_from_path(in_path: Path) -> Iterable[np.ndarray]:
+def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", expected_w: int = 512) -> np.ndarray:
+    """Convert VisionSIM packed frames (N,H,Wpacked,C) -> cube (H,W,T) bool.
+
+    VisionSIM often packs width bits: Wpacked = W/8. For example (N,512,64,3) packs a 512-wide image.
+
+    Args:
+        frames_packed: ndarray shaped (N,H,Wpacked,C) with uint8 bit-packed values.
+        reduce: how to reduce channels to a single photon observation per pixel.
+            - 'any': photon = OR over channels
+            - 'sum': photon = sum(ch)>0
+        expected_w: crop/unpack to this width.
+
+    Returns:
+        cube bool array shaped (H,W,T)
+    """
+    if frames_packed.ndim != 4:
+        raise ValueError(f"Expected packed frames (N,H,Wpacked,C), got shape={frames_packed.shape}")
+
+    # Unpack bits along the packed-width axis; result: (N,H,Wbits,C)
+    unpacked = np.unpackbits(frames_packed, axis=2)
+    if unpacked.shape[2] > expected_w:
+        unpacked = unpacked[:, :, :expected_w, :]
+
+    if reduce == "any":
+        ph_nhw = unpacked.any(axis=3)
+    elif reduce == "sum":
+        ph_nhw = unpacked.sum(axis=3) > 0
+    else:
+        raise ValueError(f"Unsupported reduce mode: {reduce}")
+
+    # (N,H,W) -> (H,W,N)
+    return np.transpose(ph_nhw, (1, 2, 0)).astype(bool, copy=False)
+
+
+def _iter_cubes_from_path(in_path: Path, *, packed_reduce: str = "any") -> Iterable[np.ndarray]:
     """Yield photon cubes from a path.
 
     Accepts:
       - directory of *.npy, each (H,W,T)
       - single *.npy containing (H,W,T) or (N,H,W,T)
+      - VisionSIM packed frames: (N,H,Wpacked,3) e.g. (17921,512,64,3)
     """
+
+    def _accept_or_convert(arr: np.ndarray, src: Path | None = None):
+        if arr.ndim == 3:
+            return arr
+        if arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128):
+            return _packed_frames_to_cube(arr, reduce=packed_reduce)
+        if src is not None:
+            raise ValueError(f"Unsupported array shape in {src}: {arr.shape}")
+        raise ValueError(f"Unsupported array shape: {arr.shape}")
 
     if in_path.is_dir():
         files = sorted([p for p in in_path.iterdir() if p.suffix.lower() == ".npy"])
         if not files:
             raise FileNotFoundError(f"No .npy files found in directory: {in_path}")
         for p in files:
-            cube = np.load(p)
-            if cube.ndim != 3:
-                raise ValueError(f"Expected cube (H,W,T) in {p}, got shape={cube.shape}")
-            yield cube
+            yield _accept_or_convert(np.load(p), src=p)
         return
 
     if in_path.suffix.lower() == ".npy":
@@ -159,11 +200,13 @@ def _iter_cubes_from_path(in_path: Path) -> Iterable[np.ndarray]:
         if arr.ndim == 3:
             yield arr
             return
-        if arr.ndim == 4:
+        if arr.ndim == 4 and not (arr.shape[-1] == 3 and arr.shape[2] in (64, 128)):
+            # (N,H,W,T) sequence of cubes
             for i in range(arr.shape[0]):
                 yield arr[i]
             return
-        raise ValueError(f"Unsupported .npy array shape: {arr.shape} in {in_path}")
+        yield _accept_or_convert(arr, src=in_path)
+        return
 
     raise ValueError(f"Unsupported input path: {in_path} (expect directory or .npy)")
 
@@ -185,6 +228,10 @@ def main():
     ap.add_argument("--bocpd_gamma", type=float, default=5e-4)
     ap.add_argument("--quantile", type=float, default=1.0)
     ap.add_argument("--min_filter_size", type=int, default=7)
+
+    # VisionSIM bit-packed video 输入 (N,H,Wpacked,3) 的解包设置
+    ap.add_argument("--packed_reduce", type=str, default="any", choices=["any", "sum"],
+                    help="bit-packed (N,H,Wpacked,3) 输入时，将 3 通道归约为单通道 photon：any=OR；sum=SUM>0")
 
     # Cube chunking (temporal)
     ap.add_argument("--cube_chunk_t", type=int, default=0, help="If >0, split each cube into chunks of this many time bins and call track() per chunk")
@@ -215,7 +262,7 @@ def main():
         "min_filter_size": args.min_filter_size,
     }
 
-    cube_iter = list(_iter_cubes_from_path(in_path))
+    cube_iter = list(_iter_cubes_from_path(in_path, packed_reduce=args.packed_reduce))
 
     # Process each cube (each cube yields T' reconstructed frames, each then yields a YOLO result).
     # We store results and also render per reconstructed frame.
