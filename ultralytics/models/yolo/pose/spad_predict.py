@@ -63,6 +63,10 @@ class SPADPosePredictor(PosePredictor):
         # det_qnns.py can set this to sanity-check mode combinations.
         self.spad_packed_reduce = getattr(self.args, "spad_packed_reduce", None)
 
+        # Additional hints for interpreting raw mosaic.
+        self.spad_bayer_pattern = getattr(self.args, "spad_bayer_pattern", "RGGB")
+        self.spad_packed_ch_order = getattr(self.args, "spad_packed_ch_order", "RGB")
+
         # Consistency check / auto-correction.
         if self.spad_packed_reduce == "rggb_raw" and self.spad_rgb_mode != "rggb_demosaic":
             self.spad_rgb_mode = "rggb_demosaic"
@@ -150,21 +154,28 @@ class SPADPosePredictor(PosePredictor):
         return (x - mn) / (mx - mn + eps)
 
     @staticmethod
-    def _demosaic_rggb_to_bgr_u8(raw_u8: np.ndarray) -> np.ndarray:
-        """Demosaic a Bayer RGGB uint8 image to BGR uint8 using OpenCV."""
+    def _demosaic_bayer_to_bgr_u8(raw_u8: np.ndarray, *, pattern: str = "RGGB") -> np.ndarray:
+        """Demosaic a Bayer uint8 image to BGR uint8 using OpenCV."""
         import cv2
 
         if raw_u8.ndim != 2:
             raise ValueError(f"Expected raw (H,W) uint8, got shape={raw_u8.shape}")
         if raw_u8.dtype != np.uint8:
             raw_u8 = raw_u8.astype(np.uint8, copy=False)
-        return cv2.cvtColor(raw_u8, cv2.COLOR_BayerRG2BGR)
+        code_map = {
+            "RGGB": cv2.COLOR_BayerRG2BGR,
+            "BGGR": cv2.COLOR_BayerBG2BGR,
+            "GRBG": cv2.COLOR_BayerGR2BGR,
+            "GBRG": cv2.COLOR_BayerGB2BGR,
+        }
+        code = code_map.get(pattern, cv2.COLOR_BayerRG2BGR)
+        return cv2.cvtColor(raw_u8, code)
 
     def _to_3ch_u8(self, img01: np.ndarray) -> np.ndarray:
         """Convert float [0,1] (H,W) to uint8 (H,W,3) according to spad_rgb_mode."""
         u8 = np.clip((img01 * 255.0).round(), 0, 255).astype(np.uint8)
         if self.spad_rgb_mode == "rggb_demosaic":
-            return self._demosaic_rggb_to_bgr_u8(u8)
+            return self._demosaic_bayer_to_bgr_u8(u8, pattern=self.spad_bayer_pattern)
         return np.repeat(u8[:, :, None], 3, axis=2)
 
     def _spad_cube_to_frames(self, cube_hwt: np.ndarray) -> list[np.ndarray]:
