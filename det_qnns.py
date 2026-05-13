@@ -183,7 +183,7 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
         ph_nhw[:, 1::2, 0::2] = unpacked[:, 1::2, 0::2, g_ch].astype(bool, copy=False)  # G
         ph_nhw[:, 1::2, 1::2] = unpacked[:, 1::2, 1::2, b_ch].astype(bool, copy=False)  # B
     elif reduce == "rggb_expand":
-        # Expand 3-channel packed info into a wider (H, 2W) single-channel raw plane before PPB.
+        # Expand 3-channel packed info into a (2H, 2W) single-channel Bayer raw plane before PPB.
         # Intended workflow: unpacked (N,H,W,3) -> raw (N,H,2W) -> cube (H,2W,T) -> PPB -> demosaic/pack back.
         ch_order = getattr(_packed_frames_to_cube, "_packed_ch_order", "RGB")
         if ch_order == "BGR":
@@ -192,17 +192,15 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
             r_ch, g_ch, b_ch = 0, 1, 2
 
         n, h, w, _ = unpacked.shape
-        raw = np.zeros((n, h, w * 2), dtype=bool)
+        raw = np.zeros((n, h * 2, w * 2), dtype=bool)
 
-        # Pack Bayer sites horizontally: raw[..., 2*x] holds R/B sites, raw[..., 2*x+1] holds G sites.
-        # R at (even row, even col)
-        raw[:, 0::2, 0::4] = unpacked[:, 0::2, 0::2, r_ch].astype(bool, copy=False)
-        # B at (odd row, odd col)
-        raw[:, 1::2, 2::4] = unpacked[:, 1::2, 1::2, b_ch].astype(bool, copy=False)
-        # G at (even row, odd col)
-        raw[:, 0::2, 3::4] = unpacked[:, 0::2, 1::2, g_ch].astype(bool, copy=False)
-        # G at (odd row, even col)
-        raw[:, 1::2, 1::4] = unpacked[:, 1::2, 0::2, g_ch].astype(bool, copy=False)
+        # Expand each (y,x) to a 2x2 RGGB block in raw:
+        #   (2y,2x)=R, (2y,2x+1)=G, (2y+1,2x)=G, (2y+1,2x+1)=B
+
+        raw[:, 0::2, 0::2] = unpacked[:, :, :, r_ch].astype(bool, copy=False)
+        raw[:, 0::2, 1::2] = unpacked[:, :, :, g_ch].astype(bool, copy=False)
+        raw[:, 1::2, 0::2] = unpacked[:, :, :, g_ch].astype(bool, copy=False)
+        raw[:, 1::2, 1::2] = unpacked[:, :, :, b_ch].astype(bool, copy=False)
 
         ph_nhw = raw
     else:
@@ -276,11 +274,13 @@ def main():
 
     # VisionSIM bit-packed video 输入 (N,H,Wpacked,3) 的解包设置
     ap.add_argument("--packed_reduce", type=str, default="any", choices=["any", "sum", "rggb_raw", "rggb_expand"],
-                    help="bit-packed (N,H,Wpacked,3) 输入时，将 3 通道归约为单通道 photon：any=OR；sum=SUM>0")
+                    help="bit-packed (N,H,Wpacked,3) 输入时，将 3 通道归约为单通道 photon：any=OR；sum=SUM>0；rggb_raw=RGGB采样；rggb_expand=展开到2W后PPB再pack回W")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"],
                     help="packed_reduce=rggb_raw 时，packed 的 3 通道顺序（用于从三通道采样 Bayer raw）。")
     ap.add_argument("--bayer_pattern", type=str, default="RGGB", choices=["RGGB", "BGGR", "GRBG", "GBRG"],
                     help="packed_reduce=rggb_raw 时，单通道 raw 的 Bayer 排列（用于 demosaic）。")
+    ap.add_argument("--spad_swap_rb", action="store_true", help="demosaic 后交换 R/B（用于修复蓝/红互换）")
+
 
 
     # Cube chunking (temporal)
@@ -365,6 +365,7 @@ def main():
                     spad_packed_reduce=args.packed_reduce,
                     spad_bayer_pattern=args.bayer_pattern,
                     spad_packed_ch_order=args.packed_ch_order,
+                    spad_swap_rb=getattr(args, "spad_swap_rb", False),
                 )
                 first_chunk = False
 
@@ -384,7 +385,11 @@ def main():
                     bg_bgr = np.repeat(bg_u8[:, :, None], 3, axis=2)
 
                 for i, r in enumerate(results):
-                    if args.vis_bg == "recon" and recon_frames is not None and i < len(recon_frames):
+                    # IMPORTANT: draw on r.orig_img (the exact image used as orig_img for scaling boxes/kpts)
+                    # to avoid misalignment caused by letterbox/resize inside Ultralytics.
+                    if getattr(r, "orig_img", None) is not None:
+                        vis = r.orig_img.copy()
+                    elif args.vis_bg == "recon" and recon_frames is not None and i < len(recon_frames):
                         vis = recon_frames[i].copy()
                     else:
                         vis = bg_bgr.copy() if bg_bgr is not None else np.zeros((cube_chunk.shape[0], cube_chunk.shape[1], 3), dtype=np.uint8)

@@ -4,6 +4,7 @@ spad_rgb_mode: gray
 spad_packed_reduce: any
 spad_bayer_pattern: RGGB
 spad_packed_ch_order: RGB
+spad_swap_rb: false
 # Global configuration YAML with settings and hyperparameters for YOLO training, validation, prediction and export
 # For documentation see https://docs.ultralytics.com/usage/cfg/
 

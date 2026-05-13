@@ -67,6 +67,9 @@ class SPADPosePredictor(PosePredictor):
         self.spad_bayer_pattern = getattr(self.args, "spad_bayer_pattern", "RGGB")
         self.spad_packed_ch_order = getattr(self.args, "spad_packed_ch_order", "RGB")
 
+        # If demosaic output has R/B swapped due to unknown sensor/channel conventions, allow a post-swap.
+        self.spad_swap_rb = bool(getattr(self.args, "spad_swap_rb", False))
+
         # Consistency check / auto-correction.
         if self.spad_packed_reduce == "rggb_raw" and self.spad_rgb_mode != "rggb_demosaic":
             self.spad_rgb_mode = "rggb_demosaic"
@@ -173,33 +176,29 @@ class SPADPosePredictor(PosePredictor):
 
     @staticmethod
     def _pack_rggb_expand_to_raw_u8(raw2w_u8: np.ndarray) -> np.ndarray:
-        """Pack expanded raw (H,2W) back to standard Bayer raw (H,W) uint8.
+        """Pack expanded raw (2H,2W) back to standard Bayer raw (H,W) uint8.
 
-        This is the inverse of det_qnns.py packed_reduce=rggb_expand mapping.
-        Expanded layout (mod 4 columns):
-          - even row: 0::4 = R, 3::4 = G
-          - odd  row: 1::4 = G, 2::4 = B
+        In packed_reduce=rggb_expand we expand each (y,x) into a 2x2 RGGB block:
+          raw2h2w[2y,2x]   = R
+          raw2h2w[2y,2x+1] = G
+          raw2h2w[2y+1,2x] = G
+          raw2h2w[2y+1,2x+1]=B
 
-        Returns:
-            raw_u8: (H,W) uint8 Bayer mosaic suitable for OpenCV demosaic.
+        This packs it back to a single-plane Bayer mosaic (H,W) where:
+          (even,even)=R, (even,odd)=G, (odd,even)=G, (odd,odd)=B.
         """
         if raw2w_u8.ndim != 2:
-            raise ValueError(f"Expected (H,2W) raw, got shape={raw2w_u8.shape}")
-        h, w2 = raw2w_u8.shape
-        if w2 % 2 != 0:
-            raise ValueError(f"Expected even width for (H,2W), got W2={w2}")
-        w = w2 // 2
+            raise ValueError(f"Expected (2H,2W) raw, got shape={raw2w_u8.shape}")
+        h2, w2 = raw2w_u8.shape
+        if (h2 % 2) != 0 or (w2 % 2) != 0:
+            raise ValueError(f"Expected even (2H,2W), got shape={raw2w_u8.shape}")
+        h, w = h2 // 2, w2 // 2
+
         raw_u8 = np.zeros((h, w), dtype=np.uint8)
-
-        # R at (even row, even col) from expanded 0::4
-        raw_u8[0::2, 0::2] = raw2w_u8[0::2, 0::4]
-        # G at (even row, odd col) from expanded 3::4
-        raw_u8[0::2, 1::2] = raw2w_u8[0::2, 3::4]
-        # G at (odd row, even col) from expanded 1::4
-        raw_u8[1::2, 0::2] = raw2w_u8[1::2, 1::4]
-        # B at (odd row, odd col) from expanded 2::4
-        raw_u8[1::2, 1::2] = raw2w_u8[1::2, 2::4]
-
+        raw_u8[0::2, 0::2] = raw2w_u8[0::2, 0::2]  # R
+        raw_u8[0::2, 1::2] = raw2w_u8[0::2, 1::2]  # G
+        raw_u8[1::2, 0::2] = raw2w_u8[1::2, 0::2]  # G
+        raw_u8[1::2, 1::2] = raw2w_u8[1::2, 1::2]  # B
         return raw_u8
 
     def _to_3ch_u8(self, img01: np.ndarray) -> np.ndarray:
@@ -209,7 +208,10 @@ class SPADPosePredictor(PosePredictor):
             # If cube came from packed_reduce=rggb_expand, PPB ran at width=2W; pack back before demosaic.
             if self.spad_packed_reduce == "rggb_expand":
                 u8 = self._pack_rggb_expand_to_raw_u8(u8)
-            return self._demosaic_bayer_to_bgr_u8(u8, pattern=self.spad_bayer_pattern)
+            bgr = self._demosaic_bayer_to_bgr_u8(u8, pattern=self.spad_bayer_pattern)
+            if self.spad_swap_rb and bgr.ndim == 3 and bgr.shape[2] == 3:
+                bgr = bgr[:, :, ::-1]  # swap R/B
+            return bgr
         return np.repeat(u8[:, :, None], 3, axis=2)
 
     def _spad_cube_to_frames(self, cube_hwt: np.ndarray) -> list[np.ndarray]:
@@ -289,3 +291,4 @@ class SPADPosePredictor(PosePredictor):
             return frame_bgr
 
         return frame_bgr
+
