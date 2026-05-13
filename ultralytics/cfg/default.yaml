@@ -1,5 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+spad_rgb_mode: gray
+spad_packed_reduce: any
 # Global configuration YAML with settings and hyperparameters for YOLO training, validation, prediction and export
 # For documentation see https://docs.ultralytics.com/usage/cfg/
 

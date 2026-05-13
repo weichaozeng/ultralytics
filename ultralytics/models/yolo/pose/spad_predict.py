@@ -54,6 +54,21 @@ class SPADPosePredictor(PosePredictor):
         # - 'sum'   : collapse to a single image (debug)
         self.spad_collapse = getattr(self.args, "spad_collapse", "frames")
 
+        # How to convert a single-channel reconstruction to a 3-channel image for YOLO/visualization.
+        # - 'gray': repeat grayscale to 3 channels (default)
+        # - 'rggb_demosaic': treat as Bayer RGGB RAW and demosaic to BGR
+        self.spad_rgb_mode = getattr(self.args, "spad_rgb_mode", "gray")
+
+        # Optional hint from caller about how the single-channel cube was produced.
+        # det_qnns.py can set this to sanity-check mode combinations.
+        self.spad_packed_reduce = getattr(self.args, "spad_packed_reduce", None)
+
+        # Consistency check / auto-correction.
+        if self.spad_packed_reduce == "rggb_raw" and self.spad_rgb_mode != "rggb_demosaic":
+            self.spad_rgb_mode = "rggb_demosaic"
+        elif self.spad_packed_reduce in ("any", "sum") and self.spad_rgb_mode == "rggb_demosaic":
+            self.spad_rgb_mode = "gray"
+
         # Stateful preprocessor
         self.perpixel_bayes = None
 
@@ -134,6 +149,24 @@ class SPADPosePredictor(PosePredictor):
         mx = float(x.max())
         return (x - mn) / (mx - mn + eps)
 
+    @staticmethod
+    def _demosaic_rggb_to_bgr_u8(raw_u8: np.ndarray) -> np.ndarray:
+        """Demosaic a Bayer RGGB uint8 image to BGR uint8 using OpenCV."""
+        import cv2
+
+        if raw_u8.ndim != 2:
+            raise ValueError(f"Expected raw (H,W) uint8, got shape={raw_u8.shape}")
+        if raw_u8.dtype != np.uint8:
+            raw_u8 = raw_u8.astype(np.uint8, copy=False)
+        return cv2.cvtColor(raw_u8, cv2.COLOR_BayerRG2BGR)
+
+    def _to_3ch_u8(self, img01: np.ndarray) -> np.ndarray:
+        """Convert float [0,1] (H,W) to uint8 (H,W,3) according to spad_rgb_mode."""
+        u8 = np.clip((img01 * 255.0).round(), 0, 255).astype(np.uint8)
+        if self.spad_rgb_mode == "rggb_demosaic":
+            return self._demosaic_rggb_to_bgr_u8(u8)
+        return np.repeat(u8[:, :, None], 3, axis=2)
+
     def _spad_cube_to_frames(self, cube_hwt: np.ndarray) -> list[np.ndarray]:
         """Convert a photon cube (H,W,T) to a list of BGR uint8 frames (HxWx3)."""
         # Clear previous cache
@@ -186,14 +219,12 @@ class SPADPosePredictor(PosePredictor):
             if self.spad_collapse == "sum":
                 img = recons_np.sum(axis=2)
                 img01 = self._normalize_frame_per_frame(img)
-                img_u8 = (img01 * 255.0).round().astype(np.uint8)
-                frames_out.append(np.repeat(img_u8[:, :, None], 3, axis=2))
+                frames_out.append(self._to_3ch_u8(img01))
                 continue
 
             for i in range(recons_np.shape[2]):
                 f01 = self._normalize_frame_per_frame(recons_np[:, :, i])
-                f_u8 = (f01 * 255.0).round().astype(np.uint8)
-                frames_out.append(np.repeat(f_u8[:, :, None], 3, axis=2))
+                frames_out.append(self._to_3ch_u8(f01))
 
         # Save cache for visualization/debug (used by det_qnns.py)
         self.last_recon_frames_u8 = frames_out

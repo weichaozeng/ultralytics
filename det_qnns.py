@@ -168,6 +168,13 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
         ph_nhw = unpacked.any(axis=3)
     elif reduce == "sum":
         ph_nhw = unpacked.sum(axis=3) > 0
+    elif reduce == "rggb_raw":
+        # Treat channels as (R,G,B) responses and sample into a Bayer RGGB mosaic RAW plane.
+        ph_nhw = np.zeros(unpacked.shape[:3], dtype=bool)
+        ph_nhw[:, 0::2, 0::2] = unpacked[:, 0::2, 0::2, 0].astype(bool, copy=False)  # R
+        ph_nhw[:, 0::2, 1::2] = unpacked[:, 0::2, 1::2, 1].astype(bool, copy=False)  # G
+        ph_nhw[:, 1::2, 0::2] = unpacked[:, 1::2, 0::2, 1].astype(bool, copy=False)  # G
+        ph_nhw[:, 1::2, 1::2] = unpacked[:, 1::2, 1::2, 2].astype(bool, copy=False)  # B
     else:
         raise ValueError(f"Unsupported reduce mode: {reduce}")
 
@@ -238,7 +245,7 @@ def main():
     ap.add_argument("--min_filter_size", type=int, default=7)
 
     # VisionSIM bit-packed video 输入 (N,H,Wpacked,3) 的解包设置
-    ap.add_argument("--packed_reduce", type=str, default="any", choices=["any", "sum"],
+    ap.add_argument("--packed_reduce", type=str, default="any", choices=["any", "sum", "rggb_raw"],
                     help="bit-packed (N,H,Wpacked,3) 输入时，将 3 通道归约为单通道 photon：any=OR；sum=SUM>0")
 
     # Cube chunking (temporal)
@@ -247,6 +254,9 @@ def main():
     ap.add_argument("--vis_bg", type=str, default="sum", choices=["sum", "recon"], help="可视化背景：sum=时间维求和；recon=PerPixelBayesian 重建帧")
 
     args = ap.parse_args()
+
+    # det_qnns 始终传给 predictor 单通道 cube；若该单通道来自 rggb_raw 采样，则 predictor 必须按 Bayer RGGB demosaic 成 RGB。
+    spad_rgb_mode = "rggb_demosaic" if args.packed_reduce == "rggb_raw" else "gray"
 
     in_path = Path(args.in_path)
     if not in_path.exists():
@@ -284,7 +294,7 @@ def main():
         out_dir = save_dir / dataset_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        cube_iter = list(_iter_cubes_from_path(dataset_path, packed_reduce=args.packed_reduce))
+        cube_iter = _iter_cubes_from_path(dataset_path, packed_reduce=args.packed_reduce)
 
         # Process each cube (each cube yields T' reconstructed frames, each then yields a YOLO result).
         for cube_idx, cube in enumerate(tqdm(cube_iter, desc=f"Processing cubes [{dataset_name}]")):
@@ -314,6 +324,8 @@ def main():
                     spad_clear_states=first_chunk,
                     spad_bayes_kwargs=spad_bayes_kwargs,
                     spad_collapse="frames",
+                    spad_rgb_mode=spad_rgb_mode,
+                    spad_packed_reduce=args.packed_reduce,
                 )
                 first_chunk = False
 
