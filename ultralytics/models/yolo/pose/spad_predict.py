@@ -171,10 +171,44 @@ class SPADPosePredictor(PosePredictor):
         code = code_map.get(pattern, cv2.COLOR_BayerRG2BGR)
         return cv2.cvtColor(raw_u8, code)
 
+    @staticmethod
+    def _pack_rggb_expand_to_raw_u8(raw2w_u8: np.ndarray) -> np.ndarray:
+        """Pack expanded raw (H,2W) back to standard Bayer raw (H,W) uint8.
+
+        This is the inverse of det_qnns.py packed_reduce=rggb_expand mapping.
+        Expanded layout (mod 4 columns):
+          - even row: 0::4 = R, 3::4 = G
+          - odd  row: 1::4 = G, 2::4 = B
+
+        Returns:
+            raw_u8: (H,W) uint8 Bayer mosaic suitable for OpenCV demosaic.
+        """
+        if raw2w_u8.ndim != 2:
+            raise ValueError(f"Expected (H,2W) raw, got shape={raw2w_u8.shape}")
+        h, w2 = raw2w_u8.shape
+        if w2 % 2 != 0:
+            raise ValueError(f"Expected even width for (H,2W), got W2={w2}")
+        w = w2 // 2
+        raw_u8 = np.zeros((h, w), dtype=np.uint8)
+
+        # R at (even row, even col) from expanded 0::4
+        raw_u8[0::2, 0::2] = raw2w_u8[0::2, 0::4]
+        # G at (even row, odd col) from expanded 3::4
+        raw_u8[0::2, 1::2] = raw2w_u8[0::2, 3::4]
+        # G at (odd row, even col) from expanded 1::4
+        raw_u8[1::2, 0::2] = raw2w_u8[1::2, 1::4]
+        # B at (odd row, odd col) from expanded 2::4
+        raw_u8[1::2, 1::2] = raw2w_u8[1::2, 2::4]
+
+        return raw_u8
+
     def _to_3ch_u8(self, img01: np.ndarray) -> np.ndarray:
         """Convert float [0,1] (H,W) to uint8 (H,W,3) according to spad_rgb_mode."""
         u8 = np.clip((img01 * 255.0).round(), 0, 255).astype(np.uint8)
         if self.spad_rgb_mode == "rggb_demosaic":
+            # If cube came from packed_reduce=rggb_expand, PPB ran at width=2W; pack back before demosaic.
+            if self.spad_packed_reduce == "rggb_expand":
+                u8 = self._pack_rggb_expand_to_raw_u8(u8)
             return self._demosaic_bayer_to_bgr_u8(u8, pattern=self.spad_bayer_pattern)
         return np.repeat(u8[:, :, None], 3, axis=2)
 

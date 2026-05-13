@@ -182,6 +182,29 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
         ph_nhw[:, 0::2, 1::2] = unpacked[:, 0::2, 1::2, g_ch].astype(bool, copy=False)  # G
         ph_nhw[:, 1::2, 0::2] = unpacked[:, 1::2, 0::2, g_ch].astype(bool, copy=False)  # G
         ph_nhw[:, 1::2, 1::2] = unpacked[:, 1::2, 1::2, b_ch].astype(bool, copy=False)  # B
+    elif reduce == "rggb_expand":
+        # Expand 3-channel packed info into a wider (H, 2W) single-channel raw plane before PPB.
+        # Intended workflow: unpacked (N,H,W,3) -> raw (N,H,2W) -> cube (H,2W,T) -> PPB -> demosaic/pack back.
+        ch_order = getattr(_packed_frames_to_cube, "_packed_ch_order", "RGB")
+        if ch_order == "BGR":
+            r_ch, g_ch, b_ch = 2, 1, 0
+        else:
+            r_ch, g_ch, b_ch = 0, 1, 2
+
+        n, h, w, _ = unpacked.shape
+        raw = np.zeros((n, h, w * 2), dtype=bool)
+
+        # Pack Bayer sites horizontally: raw[..., 2*x] holds R/B sites, raw[..., 2*x+1] holds G sites.
+        # R at (even row, even col)
+        raw[:, 0::2, 0::4] = unpacked[:, 0::2, 0::2, r_ch].astype(bool, copy=False)
+        # B at (odd row, odd col)
+        raw[:, 1::2, 2::4] = unpacked[:, 1::2, 1::2, b_ch].astype(bool, copy=False)
+        # G at (even row, odd col)
+        raw[:, 0::2, 3::4] = unpacked[:, 0::2, 1::2, g_ch].astype(bool, copy=False)
+        # G at (odd row, even col)
+        raw[:, 1::2, 1::4] = unpacked[:, 1::2, 0::2, g_ch].astype(bool, copy=False)
+
+        ph_nhw = raw
     else:
         raise ValueError(f"Unsupported reduce mode: {reduce}")
 
@@ -252,7 +275,7 @@ def main():
     ap.add_argument("--min_filter_size", type=int, default=7)
 
     # VisionSIM bit-packed video 输入 (N,H,Wpacked,3) 的解包设置
-    ap.add_argument("--packed_reduce", type=str, default="any", choices=["any", "sum", "rggb_raw"],
+    ap.add_argument("--packed_reduce", type=str, default="any", choices=["any", "sum", "rggb_raw", "rggb_expand"],
                     help="bit-packed (N,H,Wpacked,3) 输入时，将 3 通道归约为单通道 photon：any=OR；sum=SUM>0")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"],
                     help="packed_reduce=rggb_raw 时，packed 的 3 通道顺序（用于从三通道采样 Bayer raw）。")
@@ -268,7 +291,7 @@ def main():
     args = ap.parse_args()
 
     # det_qnns 始终传给 predictor 单通道 cube；若该单通道来自 rggb_raw 采样，则 predictor 必须按 Bayer RGGB demosaic 成 RGB。
-    spad_rgb_mode = "rggb_demosaic" if args.packed_reduce == "rggb_raw" else "gray"
+    spad_rgb_mode = "rggb_demosaic" if args.packed_reduce in ("rggb_raw", "rggb_expand") else "gray"
 
     _packed_frames_to_cube._packed_ch_order = args.packed_ch_order
 
