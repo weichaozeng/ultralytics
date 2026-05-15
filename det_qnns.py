@@ -210,46 +210,29 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
     return np.transpose(ph_nhw, (1, 2, 0)).astype(bool, copy=False)
 
 
-def _iter_cubes_from_path(in_path: Path, *, packed_reduce: str = "any") -> Iterable[np.ndarray]:
-    """Yield photon cubes from a path.
-
-    Accepts:
-      - directory of *.npy, each (H,W,T)
-      - single *.npy containing (H,W,T) or (N,H,W,T)
-      - VisionSIM packed frames: (N,H,Wpacked,3) e.g. (17921,512,64,3)
-    """
-
-    def _accept_or_convert(arr: np.ndarray, src: Path | None = None):
-        if arr.ndim == 3:
-            return arr
-        if arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128):
-            return _packed_frames_to_cube(arr, reduce=packed_reduce)
-        if src is not None:
-            raise ValueError(f"Unsupported array shape in {src}: {arr.shape}")
-        raise ValueError(f"Unsupported array shape: {arr.shape}")
-
+def _iter_cubes_from_path(in_path: Path):
+    """Yield raw mmap arrays and their type."""
     if in_path.is_dir():
         files = sorted([p for p in in_path.iterdir() if p.suffix.lower() == ".npy"])
-        if not files:
-            raise FileNotFoundError(f"No .npy files found in directory: {in_path}")
         for p in files:
-            yield _accept_or_convert(_np_load(p), src=p)
+            arr = _np_load(p)
+            # 判断是否是 packed 格式
+            is_packed = (arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128))
+            yield arr, is_packed
         return
 
     if in_path.suffix.lower() == ".npy":
         arr = _np_load(in_path)
-        if arr.ndim == 3:
-            yield arr
-            return
-        if arr.ndim == 4 and not (arr.shape[-1] == 3 and arr.shape[2] in (64, 128)):
-            # (N,H,W,T) sequence of cubes
+        is_packed = (arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128))
+        
+        # 如果是序列型数据 (N, H, W, T) 且不是 packed
+        if arr.ndim == 4 and not is_packed:
             for i in range(arr.shape[0]):
-                yield arr[i]
+                yield arr[i], False
             return
-        yield _accept_or_convert(arr, src=in_path)
+            
+        yield arr, is_packed
         return
-
-    raise ValueError(f"Unsupported input path: {in_path} (expect directory or .npy)")
 
 
 # ----------------------------
@@ -331,21 +314,30 @@ def main():
         out_dir = save_dir / dataset_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        cube_iter = _iter_cubes_from_path(dataset_path, packed_reduce=args.packed_reduce)
+        cube_iter = _iter_cubes_from_path(dataset_path)
 
         # Process each cube (each cube yields T' reconstructed frames, each then yields a YOLO result).
-        for cube_idx, cube in enumerate(tqdm(cube_iter, desc=f"Processing cubes [{dataset_name}]")):
+        for cube_idx, (raw_array, is_packed) in enumerate(tqdm(cube_iter, desc=f"Processing cubes [{dataset_name}]")):
 
             # Reset SPAD state at the start of each big cube/sequence.
             first_chunk = True
 
-            # Split big cube into temporal chunks (optional) and call track() sequentially.
-            T = cube.shape[2]
+            if is_packed:
+                T = raw_array.shape[0]
+            else:
+                T = raw_array.shape[2]
             chunk_t = int(args.cube_chunk_t) if int(args.cube_chunk_t) > 0 else T
             stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
+
+
             for t0 in range(0, T, stride):
                 t1 = min(T, t0 + chunk_t)
-                cube_chunk = cube[:, :, t0:t1]
+                if is_packed:
+                    raw_chunk = raw_array[t0:t1, :, :, :]
+                    cube_chunk = _packed_frames_to_cube(raw_chunk, reduce=args.packed_reduce)
+                else:
+                    cube_chunk = raw_array[:, :, t0:t1]
+
                 if cube_chunk.shape[2] == 0:
                     continue
 
@@ -377,12 +369,12 @@ def main():
                     except Exception:
                         recon_frames = None
 
-                bg_bgr = None
+                bg_rgb = None
                 if args.vis_bg == "sum" or recon_frames is None:
                     bg = cube_chunk.astype(np.float32).sum(axis=2)
                     bg = bg / (bg.max() + 1e-6)
                     bg_u8 = (bg * 255.0).round().astype(np.uint8)
-                    bg_bgr = np.repeat(bg_u8[:, :, None], 3, axis=2)
+                    bg_rgb = np.repeat(bg_u8[:, :, None], 3, axis=2)
 
                 for i, r in enumerate(results):
                     # IMPORTANT: draw on r.orig_img (the exact image used as orig_img for scaling boxes/kpts)
@@ -392,7 +384,7 @@ def main():
                     elif args.vis_bg == "recon" and recon_frames is not None and i < len(recon_frames):
                         vis = recon_frames[i].copy()
                     else:
-                        vis = bg_bgr.copy() if bg_bgr is not None else np.zeros((cube_chunk.shape[0], cube_chunk.shape[1], 3), dtype=np.uint8)
+                        vis = bg_rgb.copy() if bg_rgb is not None else np.zeros((cube_chunk.shape[0], cube_chunk.shape[1], 3), dtype=np.uint8)
 
                     if r.boxes is not None and r.boxes.id is not None:
                         track_id = r.boxes.id.cpu().numpy()
