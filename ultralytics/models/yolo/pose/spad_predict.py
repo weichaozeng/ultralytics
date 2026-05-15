@@ -175,43 +175,53 @@ class SPADPosePredictor(PosePredictor):
         return cv2.cvtColor(raw_u8, code)
 
     @staticmethod
-    def _pack_rggb_expand_to_raw_u8(raw2w_u8: np.ndarray) -> np.ndarray:
-        """Pack expanded raw (2H,2W) back to standard Bayer raw (H,W) uint8.
-
-        In packed_reduce=rggb_expand we expand each (y,x) into a 2x2 RGGB block:
-          raw2h2w[2y,2x]   = R
-          raw2h2w[2y,2x+1] = G
-          raw2h2w[2y+1,2x] = G
-          raw2h2w[2y+1,2x+1]=B
-
-        This packs it back to a single-plane Bayer mosaic (H,W) where:
-          (even,even)=R, (even,odd)=G, (odd,even)=G, (odd,odd)=B.
+    def _unexpand_to_bgr_u8(raw2w_u8: np.ndarray) -> np.ndarray:
+        """
+        Directly un-expand the (2H, 2W) PPB reconstruction back to (H, W, 3) BGR.
+        This preserves 100% of the pixels and avoids cv2 demosaic artifacts.
         """
         if raw2w_u8.ndim != 2:
             raise ValueError(f"Expected (2H,2W) raw, got shape={raw2w_u8.shape}")
         h2, w2 = raw2w_u8.shape
         if (h2 % 2) != 0 or (w2 % 2) != 0:
             raise ValueError(f"Expected even (2H,2W), got shape={raw2w_u8.shape}")
+        
         h, w = h2 // 2, w2 // 2
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
 
-        raw_u8 = np.zeros((h, w), dtype=np.uint8)
-        raw_u8[0::2, 0::2] = raw2w_u8[0::2, 0::2]  # R
-        raw_u8[0::2, 1::2] = raw2w_u8[0::2, 1::2]  # G
-        raw_u8[1::2, 0::2] = raw2w_u8[1::2, 0::2]  # G
-        raw_u8[1::2, 1::2] = raw2w_u8[1::2, 1::2]  # B
-        return raw_u8
+        # 从展开的 2H x 2W 阵列中提取各个通道
+        r  = raw2w_u8[0::2, 0::2]
+        g1 = raw2w_u8[0::2, 1::2]
+        g2 = raw2w_u8[1::2, 0::2]
+        b  = raw2w_u8[1::2, 1::2]
+
+        # 因为 PPB 平滑后两个 G 像素可能存在微小差异，取平均以防高频噪点
+        # 转换为 uint16 防止加法溢出
+        g = ((g1.astype(np.uint16) + g2.astype(np.uint16)) // 2).astype(np.uint8)
+
+        # 装填为 OpenCV 标准的 BGR 格式
+        rgb[:, :, 0] = r
+        rgb[:, :, 1] = g
+        rgb[:, :, 2] = b
+
+        return rgb
 
     def _to_3ch_u8(self, img01: np.ndarray) -> np.ndarray:
         """Convert float [0,1] (H,W) to uint8 (H,W,3) according to spad_rgb_mode."""
         u8 = np.clip((img01 * 255.0).round(), 0, 255).astype(np.uint8)
+        
         if self.spad_rgb_mode == "rggb_demosaic":
-            # If cube came from packed_reduce=rggb_expand, PPB ran at width=2W; pack back before demosaic.
             if self.spad_packed_reduce == "rggb_expand":
-                u8 = self._pack_rggb_expand_to_raw_u8(u8)
-            bgr = self._demosaic_bayer_to_bgr_u8(u8, pattern=self.spad_bayer_pattern)
+                # 无损逆向还原，跳过 cv2.cvtColor
+                bgr = self._unexpand_to_bgr_u8(u8)
+            else:
+                # 只有真实的单传感 Bayer Raw 才需要走 OpenCV demosaic
+                bgr = self._demosaic_bayer_to_bgr_u8(u8, pattern=self.spad_bayer_pattern)
+                
             if self.spad_swap_rb and bgr.ndim == 3 and bgr.shape[2] == 3:
                 bgr = bgr[:, :, ::-1]  # swap R/B
             return bgr
+            
         return np.repeat(u8[:, :, None], 3, axis=2)
 
     def _spad_cube_to_frames(self, cube_hwt: np.ndarray) -> list[np.ndarray]:
