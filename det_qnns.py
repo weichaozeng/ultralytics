@@ -280,6 +280,11 @@ def main():
         out_dir = save_dir / dataset_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        if hasattr(model, 'predictor') and model.predictor is not None:
+            if hasattr(model.predictor, 'trackers') and model.predictor.trackers:
+                for tracker in model.predictor.trackers:
+                    tracker.reset()
+
         cube_iter = _iter_cubes_from_path(dataset_path)
 
         for cube_idx, (raw_array, is_packed) in enumerate(tqdm(cube_iter, desc=f"Processing cubes [{dataset_name}]")):
