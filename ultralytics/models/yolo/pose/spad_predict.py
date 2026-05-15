@@ -96,6 +96,7 @@ class SPADPosePredictor(PosePredictor):
         # Cached (t0, t1) for the most recent preprocess cube input, in absolute big-cube indices
         self.last_recon_t01: tuple[int, int] | None = None
 
+
     # --------------------------
     # Public helpers
     # --------------------------
@@ -112,6 +113,8 @@ class SPADPosePredictor(PosePredictor):
             except Exception:
                 # Safe fallback: next set_cube() call will re-init when t_absolute==0.
                 pass
+        if hasattr(self.perpixel_bayes, "ema"):
+            self.perpixel_bayes.ema = None
 
     # --------------------------
     # Overrides
@@ -122,12 +125,13 @@ class SPADPosePredictor(PosePredictor):
         if not self.spad_enabled:
             return super().preprocess(im)
 
+        current_clear = bool(getattr(self.args, "spad_clear_states", False))
         # If the caller passes a photon cube (H,W,T) directly.
         if isinstance(im, np.ndarray) and im.ndim == 3:
-            if self.spad_clear_states:
+            if current_clear:
                 self.reset_spad_state()
                 # Ensure only cleared once per *big* cube if the script chunks externally.
-                self.spad_clear_states = False
+                self.args.spad_clear_states = False
 
             frames = self._spad_cube_to_frames(im)
             return super().preprocess(frames)
@@ -137,6 +141,10 @@ class SPADPosePredictor(PosePredictor):
             out = []
             for x in im:
                 if isinstance(x, np.ndarray) and x.ndim == 3 and x.shape[-1] != 3:
+                    if current_clear:
+                        self.reset_spad_state()
+                        self.args.spad_clear_states = False
+                        current_clear = False
                     out.extend(self._spad_cube_to_frames(x))
                 else:
                     out.append(self._spad_preprocess_frame(x))
