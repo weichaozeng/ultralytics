@@ -145,6 +145,13 @@ class SPADPosePredictor(PosePredictor):
         # Tensor path is assumed already preprocessed.
         return super().preprocess(im)
 
+    def postprocess(self, preds, img, orig_imgs):
+        """Override postprocess to fix orig_imgs mismatch when expanding cubes."""
+        # 偷天换日：用我们真正重建好的 uint8 多帧图像，替换掉 Ultralytics 错认的 bool cube
+        if self.spad_enabled and self.last_recon_frames_u8 is not None:
+            orig_imgs = self.last_recon_frames_u8
+        return super().postprocess(preds, img, orig_imgs)
+
     # --------------------------
     # SPAD preprocessing
     # --------------------------
@@ -187,7 +194,7 @@ class SPADPosePredictor(PosePredictor):
             raise ValueError(f"Expected even (2H,2W), got shape={raw2w_u8.shape}")
         
         h, w = h2 // 2, w2 // 2
-        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        bgr = np.zeros((h, w, 3), dtype=np.uint8)
 
         # 从展开的 2H x 2W 阵列中提取各个通道
         r  = raw2w_u8[0::2, 0::2]
@@ -195,16 +202,14 @@ class SPADPosePredictor(PosePredictor):
         g2 = raw2w_u8[1::2, 0::2]
         b  = raw2w_u8[1::2, 1::2]
 
-        # 因为 PPB 平滑后两个 G 像素可能存在微小差异，取平均以防高频噪点
-        # 转换为 uint16 防止加法溢出
+        # 防止高频噪点并转为 OpenCV 标准的 BGR
         g = ((g1.astype(np.uint16) + g2.astype(np.uint16)) // 2).astype(np.uint8)
 
-        # 装填为 OpenCV 标准的 BGR 格式
-        rgb[:, :, 0] = r
-        rgb[:, :, 1] = g
-        rgb[:, :, 2] = b
+        bgr[:, :, 0] = b
+        bgr[:, :, 1] = g
+        bgr[:, :, 2] = r
 
-        return rgb
+        return bgr
 
     def _to_3ch_u8(self, img01: np.ndarray) -> np.ndarray:
         """Convert float [0,1] (H,W) to uint8 (H,W,3) according to spad_rgb_mode."""
@@ -272,7 +277,6 @@ class SPADPosePredictor(PosePredictor):
                     img = photon.detach().float().cpu().numpy().sum(axis=2)
                     recons_np = img[:, :, None]
 
-
             if self.spad_collapse == "sum":
                 img = recons_np.sum(axis=2)
                 img01 = self._normalize_frame_per_frame(img)
@@ -301,4 +305,3 @@ class SPADPosePredictor(PosePredictor):
             return frame_bgr
 
         return frame_bgr
-

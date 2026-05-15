@@ -47,7 +47,6 @@ from ultralytics import YOLO
 from ultralytics.models.yolo.pose.spad_predict import SPADPosePredictor
 
 
-
 def _np_load(path: Path) -> np.ndarray:
     """Load .npy with memory mapping (keeps most data on disk)."""
     return np.load(path, mmap_mode='r')
@@ -142,20 +141,7 @@ def draw_pose(img_bgr: np.ndarray, pose_kpts: np.ndarray, thresh: float = 0.5, k
 # ----------------------------
 
 def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", expected_w: int = 512) -> np.ndarray:
-    """Convert VisionSIM packed frames (N,H,Wpacked,C) -> cube (H,W,T) bool.
-
-    VisionSIM often packs width bits: Wpacked = W/8. For example (N,512,64,3) packs a 512-wide image.
-
-    Args:
-        frames_packed: ndarray shaped (N,H,Wpacked,C) with uint8 bit-packed values.
-        reduce: how to reduce channels to a single photon observation per pixel.
-            - 'any': photon = OR over channels
-            - 'sum': photon = sum(ch)>0
-        expected_w: crop/unpack to this width.
-
-    Returns:
-        cube bool array shaped (H,W,T)
-    """
+    """Convert VisionSIM packed frames (N,H,Wpacked,C) -> cube (H,W,T) bool."""
     if frames_packed.ndim != 4:
         raise ValueError(f"Expected packed frames (N,H,Wpacked,C), got shape={frames_packed.shape}")
 
@@ -169,7 +155,6 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
     elif reduce == "sum":
         ph_nhw = unpacked.sum(axis=3) > 0
     elif reduce == "rggb_raw":
-        # Treat channels as (R,G,B) responses (or BGR if specified) and sample into a Bayer mosaic RAW plane.
         ph_nhw = np.zeros(unpacked.shape[:3], dtype=bool)
 
         ch_order = getattr(_packed_frames_to_cube, "_packed_ch_order", "RGB")
@@ -183,8 +168,6 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
         ph_nhw[:, 1::2, 0::2] = unpacked[:, 1::2, 0::2, g_ch].astype(bool, copy=False)  # G
         ph_nhw[:, 1::2, 1::2] = unpacked[:, 1::2, 1::2, b_ch].astype(bool, copy=False)  # B
     elif reduce == "rggb_expand":
-        # Expand 3-channel packed info into a (2H, 2W) single-channel Bayer raw plane before PPB.
-        # Intended workflow: unpacked (N,H,W,3) -> raw (N,H,2W) -> cube (H,2W,T) -> PPB -> demosaic/pack back.
         ch_order = getattr(_packed_frames_to_cube, "_packed_ch_order", "RGB")
         if ch_order == "BGR":
             r_ch, g_ch, b_ch = 2, 1, 0
@@ -193,9 +176,6 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
 
         n, h, w, _ = unpacked.shape
         raw = np.zeros((n, h * 2, w * 2), dtype=bool)
-
-        # Expand each (y,x) to a 2x2 RGGB block in raw:
-        #   (2y,2x)=R, (2y,2x+1)=G, (2y+1,2x)=G, (2y+1,2x+1)=B
 
         raw[:, 0::2, 0::2] = unpacked[:, :, :, r_ch].astype(bool, copy=False)
         raw[:, 0::2, 1::2] = unpacked[:, :, :, g_ch].astype(bool, copy=False)
@@ -211,12 +191,11 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
 
 
 def _iter_cubes_from_path(in_path: Path):
-    """Yield raw mmap arrays and their type."""
+    """Yield raw mmap arrays and their type to delay unpacking."""
     if in_path.is_dir():
         files = sorted([p for p in in_path.iterdir() if p.suffix.lower() == ".npy"])
         for p in files:
             arr = _np_load(p)
-            # 判断是否是 packed 格式
             is_packed = (arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128))
             yield arr, is_packed
         return
@@ -225,7 +204,6 @@ def _iter_cubes_from_path(in_path: Path):
         arr = _np_load(in_path)
         is_packed = (arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128))
         
-        # 如果是序列型数据 (N, H, W, T) 且不是 packed
         if arr.ndim == 4 and not is_packed:
             for i in range(arr.shape[0]):
                 yield arr[i], False
@@ -255,16 +233,11 @@ def main():
     ap.add_argument("--quantile", type=float, default=1.0)
     ap.add_argument("--min_filter_size", type=int, default=7)
 
-    # VisionSIM bit-packed video 输入 (N,H,Wpacked,3) 的解包设置
-    ap.add_argument("--packed_reduce", type=str, default="any", choices=["any", "sum", "rggb_raw", "rggb_expand"],
-                    help="bit-packed (N,H,Wpacked,3) 输入时，将 3 通道归约为单通道 photon：any=OR；sum=SUM>0；rggb_raw=RGGB采样；rggb_expand=展开到2W后PPB再pack回W")
-    ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"],
-                    help="packed_reduce=rggb_raw 时，packed 的 3 通道顺序（用于从三通道采样 Bayer raw）。")
-    ap.add_argument("--bayer_pattern", type=str, default="RGGB", choices=["RGGB", "BGGR", "GRBG", "GBRG"],
-                    help="packed_reduce=rggb_raw 时，单通道 raw 的 Bayer 排列（用于 demosaic）。")
-    ap.add_argument("--spad_swap_rb", action="store_true", help="demosaic 后交换 R/B（用于修复蓝/红互换）")
-
-
+    # VisionSIM bit-packed video
+    ap.add_argument("--packed_reduce", type=str, default="any", choices=["any", "sum", "rggb_raw", "rggb_expand"])
+    ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
+    ap.add_argument("--bayer_pattern", type=str, default="RGGB", choices=["RGGB", "BGGR", "GRBG", "GBRG"])
+    ap.add_argument("--spad_swap_rb", action="store_true")
 
     # Cube chunking (temporal)
     ap.add_argument("--cube_chunk_t", type=int, default=0, help="If >0, split each cube into chunks of this many time bins and call track() per chunk")
@@ -273,9 +246,7 @@ def main():
 
     args = ap.parse_args()
 
-    # det_qnns 始终传给 predictor 单通道 cube；若该单通道来自 rggb_raw 采样，则 predictor 必须按 Bayer RGGB demosaic 成 RGB。
     spad_rgb_mode = "rggb_demosaic" if args.packed_reduce in ("rggb_raw", "rggb_expand") else "gray"
-
     _packed_frames_to_cube._packed_ch_order = args.packed_ch_order
 
     in_path = Path(args.in_path)
@@ -285,7 +256,6 @@ def main():
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Support root folder with multiple datasets: iterate subfolders when --in_glob is set.
     if in_path.is_dir() and args.in_glob:
         dataset_paths = [p for p in sorted(in_path.glob(args.in_glob)) if p.is_dir()]
         if not dataset_paths:
@@ -294,15 +264,11 @@ def main():
         dataset_paths = [in_path]
 
     model = YOLO(args.ckpt)
-
     tracker_cfg = f"{args.tracker}.yaml" if args.tracker in ("bytetrack", "botsort") else "botsort.yaml"
 
-    # Predictor kwargs
-    # Important: SPADPosePredictor is expected to accept (H,W,T) cube and expand into a list of frames.
     spad_bayes_kwargs = {
         "subsampling": args.subsampling,
         "bocpd_gamma": args.bocpd_gamma,
-        # IMPORTANT: disable integrator's internal normalization to avoid non-causal global statistics.
         "normalize": False,
         "quantile": args.quantile,
         "min_filter_size": args.min_filter_size,
@@ -316,22 +282,22 @@ def main():
 
         cube_iter = _iter_cubes_from_path(dataset_path)
 
-        # Process each cube (each cube yields T' reconstructed frames, each then yields a YOLO result).
         for cube_idx, (raw_array, is_packed) in enumerate(tqdm(cube_iter, desc=f"Processing cubes [{dataset_name}]")):
 
-            # Reset SPAD state at the start of each big cube/sequence.
             first_chunk = True
 
             if is_packed:
                 T = raw_array.shape[0]
             else:
                 T = raw_array.shape[2]
+                
             chunk_t = int(args.cube_chunk_t) if int(args.cube_chunk_t) > 0 else T
             stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
 
-
             for t0 in range(0, T, stride):
                 t1 = min(T, t0 + chunk_t)
+                
+                # 延迟解包：先极低成本切片 Mmap，再进行内存密集型的 Unpack 和 Transpose
                 if is_packed:
                     raw_chunk = raw_array[t0:t1, :, :, :]
                     cube_chunk = _packed_frames_to_cube(raw_chunk, reduce=args.packed_reduce)
@@ -361,30 +327,19 @@ def main():
                 )
                 first_chunk = False
 
-                # 可视化背景：sum 或 recon
-                recon_frames = None
-                if args.vis_bg == "recon":
-                    try:
-                        recon_frames = getattr(getattr(model, "predictor", None), "last_recon_frames_u8", None)
-                    except Exception:
-                        recon_frames = None
-
-                bg_rgb = None
-                if args.vis_bg == "sum" or recon_frames is None:
+                bg_bgr = None
+                if args.vis_bg == "sum":
                     bg = cube_chunk.astype(np.float32).sum(axis=2)
                     bg = bg / (bg.max() + 1e-6)
                     bg_u8 = (bg * 255.0).round().astype(np.uint8)
-                    bg_rgb = np.repeat(bg_u8[:, :, None], 3, axis=2)
+                    bg_bgr = np.repeat(bg_u8[:, :, None], 3, axis=2)
 
                 for i, r in enumerate(results):
-                    # IMPORTANT: draw on r.orig_img (the exact image used as orig_img for scaling boxes/kpts)
-                    # to avoid misalignment caused by letterbox/resize inside Ultralytics.
-                    if getattr(r, "orig_img", None) is not None:
+                    # 彻底修复的 vis_bg 逻辑：因为我们重载了 postprocess，r.orig_img 就是完美对应的贝叶斯重构 RGB 帧！
+                    if args.vis_bg == "recon" and getattr(r, "orig_img", None) is not None:
                         vis = r.orig_img.copy()
-                    elif args.vis_bg == "recon" and recon_frames is not None and i < len(recon_frames):
-                        vis = recon_frames[i].copy()
                     else:
-                        vis = bg_rgb.copy() if bg_rgb is not None else np.zeros((cube_chunk.shape[0], cube_chunk.shape[1], 3), dtype=np.uint8)
+                        vis = bg_bgr.copy() if bg_bgr is not None else np.zeros((cube_chunk.shape[0], cube_chunk.shape[1], 3), dtype=np.uint8)
 
                     if r.boxes is not None and r.boxes.id is not None:
                         track_id = r.boxes.id.cpu().numpy()
