@@ -8,8 +8,9 @@ parallel entrypoint for SPAD/QNN experiments where the model input is a photon c
 
 Expected input formats
 ----------------------
-- A directory containing per-frame cubes as `.npy` files, each shaped (H, W, T)
-  (sorted lexicographically).
+- A root directory plus `--in_glob`, where each matched subfolder is one independent
+  video/sample and contains its `.npy` data file.
+- A directory containing one or more `.npy` files, each treated in sorted order.
 - OR a single `.npy` file shaped:
     * (H, W, T)          (single cube)
     * (N, H, W, T)       (sequence of cubes)
@@ -190,8 +191,8 @@ def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", ex
     return np.transpose(ph_nhw, (1, 2, 0)).astype(bool, copy=False)
 
 
-def _iter_cubes_from_path(in_path: Path):
-    """Yield raw mmap arrays and their type to delay unpacking."""
+def _iter_video_arrays_from_sample_path(in_path: Path):
+    """Yield .npy video/cube arrays from a sample path, delaying packed-data unpacking."""
     if in_path.is_dir():
         files = sorted([p for p in in_path.iterdir() if p.suffix.lower() == ".npy"])
         for p in files:
@@ -219,9 +220,9 @@ def _iter_cubes_from_path(in_path: Path):
 
 def main():
     ap = argparse.ArgumentParser(description="SPAD cube -> reconstructed frames -> YOLO pose tracking")
-    ap.add_argument("--in_path", type=str, required=True, help="Directory of .npy cubes or a .npy file")
+    ap.add_argument("--in_path", type=str, required=True, help="Sample/video folder, root folder, or a .npy file")
     ap.add_argument("--in_glob", type=str, default=None,
-                    help="Optional glob (e.g. '*') when --in_path is a root folder containing many dataset subfolders")
+                    help="Optional glob (e.g. '*') when --in_path is a root folder containing many sample/video subfolders")
     ap.add_argument("--save_dir", type=str, required=True, help="Directory to save visualized frames")
     ap.add_argument("--ckpt", type=str, default="weights/detector.pt")
     ap.add_argument("--det_thresh", type=float, default=0.4)
@@ -257,11 +258,11 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if in_path.is_dir() and args.in_glob:
-        dataset_paths = [p for p in sorted(in_path.glob(args.in_glob)) if p.is_dir()]
-        if not dataset_paths:
-            raise FileNotFoundError(f"No dataset subfolders matched: {in_path}/{args.in_glob}")
+        sample_paths = [p for p in sorted(in_path.glob(args.in_glob)) if p.is_dir()]
+        if not sample_paths:
+            raise FileNotFoundError(f"No sample/video subfolders matched: {in_path}/{args.in_glob}")
     else:
-        dataset_paths = [in_path]
+        sample_paths = [in_path]
 
     model = YOLO(args.ckpt)
     tracker_cfg = f"{args.tracker}.yaml" if args.tracker in ("bytetrack", "botsort") else "botsort.yaml"
@@ -275,20 +276,23 @@ def main():
     }
     global_frame_idx = 0
 
-    for dataset_path in dataset_paths:
-        dataset_name = dataset_path.name if dataset_path.is_dir() else dataset_path.stem
-        out_dir = save_dir / dataset_name
+    for sample_path in sample_paths:
+        sample_name = sample_path.name if sample_path.is_dir() else sample_path.stem
+        out_dir = save_dir / sample_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Each matched sample/video starts a fresh tracking session.
         if hasattr(model, 'predictor') and model.predictor is not None:
             if hasattr(model.predictor, 'trackers') and model.predictor.trackers:
                 for tracker in model.predictor.trackers:
                     tracker.reset()
 
-        cube_iter = _iter_cubes_from_path(dataset_path)
+        video_iter = _iter_video_arrays_from_sample_path(sample_path)
 
-        for cube_idx, (raw_array, is_packed) in enumerate(tqdm(cube_iter, desc=f"Processing cubes [{dataset_name}]")):
+        for video_idx, (raw_array, is_packed) in enumerate(tqdm(video_iter, desc=f"Processing video [{sample_name}]")):
 
+            # Reset the Bayesian state at the start of each .npy video, then keep
+            # temporal continuity across its non-overlapping chunks.
             first_chunk = True
 
             if is_packed:
@@ -365,7 +369,7 @@ def main():
                             if poses is not None:
                                 vis = draw_pose(vis, poses[j])
 
-                    out_path = out_dir / f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
+                    out_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
                     cv2.imwrite(str(out_path), vis)
                     global_frame_idx += 1
 
