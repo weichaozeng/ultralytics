@@ -19,6 +19,7 @@ class _QNNNoOpValidator:
 
     def __init__(self, args):
         self.args = copy(args)
+        self.metrics = type("QNNNoOpMetrics", (), {"keys": []})()
 
     def __call__(self, *args, **kwargs):
         return {"fitness": 0.0}
