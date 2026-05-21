@@ -63,6 +63,7 @@ def _main_impl(args):
     print(f"split={args.split}")
     print(f"test_keywords={args.test_keywords}")
     print(f"output_frames={args.output_frames}")
+    print(f"spad_step={args.spad_step}")
     print(f"stride_frames={args.stride_frames}")
     print(f"batch={args.batch}")
 
@@ -75,6 +76,7 @@ def _main_impl(args):
         split_seed=args.split_seed,
         output_frames=args.output_frames,
         spad_per_gt=args.spad_per_gt,
+        spad_step=args.spad_step,
         stride_frames=args.stride_frames,
         image_size=args.image_size,
         packed_ch_order=args.packed_ch_order,
@@ -115,6 +117,7 @@ def main():
     ap.add_argument("--split-seed", type=int, default=0)
     ap.add_argument("--output-frames", type=int, default=4)
     ap.add_argument("--spad-per-gt", type=int, default=64)
+    ap.add_argument("--spad-step", type=int, default=None, help="SPAD bins between model output frames")
     ap.add_argument("--stride-frames", type=int, default=0)
     ap.add_argument("--image-size", type=int, default=512)
     ap.add_argument("--packed-ch-order", type=str, default="RGB", choices=["RGB", "BGR"])

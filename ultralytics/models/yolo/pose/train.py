@@ -166,6 +166,7 @@ class QNNPoseTrainer(PoseTrainer):
             split_seed=int(getattr(self.args, "qnn_split_seed", self.data.get("qnn_split_seed", 0))),
             output_frames=int(getattr(self.args, "qnn_output_frames", self.data.get("qnn_output_frames", 4))),
             spad_per_gt=int(getattr(self.args, "qnn_spad_per_gt", self.data.get("qnn_spad_per_gt", 64))),
+            spad_step=int(getattr(self.args, "qnn_subsampling", self.data.get("qnn_subsampling", 64))),
             stride_frames=int(getattr(self.args, "qnn_stride_frames", self.data.get("qnn_stride_frames", 0))) or None,
             image_size=int(getattr(self.args, "qnn_image_size", self.data.get("qnn_image_size", 512))),
             packed_ch_order=getattr(self.args, "qnn_packed_ch_order", self.data.get("qnn_packed_ch_order", "RGB")),

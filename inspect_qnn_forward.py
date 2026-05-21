@@ -70,6 +70,7 @@ def _make_dataset(args):
         split_seed=args.split_seed,
         output_frames=args.output_frames,
         spad_per_gt=args.spad_per_gt,
+        spad_step=args.qnn_subsampling,
         stride_frames=args.stride_frames,
         image_size=args.image_size,
         packed_ch_order=args.packed_ch_order,

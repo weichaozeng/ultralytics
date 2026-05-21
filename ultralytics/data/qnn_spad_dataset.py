@@ -22,6 +22,7 @@ class QNNWindow:
     spad_path: Path
     gt_start: int
     output_frames: int
+    spad_step: int
 
 
 class QNNSpadPoseDataset(Dataset):
@@ -40,6 +41,7 @@ class QNNSpadPoseDataset(Dataset):
         split_seed: int = 0,
         output_frames: int = 4,
         spad_per_gt: int = 64,
+        spad_step: int | None = None,
         stride_frames: int | None = None,
         image_size: int = 512,
         packed_ch_order: str = "RGB",
@@ -52,6 +54,7 @@ class QNNSpadPoseDataset(Dataset):
         self.split_seed = int(split_seed)
         self.output_frames = int(output_frames)
         self.spad_per_gt = int(spad_per_gt)
+        self.spad_step = int(spad_step or spad_per_gt)
         self.stride_frames = int(stride_frames or output_frames)
         self.image_size = int(image_size)
         self.packed_ch_order = packed_ch_order.upper()
@@ -60,6 +63,8 @@ class QNNSpadPoseDataset(Dataset):
             raise ValueError(f"output_frames must be > 0, got {self.output_frames}")
         if self.spad_per_gt <= 0:
             raise ValueError(f"spad_per_gt must be > 0, got {self.spad_per_gt}")
+        if self.spad_step <= 0:
+            raise ValueError(f"spad_step must be > 0, got {self.spad_step}")
 
         self.video_names = self._select_video_names()
         self.annotations = {name: self._load_annotation(name) for name in self.video_names}
@@ -106,8 +111,8 @@ class QNNSpadPoseDataset(Dataset):
         for name in self.video_names:
             ann = self.annotations[name]
             n_gt = len(ann)
-            # Endpoint convention: output frames align to gt_start+1 ... gt_start+output_frames.
-            max_start = n_gt - self.output_frames - 1
+            last_gt_offset = self.output_frames * self.spad_step / self.spad_per_gt
+            max_start = int(np.floor((n_gt - 1) - last_gt_offset))
             if max_start < 0:
                 continue
             for gt_start in range(0, max_start + 1, self.stride_frames):
@@ -118,6 +123,7 @@ class QNNSpadPoseDataset(Dataset):
                         spad_path=self.spad_root / name / "frames.npy",
                         gt_start=gt_start,
                         output_frames=self.output_frames,
+                        spad_step=self.spad_step,
                     )
                 )
         return windows
@@ -143,7 +149,7 @@ class QNNSpadPoseDataset(Dataset):
 
     def _load_raw_window(self, window: QNNWindow) -> np.ndarray:
         spad_start = window.gt_start * self.spad_per_gt
-        spad_len = window.output_frames * self.spad_per_gt + 1
+        spad_len = window.output_frames * window.spad_step + 1
         spad_end = spad_start + spad_len
 
         arr = np.load(window.spad_path, mmap_mode="r")
@@ -179,10 +185,9 @@ class QNNSpadPoseDataset(Dataset):
         cls_ll, bbox_ll, kpt_ll, batch_idx_ll = [], [], [], []
 
         for out_i in range(window.output_frames):
-            gt_t = window.gt_start + out_i + 1
-            frame_ann = ann[f"frame_{gt_t:06d}.png"]
+            gt_time = window.gt_start + ((out_i + 1) * window.spad_step / self.spad_per_gt)
             for hand_name, cls_id in self.HAND_TO_CLASS.items():
-                hand = frame_ann.get(hand_name)
+                hand = self._interpolate_hand_annotation(ann, gt_time, hand_name)
                 if not hand:
                     continue
                 cls_ll.append([float(cls_id)])
@@ -201,6 +206,27 @@ class QNNSpadPoseDataset(Dataset):
             keypoints = torch.zeros((0, 21, 3), dtype=torch.float32)
             batch_idx = torch.zeros((0, 1), dtype=torch.float32)
         return cls, bboxes, keypoints, batch_idx
+
+    def _interpolate_hand_annotation(self, ann: dict[str, Any], gt_time: float, hand_name: str):
+        lo = int(np.floor(gt_time))
+        hi = int(np.ceil(gt_time))
+        alpha = float(gt_time - lo)
+        lo_hand = ann.get(f"frame_{lo:06d}.png", {}).get(hand_name)
+        hi_hand = ann.get(f"frame_{hi:06d}.png", {}).get(hand_name)
+        if lo_hand is None and hi_hand is None:
+            return None
+        if hi_hand is None or alpha == 0.0:
+            return lo_hand
+        if lo_hand is None:
+            return hi_hand
+
+        bbox = (1.0 - alpha) * np.asarray(lo_hand["bbox"], dtype=np.float32) + alpha * np.asarray(
+            hi_hand["bbox"], dtype=np.float32
+        )
+        keypoints = (1.0 - alpha) * np.asarray(lo_hand["keypoints_2d"], dtype=np.float32) + alpha * np.asarray(
+            hi_hand["keypoints_2d"], dtype=np.float32
+        )
+        return {"bbox": bbox.tolist(), "keypoints_2d": keypoints.tolist()}
 
     def _xyxy_to_normalized_xywh(self, bbox) -> list[float]:
         x1, y1, x2, y2 = [float(x) for x in bbox]
