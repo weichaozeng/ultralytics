@@ -6,6 +6,9 @@ from copy import copy
 from pathlib import Path
 from typing import Any
 
+import torch
+
+from ultralytics.data.qnn_spad_dataset import QNNSpadPoseDataset
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import PoseModel, QNNPoseModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER
@@ -119,6 +122,27 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
 class QNNPoseTrainer(PoseTrainer):
     """Pose trainer that builds QNNPoseModel and freezes the pretrained YOLO detector by default."""
 
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+        """Build QNN SPAD pose dataset for train/val."""
+        gt_root = getattr(self.args, "qnn_gt_root", None) or self.data.get("qnn_gt_root") or img_path
+        spad_root = getattr(self.args, "qnn_spad_root", None) or self.data.get("qnn_spad_root")
+        if not spad_root:
+            raise ValueError("QNNPoseTrainer requires `qnn_spad_root` in args or data yaml.")
+
+        return QNNSpadPoseDataset(
+            gt_root=gt_root,
+            spad_root=spad_root,
+            split="train" if mode == "train" else "val",
+            test_keywords=getattr(self.args, "qnn_test_keywords", self.data.get("qnn_test_keywords", None)),
+            test_fraction=float(getattr(self.args, "qnn_test_fraction", self.data.get("qnn_test_fraction", 0.2))),
+            split_seed=int(getattr(self.args, "qnn_split_seed", self.data.get("qnn_split_seed", 0))),
+            output_frames=int(getattr(self.args, "qnn_output_frames", self.data.get("qnn_output_frames", 4))),
+            spad_per_gt=int(getattr(self.args, "qnn_spad_per_gt", self.data.get("qnn_spad_per_gt", 64))),
+            stride_frames=int(getattr(self.args, "qnn_stride_frames", self.data.get("qnn_stride_frames", 0))) or None,
+            image_size=int(getattr(self.args, "qnn_image_size", self.data.get("qnn_image_size", 512))),
+            packed_ch_order=getattr(self.args, "qnn_packed_ch_order", self.data.get("qnn_packed_ch_order", "RGB")),
+        )
+
     def get_model(
         self,
         cfg: str | Path | dict[str, Any] | None = None,
@@ -160,3 +184,10 @@ class QNNPoseTrainer(PoseTrainer):
         if bool(getattr(self.args, "qnn_freeze_detector", True)):
             self.args.freeze = list(range(len(self.model.model)))
             LOGGER.info("QNNPoseTrainer: freezing pretrained YOLO detector layers; QNN modules remain trainable.")
+
+    def preprocess_batch(self, batch: dict) -> dict:
+        """Move QNN video batches to device without applying image-style normalization."""
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
+        return batch
