@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import PoseModel
+from ultralytics.nn.tasks import PoseModel, QNNPoseModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER
 
 
@@ -114,3 +114,49 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         if "kpt_shape" not in data:
             raise KeyError(f"No `kpt_shape` in the {self.args.data}. See https://docs.ultralytics.com/datasets/pose/")
         return data
+
+
+class QNNPoseTrainer(PoseTrainer):
+    """Pose trainer that builds QNNPoseModel and freezes the pretrained YOLO detector by default."""
+
+    def get_model(
+        self,
+        cfg: str | Path | dict[str, Any] | None = None,
+        weights: str | Path | None = None,
+        verbose: bool = True,
+    ) -> QNNPoseModel:
+        """Get QNN-augmented pose model with optional pretrained detector weights."""
+        qnn_integrator_kwargs = {
+            "subsampling": int(getattr(self.args, "qnn_subsampling", getattr(self.args, "subsampling", 64))),
+            "bocpd_gamma": float(getattr(self.args, "qnn_bocpd_gamma", getattr(self.args, "bocpd_gamma", 5e-4))),
+            "normalize": bool(getattr(self.args, "qnn_normalize", True)),
+            "quantile": float(getattr(self.args, "qnn_quantile", getattr(self.args, "quantile", 1.0))),
+            "min_filter_size": int(getattr(self.args, "qnn_min_filter_size", getattr(self.args, "min_filter_size", 7))),
+        }
+        qnn_ssd_after_layers = getattr(self.args, "qnn_ssd_after_layers", None)
+        if isinstance(qnn_ssd_after_layers, str):
+            qnn_ssd_after_layers = [int(x) for x in qnn_ssd_after_layers.split(",") if x.strip()]
+
+        model = QNNPoseModel(
+            cfg,
+            nc=self.data["nc"],
+            ch=self.data["channels"],
+            data_kpt_shape=self.data["kpt_shape"],
+            verbose=verbose,
+            qnn_enabled=bool(getattr(self.args, "qnn_enabled", True)),
+            qnn_integrator_kwargs=qnn_integrator_kwargs,
+            qnn_ssd_after_layers=qnn_ssd_after_layers,
+            qnn_ssd_state_dim=int(getattr(self.args, "qnn_ssd_state_dim", 8)),
+            qnn_ssd_head_divisor=int(getattr(self.args, "qnn_ssd_head_divisor", 4)),
+        )
+        if weights:
+            model.load(weights)
+
+        return model
+
+    def set_model_attributes(self):
+        """Set pose attributes and freeze the detector graph unless the user overrides qnn_freeze_detector."""
+        super().set_model_attributes()
+        if bool(getattr(self.args, "qnn_freeze_detector", True)):
+            self.args.freeze = list(range(len(self.model.model)))
+            LOGGER.info("QNNPoseTrainer: freezing pretrained YOLO detector layers; QNN modules remain trainable.")
