@@ -14,6 +14,16 @@ from ultralytics.nn.tasks import PoseModel, QNNPoseModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER
 
 
+class _QNNNoOpValidator:
+    """Placeholder validator; QNN evaluation is handled by train_qnn_pose.py callbacks."""
+
+    def __init__(self, args):
+        self.args = copy(args)
+
+    def __call__(self, *args, **kwargs):
+        return {"fitness": 0.0}
+
+
 class PoseTrainer(yolo.detect.DetectionTrainer):
     """A class extending the DetectionTrainer class for training YOLO pose estimation models.
 
@@ -208,3 +218,15 @@ class QNNPoseTrainer(PoseTrainer):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
         return batch
+
+    def get_validator(self):
+        """Return a no-op validator because standard PoseValidator expects image batches."""
+        self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
+        return _QNNNoOpValidator(self.args)
+
+    def validate(self):
+        """Skip built-in validation; QNN val loss/visualization runs from the training callback."""
+        fitness = -float(self.loss.detach().cpu()) if hasattr(self, "loss") else 0.0
+        if not self.best_fitness or self.best_fitness < fitness:
+            self.best_fitness = fitness
+        return {}, fitness
