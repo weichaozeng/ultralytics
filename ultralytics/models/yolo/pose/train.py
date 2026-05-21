@@ -122,6 +122,23 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
 class QNNPoseTrainer(PoseTrainer):
     """Pose trainer that builds QNNPoseModel and freezes the pretrained YOLO detector by default."""
 
+    def get_dataset(self) -> dict[str, Any]:
+        """Return a minimal dataset dictionary for QNN SPAD training."""
+        qnn_gt_root = getattr(self.args, "qnn_gt_root", None)
+        qnn_spad_root = getattr(self.args, "qnn_spad_root", None)
+        if qnn_gt_root and qnn_spad_root:
+            return {
+                "train": qnn_gt_root,
+                "val": qnn_gt_root,
+                "nc": 2,
+                "names": {0: "left_hand", 1: "right_hand"},
+                "channels": 3,
+                "kpt_shape": [21, 3],
+                "qnn_gt_root": qnn_gt_root,
+                "qnn_spad_root": qnn_spad_root,
+            }
+        return super().get_dataset()
+
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
         """Build QNN SPAD pose dataset for train/val."""
         gt_root = getattr(self.args, "qnn_gt_root", None) or self.data.get("qnn_gt_root") or img_path
