@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +133,7 @@ def _print_state_dict_keys(m: Any, limit: int):
 def main():
     ap = argparse.ArgumentParser(description="Inspect Ultralytics YOLO .pt (print structure only)")
     ap.add_argument("--ckpt", type=str, required=True, help="Path to .pt checkpoint")
+    ap.add_argument("--out", type=str, default=None, help="Optional path to write the inspection report as .txt")
     ap.add_argument("--imgsz", type=int, default=None, help="Dummy forward image size (required with --dummy-forward)")
     ap.add_argument("--device", type=str, default="cpu", help="cpu | 0 | 0,1 ...")
     ap.add_argument("--half", action="store_true", help="Use fp16 for dummy forward (if supported)")
@@ -140,6 +141,19 @@ def main():
     ap.add_argument("--state-limit", type=int, default=120, help="Number of state_dict entries to print")
     args = ap.parse_args()
 
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as f, redirect_stdout(f):
+            _main_impl(args)
+        print(f"Wrote inspection report to: {out_path}")
+        return
+
+    _main_impl(args)
+
+
+def _main_impl(args):
+    """Run inspection and print to the active stdout."""
     ckpt_path = Path(args.ckpt)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
