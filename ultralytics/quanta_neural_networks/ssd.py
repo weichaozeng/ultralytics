@@ -11,7 +11,7 @@ from einops import rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor, nn
 
-from quanta_neural_networks.ops.array_ops import loguniform
+from .ops.array_ops import loguniform
 
 
 def segsum(x):

@@ -589,6 +589,86 @@ class PoseModel(DetectionModel):
         return v8PoseLoss(self)
 
 
+class QNNPoseModel(PoseModel):
+    """Pose model with QNN preprocessing hooks for SPAD videos.
+
+    This subclass keeps the original YOLO pose layers in ``self.model`` unchanged so pretrained pose checkpoints can
+    still load into the same ``model.*`` parameter names. QNN modules live outside the detector graph and are wired into
+    the forward path by later steps.
+    """
+
+    def __init__(
+        self,
+        cfg="yolo11n-pose.yaml",
+        ch=3,
+        nc=None,
+        data_kpt_shape=(None, None),
+        verbose=True,
+        qnn_enabled=True,
+        qnn_integrator_kwargs=None,
+        qnn_ssd_after_layers=None,
+        qnn_ssd_state_dim=8,
+        qnn_ssd_head_divisor=4,
+        qnn_ssd_kwargs=None,
+    ):
+        """Initialize a QNN-augmented YOLO pose model.
+
+        Args mirror ``PoseModel`` and add QNN-specific configuration. ``qnn_ssd_after_layers`` contains YOLO layer
+        indices after which an SSD block will be applied to the temporal feature sequence.
+        """
+        self.qnn_enabled = qnn_enabled
+        self.qnn_integrator_kwargs = dict(qnn_integrator_kwargs or {})
+        self.qnn_ssd_after_layers = tuple(qnn_ssd_after_layers or ())
+        self.qnn_ssd_state_dim = qnn_ssd_state_dim
+        self.qnn_ssd_head_divisor = qnn_ssd_head_divisor
+        self.qnn_ssd_kwargs = dict(qnn_ssd_kwargs or {})
+
+        super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
+
+        self.integrator = None
+        self.ssd_by_layer = torch.nn.ModuleDict()
+        if self.qnn_enabled:
+            self._init_qnn_modules()
+
+    def _init_qnn_modules(self):
+        """Create PerPixelBayesian and SSD modules without changing the base YOLO graph."""
+        from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
+        from ultralytics.quanta_neural_networks.ssd import SSD
+
+        self.integrator = PerPixelBayesian(**self.qnn_integrator_kwargs)
+
+        for layer_idx in self.qnn_ssd_after_layers:
+            channels = self._layer_output_channels(layer_idx)
+            head_dim = self._ssd_head_dim(channels)
+            self.ssd_by_layer[str(layer_idx)] = SSD(
+                in_dim=channels,
+                state_dim=self.qnn_ssd_state_dim,
+                head_dim=head_dim,
+                **self.qnn_ssd_kwargs,
+            )
+
+    def _layer_output_channels(self, layer_idx):
+        """Best-effort channel lookup for layers that should feed an SSD block."""
+        layer = self.model[layer_idx]
+        if hasattr(layer, "cv2") and hasattr(layer.cv2, "conv"):
+            return layer.cv2.conv.out_channels
+        if hasattr(layer, "cv1") and hasattr(layer.cv1, "conv"):
+            return layer.cv1.conv.out_channels
+        if hasattr(layer, "conv") and hasattr(layer.conv, "out_channels"):
+            return layer.conv.out_channels
+        if hasattr(layer, "out_channels"):
+            return layer.out_channels
+        raise AttributeError(f"Unable to infer output channels for layer {layer_idx}: {layer.__class__.__name__}")
+
+    def _ssd_head_dim(self, channels):
+        """Choose an SSD head dimension that divides the feature channel count."""
+        divisor = max(int(self.qnn_ssd_head_divisor), 1)
+        head_dim = max(channels // divisor, 1)
+        while channels % head_dim != 0 and head_dim > 1:
+            head_dim -= 1
+        return head_dim
+
+
 class ClassificationModel(BaseModel):
     """YOLO classification model.
 
