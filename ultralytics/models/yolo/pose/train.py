@@ -371,9 +371,10 @@ class QNNPoseTrainer(PoseTrainer):
         img = frames[si, 0].detach().float().cpu().permute(1, 2, 0).numpy()
         img = img - img.min()
         img = img / (img.max() + 1e-6)
-        return np.clip(img * 255.0, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
 
     def _qnn_draw_pose(self, img: np.ndarray, keypoints: np.ndarray, color: tuple[int, int, int]):
+        img = np.ascontiguousarray(img)
         for s, e in QNN_BONE_CONNECTIONS:
             if keypoints[s, 2] > 0 and keypoints[e, 2] > 0:
                 cv2.line(img, tuple(keypoints[s, :2].astype(int)), tuple(keypoints[e, :2].astype(int)), color, 2)
