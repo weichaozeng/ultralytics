@@ -750,6 +750,7 @@ class QNNPoseModel(PoseModel):
         self.qnn_batch_size = int(bsz)
         self.qnn_num_frame = int(frames_t_b_c_h_w.shape[0])
         self.qnn_t_index_ll = t_index_ll or []
+        self.qnn_last_recon_frames = frames_t_b_c_h_w.detach()
         return frames_t_b_c_h_w, self.qnn_t_index_ll
 
     @staticmethod

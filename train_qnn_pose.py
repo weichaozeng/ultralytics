@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.data import Subset
 
 from ultralytics.models.yolo.pose import QNNPoseTrainer
 from ultralytics.utils import DEFAULT_CFG_DICT, nms
@@ -82,17 +83,36 @@ def _postprocess_pose(preds, *, nc: int, conf: float, iou: float, max_det: int):
     return processed
 
 
+def _recon_canvas(model, si: int, image_size: int) -> np.ndarray:
+    frames = getattr(model, "qnn_last_recon_frames", None)
+    if frames is None:
+        return np.zeros((image_size, image_size, 3), dtype=np.uint8)
+    t = si
+    b = 0
+    if t >= frames.shape[0]:
+        return np.zeros((image_size, image_size, 3), dtype=np.uint8)
+    img = frames[t, b].detach().float().cpu().permute(1, 2, 0).numpy()
+    img = img - img.min()
+    img = img / (img.max() + 1e-6)
+    return np.clip(img * 255.0, 0, 255).astype(np.uint8)
+
+
 def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
     model = trainer.ema.ema if getattr(trainer, "ema", None) is not None else trainer.model
     was_training = model.training
     model.eval()
     dataset = trainer.test_loader.dataset
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn)
+    max_batches = int(args.eval_max_batches)
+    viz_batches = int(args.viz_batches)
+    eval_count = len(dataset) if max_batches < 0 else min(max_batches, len(dataset))
+    if eval_count <= 0:
+        eval_count = min(1, len(dataset))
+    generator = torch.Generator().manual_seed(int(args.eval_seed) + int(epoch_idx))
+    indices = torch.randperm(len(dataset), generator=generator)[:eval_count].tolist()
+    loader = DataLoader(Subset(dataset, indices), batch_size=1, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn)
     save_dir = Path(trainer.save_dir) / "qnn_viz" / f"epoch{epoch_idx:03d}"
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    max_batches = int(args.eval_max_batches)
-    viz_batches = int(args.viz_batches)
     loss_sum_total = 0.0
     loss_items_total = None
     seen_batches = 0
@@ -102,8 +122,6 @@ def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
 
     with torch.no_grad():
         for batch_i, batch in enumerate(loader):
-            if max_batches >= 0 and batch_i >= max_batches:
-                break
             batch = trainer.preprocess_batch(batch)
             preds = model(batch["img"])
             loss, loss_items = model.loss(batch, preds)
@@ -122,11 +140,12 @@ def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
                 image_size = int(args.imgsz)
                 num_images = min(int(args.viz_frames), max(len(processed), last_target_images))
                 for si in range(num_images):
-                    canvas = np.zeros((image_size, image_size, 3), dtype=np.uint8)
+                    canvas = _recon_canvas(model, si, image_size)
+                    cv2.imwrite(str(save_dir / f"batch{batch_i:03d}_sample{si:03d}_recon.png"), canvas)
                     _draw_labels(canvas, batch, si, image_size)
                     if si < len(processed):
                         _draw_predictions(canvas, processed[si], conf=args.viz_conf)
-                    out_path = save_dir / f"batch{batch_i:03d}_sample{si:03d}.png"
+                    out_path = save_dir / f"batch{batch_i:03d}_sample{si:03d}_overlay.png"
                     ok = cv2.imwrite(str(out_path), canvas)
                     written.append(f"{out_path.name}: {'ok' if ok else 'failed'}")
 
@@ -142,6 +161,7 @@ def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
         f.write(f"epoch_idx: {epoch_idx}\n")
         f.write(f"seen_batches: {seen_batches}\n")
         f.write(f"eval_max_batches: {max_batches}\n")
+        f.write(f"random_indices: {indices}\n")
         f.write(f"mean_loss_sum: {trainer.metrics.get('qnn_val/loss_sum', 0.0)}\n")
         f.write(f"mean_loss_items: {mean_loss_items.tolist()}\n")
         f.write(f"last_processed_predictions: {last_processed_count}\n")
@@ -207,6 +227,7 @@ def parse_args():
     ap.add_argument("--qnn-freeze-detector", action="store_true", default=True)
     ap.add_argument("--viz-period", type=int, default=1)
     ap.add_argument("--eval-max-batches", type=int, default=-1, help="-1 evaluates the full test split")
+    ap.add_argument("--eval-seed", type=int, default=0, help="Seed for random eval batch selection")
     ap.add_argument("--viz-batches", type=int, default=1, help="Number of eval batches to visualize")
     ap.add_argument("--viz-frames", type=int, default=4)
     ap.add_argument("--viz-conf", type=float, default=0.25)
