@@ -177,7 +177,7 @@ def main():
     model = YOLO(args.ckpt)
     tracker_cfg = f"{args.tracker}.yaml" if args.tracker in ("bytetrack", "botsort") else "botsort.yaml"
 
-    global_frame_idx = 0
+    # global_frame_idx = 0
     for dataset_path in dataset_paths:
         dataset_name = dataset_path.name if dataset_path.is_dir() else dataset_path.stem
         out_dir = save_dir / dataset_name
@@ -185,6 +185,8 @@ def main():
 
         frames_rgb = _load_rgb_frames(dataset_path)  # (N,H,W,3) RGB
         frames_bgr = frames_rgb[..., ::-1].copy()
+
+        global_frame_idx = 0
 
         for i in tqdm(range(frames_bgr.shape[0]), desc=f"Processing RGB frames [{dataset_name}]"):
             frame_bgr = frames_bgr[i]
@@ -219,7 +221,7 @@ def main():
                     if poses is not None:
                         vis = draw_pose(vis, poses[j])
 
-            out_path = out_dir / f"frame{global_frame_idx:07d}.png"
+            out_path = out_dir / f"frame_{global_frame_idx:06d}.png"
             cv2.imwrite(str(out_path), vis)
             global_frame_idx += 1
 
