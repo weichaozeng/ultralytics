@@ -103,7 +103,7 @@ def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
     for i, value in enumerate(loss_items.detach().cpu().tolist()):
         trainer.metrics[f"qnn_val/loss_{i}"] = float(value)
 
-    image_size = int(args.qnn_image_size)
+    image_size = int(args.imgsz)
     num_images = min(int(args.viz_frames), len(processed))
     for si in range(num_images):
         canvas = np.zeros((image_size, image_size, 3), dtype=np.uint8)
