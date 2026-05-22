@@ -188,6 +188,12 @@ def main():
 
         global_frame_idx = 0
 
+         # Each matched sample/video starts a fresh tracking session.
+        if hasattr(model, 'predictor') and model.predictor is not None:
+            if hasattr(model.predictor, 'trackers') and model.predictor.trackers:
+                for tracker in model.predictor.trackers:
+                    tracker.reset()
+
         for i in tqdm(range(frames_bgr.shape[0]), desc=f"Processing RGB frames [{dataset_name}]"):
             frame_bgr = frames_bgr[i]
 
