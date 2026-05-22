@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Subset
 
 from ultralytics.models.yolo.pose import QNNPoseTrainer
-from ultralytics.utils import DEFAULT_CFG_DICT, nms
+from ultralytics.utils import DEFAULT_CFG_DICT, RANK, nms
 
 
 BONE_CONNECTIONS = [
@@ -98,6 +98,9 @@ def _recon_canvas(model, si: int, image_size: int) -> np.ndarray:
 
 
 def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
+    if RANK not in {-1, 0}:
+        return
+
     model = trainer.ema.ema if getattr(trainer, "ema", None) is not None else trainer.model
     was_training = model.training
     model.eval()
@@ -177,16 +180,17 @@ def _make_eval_callback(args, *, baseline: bool = False):
     def callback(trainer):
         if baseline:
             _run_qnn_eval_visualization(trainer, args, epoch_idx=0)
-            initial_path = Path(trainer.save_dir) / "weights" / "initial.pt"
-            initial_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "epoch": -1,
-                    "model": trainer.model,
-                    "train_args": vars(trainer.args),
-                },
-                initial_path,
-            )
+            if RANK in {-1, 0}:
+                initial_path = Path(trainer.save_dir) / "weights" / "initial.pt"
+                initial_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "epoch": -1,
+                        "model": trainer.model,
+                        "train_args": vars(trainer.args),
+                    },
+                    initial_path,
+                )
             return
 
         period = int(args.viz_period)

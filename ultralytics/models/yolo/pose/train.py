@@ -133,6 +133,15 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
 class QNNPoseTrainer(PoseTrainer):
     """Pose trainer that builds QNNPoseModel and freezes the pretrained YOLO detector by default."""
 
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
+        """Initialize QNN trainer while allowing custom qnn_* args through Ultralytics cfg validation."""
+        overrides = overrides or {}
+        if any(str(k).startswith("qnn_") for k in overrides):
+            cfg_dict = dict(vars(cfg)) if hasattr(cfg, "__dict__") else dict(cfg)
+            cfg_dict.update({k: v for k, v in overrides.items() if str(k).startswith("qnn_")})
+            cfg = cfg_dict
+        super().__init__(cfg, overrides, _callbacks)
+
     def get_dataset(self) -> dict[str, Any]:
         """Return a minimal dataset dictionary for QNN SPAD training."""
         qnn_gt_root = getattr(self.args, "qnn_gt_root", None)
