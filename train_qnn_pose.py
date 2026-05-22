@@ -260,6 +260,14 @@ def main():
             "qnn_ssd_state_dim": args.qnn_ssd_state_dim,
             "qnn_ssd_head_divisor": args.qnn_ssd_head_divisor,
             "qnn_freeze_detector": args.qnn_freeze_detector,
+            "qnn_eval_max_batches": args.eval_max_batches,
+            "qnn_eval_seed": args.eval_seed,
+            "qnn_viz_batches": args.viz_batches,
+            "qnn_viz_frames": args.viz_frames,
+            "qnn_viz_period": args.viz_period,
+            "qnn_viz_conf": args.viz_conf,
+            "qnn_viz_iou": args.viz_iou,
+            "qnn_viz_max_det": args.viz_max_det,
         }
     )
     overrides = {
@@ -282,8 +290,6 @@ def main():
     }
 
     trainer = QNNPoseTrainer(cfg=cfg, overrides=overrides)
-    trainer.add_callback("on_train_start", _make_eval_callback(args, baseline=True))
-    trainer.add_callback("on_fit_epoch_end", _make_eval_callback(args))
     trainer.train()
 
 
