@@ -82,42 +82,51 @@ def _postprocess_pose(preds, *, nc: int, conf: float, iou: float, max_det: int):
     return processed
 
 
-def _make_eval_callback(args):
-    def on_fit_epoch_end(trainer):
+def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
+    model = trainer.ema.ema if getattr(trainer, "ema", None) is not None else trainer.model
+    was_training = model.training
+    model.eval()
+    dataset = trainer.test_loader.dataset
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn)
+    batch = next(iter(loader))
+    batch = trainer.preprocess_batch(batch)
+
+    save_dir = Path(trainer.save_dir) / "qnn_viz" / f"epoch{epoch_idx:03d}"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    with torch.no_grad():
+        preds = model(batch["img"])
+        loss, loss_items = model.loss(batch, preds)
+        processed = _postprocess_pose(preds, nc=trainer.data["nc"], conf=args.viz_conf, iou=args.viz_iou, max_det=args.viz_max_det)
+
+    trainer.metrics["qnn_val/loss_sum"] = float(loss.sum().detach().cpu())
+    for i, value in enumerate(loss_items.detach().cpu().tolist()):
+        trainer.metrics[f"qnn_val/loss_{i}"] = float(value)
+
+    image_size = int(args.qnn_image_size)
+    num_images = min(int(args.viz_frames), len(processed))
+    for si in range(num_images):
+        canvas = np.zeros((image_size, image_size, 3), dtype=np.uint8)
+        _draw_labels(canvas, batch, si, image_size)
+        _draw_predictions(canvas, processed[si], conf=args.viz_conf)
+        cv2.imwrite(str(save_dir / f"sample{si:03d}.png"), canvas)
+
+    if was_training:
+        model.train()
+
+
+def _make_eval_callback(args, *, baseline: bool = False):
+    def callback(trainer):
+        if baseline:
+            _run_qnn_eval_visualization(trainer, args, epoch_idx=0)
+            return
+
         period = int(args.viz_period)
         if period <= 0 or (trainer.epoch + 1) % period != 0:
             return
+        _run_qnn_eval_visualization(trainer, args, epoch_idx=trainer.epoch + 1)
 
-        model = trainer.ema.ema if getattr(trainer, "ema", None) is not None else trainer.model
-        model.eval()
-        dataset = trainer.test_loader.dataset
-        loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn)
-        batch = next(iter(loader))
-        batch = trainer.preprocess_batch(batch)
-
-        save_dir = Path(trainer.save_dir) / "qnn_viz" / f"epoch{trainer.epoch + 1:03d}"
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        with torch.no_grad():
-            preds = model(batch["img"])
-            loss, loss_items = model.loss(batch, preds)
-            processed = _postprocess_pose(preds, nc=trainer.data["nc"], conf=args.viz_conf, iou=args.viz_iou, max_det=args.viz_max_det)
-
-        trainer.metrics["qnn_val/loss_sum"] = float(loss.sum().detach().cpu())
-        for i, value in enumerate(loss_items.detach().cpu().tolist()):
-            trainer.metrics[f"qnn_val/loss_{i}"] = float(value)
-
-        image_size = int(args.qnn_image_size)
-        num_images = min(int(args.viz_frames), len(processed))
-        for si in range(num_images):
-            canvas = np.zeros((image_size, image_size, 3), dtype=np.uint8)
-            _draw_labels(canvas, batch, si, image_size)
-            _draw_predictions(canvas, processed[si], conf=args.viz_conf)
-            cv2.imwrite(str(save_dir / f"sample{si:03d}.png"), canvas)
-
-        model.train()
-
-    return on_fit_epoch_end
+    return callback
 
 
 def parse_args():
@@ -198,6 +207,7 @@ def main():
     }
 
     trainer = QNNPoseTrainer(cfg=cfg, overrides=overrides)
+    trainer.add_callback("on_train_start", _make_eval_callback(args, baseline=True))
     trainer.add_callback("on_fit_epoch_end", _make_eval_callback(args))
     trainer.train()
 
