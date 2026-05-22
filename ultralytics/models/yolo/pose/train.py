@@ -368,10 +368,9 @@ class QNNPoseTrainer(PoseTrainer):
         frames = getattr(model, "qnn_last_recon_frames", None)
         if frames is None or si >= frames.shape[0]:
             return np.zeros((image_size, image_size, 3), dtype=np.uint8)
-        img = frames[si, 0].detach().float().cpu().permute(1, 2, 0).numpy()
-        img = img - img.min()
-        img = img / (img.max() + 1e-6)
-        return np.ascontiguousarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
+        rgb = frames[si, 0].detach().float().cpu().permute(1, 2, 0).numpy()
+        rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(rgb_u8[:, :, ::-1])
 
     def _qnn_draw_pose(self, img: np.ndarray, keypoints: np.ndarray, color: tuple[int, int, int]):
         img = np.ascontiguousarray(img)
