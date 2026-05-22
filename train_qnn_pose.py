@@ -88,28 +88,66 @@ def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
     model.eval()
     dataset = trainer.test_loader.dataset
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn)
-    batch = next(iter(loader))
-    batch = trainer.preprocess_batch(batch)
-
     save_dir = Path(trainer.save_dir) / "qnn_viz" / f"epoch{epoch_idx:03d}"
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    max_batches = int(args.eval_max_batches)
+    viz_batches = int(args.viz_batches)
+    loss_sum_total = 0.0
+    loss_items_total = None
+    seen_batches = 0
+    written = []
+    last_processed_count = 0
+    last_target_images = 0
+
     with torch.no_grad():
-        preds = model(batch["img"])
-        loss, loss_items = model.loss(batch, preds)
-        processed = _postprocess_pose(preds, nc=trainer.data["nc"], conf=args.viz_conf, iou=args.viz_iou, max_det=args.viz_max_det)
+        for batch_i, batch in enumerate(loader):
+            if max_batches >= 0 and batch_i >= max_batches:
+                break
+            batch = trainer.preprocess_batch(batch)
+            preds = model(batch["img"])
+            loss, loss_items = model.loss(batch, preds)
+            processed = _postprocess_pose(
+                preds, nc=trainer.data["nc"], conf=args.viz_conf, iou=args.viz_iou, max_det=args.viz_max_det
+            )
 
-    trainer.metrics["qnn_val/loss_sum"] = float(loss.sum().detach().cpu())
-    for i, value in enumerate(loss_items.detach().cpu().tolist()):
-        trainer.metrics[f"qnn_val/loss_{i}"] = float(value)
+            loss_sum_total += float(loss.sum().detach().cpu())
+            loss_items_cpu = loss_items.detach().cpu()
+            loss_items_total = loss_items_cpu if loss_items_total is None else loss_items_total + loss_items_cpu
+            seen_batches += 1
+            last_processed_count = len(processed)
+            last_target_images = int(batch["batch_idx"].max().item() + 1) if batch["batch_idx"].numel() else 0
 
-    image_size = int(args.imgsz)
-    num_images = min(int(args.viz_frames), len(processed))
-    for si in range(num_images):
-        canvas = np.zeros((image_size, image_size, 3), dtype=np.uint8)
-        _draw_labels(canvas, batch, si, image_size)
-        _draw_predictions(canvas, processed[si], conf=args.viz_conf)
-        cv2.imwrite(str(save_dir / f"sample{si:03d}.png"), canvas)
+            if batch_i < viz_batches:
+                image_size = int(args.imgsz)
+                num_images = min(int(args.viz_frames), max(len(processed), last_target_images))
+                for si in range(num_images):
+                    canvas = np.zeros((image_size, image_size, 3), dtype=np.uint8)
+                    _draw_labels(canvas, batch, si, image_size)
+                    if si < len(processed):
+                        _draw_predictions(canvas, processed[si], conf=args.viz_conf)
+                    out_path = save_dir / f"batch{batch_i:03d}_sample{si:03d}.png"
+                    ok = cv2.imwrite(str(out_path), canvas)
+                    written.append(f"{out_path.name}: {'ok' if ok else 'failed'}")
+
+    if seen_batches:
+        trainer.metrics["qnn_val/loss_sum"] = loss_sum_total / seen_batches
+        mean_loss_items = loss_items_total / seen_batches
+        for i, value in enumerate(mean_loss_items.tolist()):
+            trainer.metrics[f"qnn_val/loss_{i}"] = float(value)
+    else:
+        mean_loss_items = torch.zeros(5)
+
+    with (save_dir / "summary.txt").open("w", encoding="utf-8") as f:
+        f.write(f"epoch_idx: {epoch_idx}\n")
+        f.write(f"seen_batches: {seen_batches}\n")
+        f.write(f"eval_max_batches: {max_batches}\n")
+        f.write(f"mean_loss_sum: {trainer.metrics.get('qnn_val/loss_sum', 0.0)}\n")
+        f.write(f"mean_loss_items: {mean_loss_items.tolist()}\n")
+        f.write(f"last_processed_predictions: {last_processed_count}\n")
+        f.write(f"last_target_images: {last_target_images}\n")
+        f.write("\n".join(written))
+        f.write("\n")
 
     if was_training:
         model.train()
@@ -119,6 +157,16 @@ def _make_eval_callback(args, *, baseline: bool = False):
     def callback(trainer):
         if baseline:
             _run_qnn_eval_visualization(trainer, args, epoch_idx=0)
+            initial_path = Path(trainer.save_dir) / "weights" / "initial.pt"
+            initial_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "epoch": -1,
+                    "model": trainer.model,
+                    "train_args": vars(trainer.args),
+                },
+                initial_path,
+            )
             return
 
         period = int(args.viz_period)
@@ -158,6 +206,8 @@ def parse_args():
     ap.add_argument("--qnn-ssd-head-divisor", type=int, default=4)
     ap.add_argument("--qnn-freeze-detector", action="store_true", default=True)
     ap.add_argument("--viz-period", type=int, default=1)
+    ap.add_argument("--eval-max-batches", type=int, default=-1, help="-1 evaluates the full test split")
+    ap.add_argument("--viz-batches", type=int, default=1, help="Number of eval batches to visualize")
     ap.add_argument("--viz-frames", type=int, default=4)
     ap.add_argument("--viz-conf", type=float, default=0.25)
     ap.add_argument("--viz-iou", type=float, default=0.7)
