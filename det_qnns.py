@@ -1,10 +1,11 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """det_qnns.py
 
-Run pose tracking on SPAD photon-cube sequences using a custom predictor (`SPADPosePredictor`).
+Run inference with the trained QNN pose checkpoint on SPAD raw clips.
 
-This script intentionally does NOT modify `det.py` (RGB-image workflow). Instead it provides a
-parallel entrypoint for SPAD/QNN experiments where the model input is a photon cube HxWxT.
+Unlike the older SPAD predictor workflow, this script does not reconstruct frames in the
+predictor. Instead it feeds raw SPAD clips directly into the checkpoint's `QNNPoseModel`, which
+already contains the trained `PerPixelBayesian + SSD + YOLO pose head` pipeline.
 
 Expected input formats
 ----------------------
@@ -12,45 +13,38 @@ Expected input formats
   video/sample and contains its `.npy` data file.
 - A directory containing one or more `.npy` files, each treated in sorted order.
 - OR a single `.npy` file shaped:
-    * (H, W, T)          (single cube)
-    * (N, H, W, T)       (sequence of cubes)
+    * (T, H, W, 1)       raw SPAD clip
+    * (T, H, W)          raw SPAD clip
+    * (H, W, T)          legacy raw photon cube
+    * (N, H, W, T)       sequence of legacy raw photon cubes
+    * (T, H, Wpacked, 3) VisionSIM packed frames (expanded to raw RGGB on load)
 
-The predictor expands each cube into a list of reconstructed frames (T' images) and runs YOLO
-on each reconstructed frame.
-
-Example
--------
-python ultralytics/det_qnns.py \
-  --in_path /path/to/acq00002 \
-  --ckpt weights/detector.pt \
-  --save_dir /path/to/save \
-  --det_thresh 0.4 \
-  --tracker botsort \
-  --subsampling 64
-
-Notes
------
-- This script relies on your `SPADPosePredictor` to do the cube->frames reconstruction.
-- For now we keep visualization identical to `det.py`: draw bbox + 21-keypoint hand skeleton.
+The checkpoint reconstructs `T'` RGB-like frames internally. This script runs the model,
+postprocesses detections, applies optional ByteTrack/BoT-SORT tracking, and saves per-frame
+visualizations.
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import cv2
 import numpy as np
+import torch
 from tqdm import tqdm
 
 from ultralytics import YOLO
-from ultralytics.models.yolo.pose.spad_predict import SPADPosePredictor
+from ultralytics.engine.results import Results
+from ultralytics.trackers.track import TRACKER_MAP
+from ultralytics.utils import IterableSimpleNamespace, YAML, nms
+from ultralytics.utils.checks import check_yaml
 
 
 def _np_load(path: Path) -> np.ndarray:
     """Load .npy with memory mapping (keeps most data on disk)."""
-    return np.load(path, mmap_mode='r')
+    return np.load(path, mmap_mode="r")
 
 
 # ----------------------------
@@ -141,77 +135,153 @@ def draw_pose(img_bgr: np.ndarray, pose_kpts: np.ndarray, thresh: float = 0.5, k
 # Data loading utilities
 # ----------------------------
 
-def _packed_frames_to_cube(frames_packed: np.ndarray, *, reduce: str = "any", expected_w: int = 512) -> np.ndarray:
-    """Convert VisionSIM packed frames (N,H,Wpacked,C) -> cube (H,W,T) bool."""
-    if frames_packed.ndim != 4:
-        raise ValueError(f"Expected packed frames (N,H,Wpacked,C), got shape={frames_packed.shape}")
+def _packed_frames_to_raw_video(
+    frames_packed: np.ndarray, *, expected_w: int = 512, ch_order: str = "RGB"
+) -> np.ndarray:
+    """Convert VisionSIM packed frames `(T,H,Wpacked,3)` to raw `(T,2H,2W,1)`."""
+    if frames_packed.ndim != 4 or frames_packed.shape[-1] != 3:
+        raise ValueError(f"Expected packed frames (T,H,Wpacked,3), got shape={frames_packed.shape}")
 
-    # Unpack bits along the packed-width axis; result: (N,H,Wbits,C)
     unpacked = np.unpackbits(frames_packed, axis=2)
     if unpacked.shape[2] > expected_w:
         unpacked = unpacked[:, :, :expected_w, :]
 
-    if reduce == "any":
-        ph_nhw = unpacked.any(axis=3)
-    elif reduce == "sum":
-        ph_nhw = unpacked.sum(axis=3) > 0
-    elif reduce == "rggb_raw":
-        ph_nhw = np.zeros(unpacked.shape[:3], dtype=bool)
-
-        ch_order = getattr(_packed_frames_to_cube, "_packed_ch_order", "RGB")
-        if ch_order == "BGR":
-            r_ch, g_ch, b_ch = 2, 1, 0
-        else:
-            r_ch, g_ch, b_ch = 0, 1, 2
-
-        ph_nhw[:, 0::2, 0::2] = unpacked[:, 0::2, 0::2, r_ch].astype(bool, copy=False)  # R
-        ph_nhw[:, 0::2, 1::2] = unpacked[:, 0::2, 1::2, g_ch].astype(bool, copy=False)  # G
-        ph_nhw[:, 1::2, 0::2] = unpacked[:, 1::2, 0::2, g_ch].astype(bool, copy=False)  # G
-        ph_nhw[:, 1::2, 1::2] = unpacked[:, 1::2, 1::2, b_ch].astype(bool, copy=False)  # B
-    elif reduce == "rggb_expand":
-        ch_order = getattr(_packed_frames_to_cube, "_packed_ch_order", "RGB")
-        if ch_order == "BGR":
-            r_ch, g_ch, b_ch = 2, 1, 0
-        else:
-            r_ch, g_ch, b_ch = 0, 1, 2
-
-        n, h, w, _ = unpacked.shape
-        raw = np.zeros((n, h * 2, w * 2), dtype=bool)
-
-        raw[:, 0::2, 0::2] = unpacked[:, :, :, r_ch].astype(bool, copy=False)
-        raw[:, 0::2, 1::2] = unpacked[:, :, :, g_ch].astype(bool, copy=False)
-        raw[:, 1::2, 0::2] = unpacked[:, :, :, g_ch].astype(bool, copy=False)
-        raw[:, 1::2, 1::2] = unpacked[:, :, :, b_ch].astype(bool, copy=False)
-
-        ph_nhw = raw
+    if ch_order.upper() == "BGR":
+        r_ch, g_ch, b_ch = 2, 1, 0
     else:
-        raise ValueError(f"Unsupported reduce mode: {reduce}")
+        r_ch, g_ch, b_ch = 0, 1, 2
 
-    # (N,H,W) -> (H,W,N)
-    return np.transpose(ph_nhw, (1, 2, 0)).astype(bool, copy=False)
+    t, h, w, _ = unpacked.shape
+    raw = np.zeros((t, h * 2, w * 2), dtype=np.uint8)
+    raw[:, 0::2, 0::2] = unpacked[:, :, :, r_ch]
+    raw[:, 0::2, 1::2] = unpacked[:, :, :, g_ch]
+    raw[:, 1::2, 0::2] = unpacked[:, :, :, g_ch]
+    raw[:, 1::2, 1::2] = unpacked[:, :, :, b_ch]
+    return raw[:, :, :, None]
 
 
-def _iter_video_arrays_from_sample_path(in_path: Path):
-    """Yield .npy video/cube arrays from a sample path, delaying packed-data unpacking."""
+def _is_packed_spad(arr: np.ndarray) -> bool:
+    return arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128)
+
+
+def _looks_like_hwt(arr: np.ndarray) -> bool:
+    return arr.ndim == 3 and arr.shape[0] == arr.shape[1] and arr.shape[2] != arr.shape[1]
+
+
+def _coerce_to_raw_video(arr: np.ndarray, *, packed_ch_order: str) -> list[np.ndarray]:
+    """Normalize supported input layouts to raw `(T,H,W,1)` clips."""
+    if _is_packed_spad(arr):
+        return [_packed_frames_to_raw_video(arr, ch_order=packed_ch_order)]
+
+    if arr.ndim == 4 and arr.shape[-1] == 1:
+        return [arr.astype(np.uint8, copy=False)]
+
+    if arr.ndim == 3:
+        if _looks_like_hwt(arr):
+            return [np.transpose(arr, (2, 0, 1))[:, :, :, None].astype(np.uint8, copy=False)]
+        return [arr[:, :, :, None].astype(np.uint8, copy=False)]
+
+    if arr.ndim == 4:
+        return [np.transpose(arr[i], (2, 0, 1))[:, :, :, None].astype(np.uint8, copy=False) for i in range(arr.shape[0])]
+
+    raise ValueError(f"Unsupported input shape: {arr.shape}")
+
+
+def _iter_raw_videos_from_sample_path(in_path: Path, *, packed_ch_order: str):
+    """Yield raw `(T,H,W,1)` videos from a sample path."""
     if in_path.is_dir():
         files = sorted([p for p in in_path.iterdir() if p.suffix.lower() == ".npy"])
         for p in files:
-            arr = _np_load(p)
-            is_packed = (arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128))
-            yield arr, is_packed
+            for video in _coerce_to_raw_video(_np_load(p), packed_ch_order=packed_ch_order):
+                yield video
         return
 
     if in_path.suffix.lower() == ".npy":
-        arr = _np_load(in_path)
-        is_packed = (arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128))
-        
-        if arr.ndim == 4 and not is_packed:
-            for i in range(arr.shape[0]):
-                yield arr[i], False
-            return
-            
-        yield arr, is_packed
+        for video in _coerce_to_raw_video(_np_load(in_path), packed_ch_order=packed_ch_order):
+            yield video
         return
+
+    raise ValueError(f"Unsupported input path: {in_path}")
+
+
+def _cfg_get(cfg: Any, key: str, default=None):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _resolve_device(device_arg: str) -> torch.device:
+    if device_arg:
+        return torch.device(device_arg)
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _trained_chunk_t(model) -> int | None:
+    train_args = getattr(model, "args", None)
+    output_frames = _cfg_get(train_args, "qnn_output_frames", None)
+    subsampling = getattr(getattr(model, "integrator", None), "subsampling", None)
+    if output_frames is None or subsampling is None:
+        return None
+    return int(output_frames) * int(subsampling) + 1
+
+
+def _recon_frames_bgr(model, batch_index: int = 0) -> list[np.ndarray]:
+    frames = getattr(model, "qnn_last_recon_frames", None)
+    if frames is None:
+        return []
+    rgb = frames[:, batch_index].detach().float().cpu().permute(0, 2, 3, 1).numpy()
+    bgr = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)[:, :, :, ::-1]
+    return [np.ascontiguousarray(frame) for frame in bgr]
+
+
+def _raw_sum_bgr(raw_video: np.ndarray) -> np.ndarray:
+    raw_sum = raw_video[..., 0].astype(np.float32).sum(axis=0)
+    r = raw_sum[0::2, 0::2]
+    g = 0.5 * (raw_sum[0::2, 1::2] + raw_sum[1::2, 0::2])
+    b = raw_sum[1::2, 1::2]
+    rgb = np.stack((r, g, b), axis=2)
+    rgb /= rgb.max() + 1e-6
+    rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(rgb_u8[:, :, ::-1])
+
+
+def _postprocess_pose_predictions(raw_preds, *, conf: float, iou: float, nc: int, max_det: int, kpt_shape) -> list[torch.Tensor]:
+    raw = raw_preds[0] if isinstance(raw_preds, (list, tuple)) and torch.is_tensor(raw_preds[0]) else raw_preds
+    preds = nms.non_max_suppression(raw, conf, iou, nc=nc, multi_label=True, max_det=max_det)
+    return [pred if pred is not None else raw.new_zeros((0, 6 + int(np.prod(kpt_shape)))) for pred in preds]
+
+
+def _results_from_preds(preds: list[torch.Tensor], recon_frames_bgr: list[np.ndarray], names, *, prefix: str, kpt_shape) -> list[Results]:
+    results = []
+    empty_kpts = (0, int(kpt_shape[0]), int(kpt_shape[1]))
+    for i, pred in enumerate(preds):
+        orig = recon_frames_bgr[i] if i < len(recon_frames_bgr) else np.zeros((512, 512, 3), dtype=np.uint8)
+        boxes = pred[:, :6] if pred.numel() else pred.new_zeros((0, 6))
+        keypoints = pred[:, 6:].view(-1, int(kpt_shape[0]), int(kpt_shape[1])) if pred.numel() else pred.new_zeros(empty_kpts)
+        results.append(Results(orig_img=orig, path=f"{prefix}_frame{i:06d}.png", names=names, boxes=boxes, keypoints=keypoints))
+    return results
+
+
+def _init_tracker(tracker_name: str, *, frame_rate: int):
+    cfg = IterableSimpleNamespace(**YAML.load(check_yaml(f"{tracker_name}.yaml")))
+    return TRACKER_MAP[cfg.tracker_type](args=cfg, frame_rate=frame_rate)
+
+
+def _apply_tracker(result: Results, tracker) -> Results:
+    det = result.boxes.cpu().numpy()
+    tracks = tracker.update(det, result.orig_img, getattr(result, "feats", None))
+    if len(tracks) == 0:
+        return result
+    idx = tracks[:, -1].astype(int)
+    tracked = result[idx]
+    tracked.update(boxes=torch.as_tensor(tracks[:, :-1], device=result.boxes.data.device))
+    return tracked
 
 
 # ----------------------------
@@ -219,36 +289,31 @@ def _iter_video_arrays_from_sample_path(in_path: Path):
 # ----------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="SPAD cube -> reconstructed frames -> YOLO pose tracking")
+    ap = argparse.ArgumentParser(description="Raw SPAD clip -> trained QNNPoseModel -> pose tracking")
     ap.add_argument("--in_path", type=str, required=True, help="Sample/video folder, root folder, or a .npy file")
     ap.add_argument("--in_glob", type=str, default=None,
                     help="Optional glob (e.g. '*') when --in_path is a root folder containing many sample/video subfolders")
     ap.add_argument("--save_dir", type=str, required=True, help="Directory to save visualized frames")
     ap.add_argument("--ckpt", type=str, default="weights/detector.pt")
+    ap.add_argument("--device", type=str, default="", help="Torch device, e.g. cpu / cuda:0 / mps")
     ap.add_argument("--det_thresh", type=float, default=0.4)
+    ap.add_argument("--iou", type=float, default=0.7)
+    ap.add_argument("--max_det", type=int, default=20)
     ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort"])
-
-    # PerPixelBayesian / SPAD options passed into predictor
-    ap.add_argument("--subsampling", type=int, default=64, help="PerPixelBayesian subsampling (T -> T')")
-    ap.add_argument("--bocpd_gamma", type=float, default=5e-4)
-    ap.add_argument("--quantile", type=float, default=1.0)
-    ap.add_argument("--min_filter_size", type=int, default=7)
-
-    # VisionSIM bit-packed video
-    ap.add_argument("--packed_reduce", type=str, default="any", choices=["any", "sum", "rggb_raw", "rggb_expand"])
+    ap.add_argument("--frame_rate", type=int, default=30, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
-    ap.add_argument("--bayer_pattern", type=str, default="RGGB", choices=["RGGB", "BGGR", "GRBG", "GBRG"])
-    ap.add_argument("--spad_swap_rb", action="store_true")
 
-    # Cube chunking (temporal)
-    ap.add_argument("--cube_chunk_t", type=int, default=0, help="If >0, split each cube into chunks of this many time bins and call track() per chunk")
+    # Raw clip chunking
+    ap.add_argument(
+        "--cube_chunk_t",
+        type=int,
+        default=0,
+        help="If >0, split each raw video into chunks of this many bins. If 0, use the train-time QNN window length when available, else full video.",
+    )
     ap.add_argument("--cube_chunk_stride", type=int, default=0, help="Stride for chunking; default uses cube_chunk_t (no overlap)")
-    ap.add_argument("--vis_bg", type=str, default="sum", choices=["sum", "recon"], help="可视化背景：sum=时间维求和；recon=PerPixelBayesian 重建帧")
+    ap.add_argument("--vis_bg", type=str, default="recon", choices=["sum", "recon"], help="Visualization background")
 
     args = ap.parse_args()
-
-    spad_rgb_mode = "rggb_demosaic" if args.packed_reduce in ("rggb_raw", "rggb_expand") else "gray"
-    _packed_frames_to_cube._packed_ch_order = args.packed_ch_order
 
     in_path = Path(args.in_path)
     if not in_path.exists():
@@ -264,16 +329,21 @@ def main():
     else:
         sample_paths = [in_path]
 
-    model = YOLO(args.ckpt)
-    tracker_cfg = f"{args.tracker}.yaml" if args.tracker in ("bytetrack", "botsort") else "botsort.yaml"
+    yolo = YOLO(args.ckpt)
+    qnn_model = yolo.model
+    if not getattr(qnn_model, "qnn_enabled", False) or not hasattr(qnn_model, "integrator"):
+        raise TypeError(
+            f"Checkpoint {args.ckpt} is not a trained QNN pose model. "
+            f"Loaded type: {qnn_model.__class__.__name__}"
+        )
 
-    spad_bayes_kwargs = {
-        "subsampling": args.subsampling,
-        "bocpd_gamma": args.bocpd_gamma,
-        "normalize": False,
-        "quantile": args.quantile,
-        "min_filter_size": args.min_filter_size,
-    }
+    device = _resolve_device(args.device)
+    qnn_model.to(device)
+    qnn_model.eval()
+    tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate)
+    names = yolo.names
+    kpt_shape = getattr(qnn_model, "kpt_shape", (21, 3))
+    trained_chunk_t = _trained_chunk_t(qnn_model)
     global_frame_idx = 0
 
     for sample_path in sample_paths:
@@ -281,92 +351,76 @@ def main():
         out_dir = save_dir / sample_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Each matched sample/video starts a fresh tracking session.
-        if hasattr(model, 'predictor') and model.predictor is not None:
-            if hasattr(model.predictor, 'trackers') and model.predictor.trackers:
-                for tracker in model.predictor.trackers:
-                    tracker.reset()
+        tracker.reset()
+        video_iter = _iter_raw_videos_from_sample_path(sample_path, packed_ch_order=args.packed_ch_order)
 
-        video_iter = _iter_video_arrays_from_sample_path(sample_path)
+        for video_idx, raw_video in enumerate(tqdm(video_iter, desc=f"Processing video [{sample_name}]")):
+            if raw_video.ndim != 4 or raw_video.shape[-1] != 1:
+                raise ValueError(f"Expected raw video (T,H,W,1), got {raw_video.shape}")
 
-        for video_idx, (raw_array, is_packed) in enumerate(tqdm(video_iter, desc=f"Processing video [{sample_name}]")):
-
-            # Reset the Bayesian state at the start of each .npy video, then keep
-            # temporal continuity across its non-overlapping chunks.
-            first_chunk = True
-
-            if is_packed:
-                T = raw_array.shape[0]
+            T = raw_video.shape[0]
+            if int(args.cube_chunk_t) > 0:
+                chunk_t = int(args.cube_chunk_t)
+            elif trained_chunk_t is not None:
+                chunk_t = min(int(trained_chunk_t), T)
             else:
-                T = raw_array.shape[2]
-                
-            chunk_t = int(args.cube_chunk_t) if int(args.cube_chunk_t) > 0 else T
+                chunk_t = T
             stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
 
             for t0 in range(0, T, stride):
                 t1 = min(T, t0 + chunk_t)
-                
-                # 延迟解包：先极低成本切片 Mmap，再进行内存密集型的 Unpack 和 Transpose
-                if is_packed:
-                    raw_chunk = raw_array[t0:t1, :, :, :]
-                    cube_chunk = _packed_frames_to_cube(raw_chunk, reduce=args.packed_reduce)
-                else:
-                    cube_chunk = raw_array[:, :, t0:t1]
-
-                if cube_chunk.shape[2] == 0:
+                raw_chunk = np.ascontiguousarray(raw_video[t0:t1])
+                if raw_chunk.shape[0] == 0:
                     continue
 
-                results = model.track(
-                    cube_chunk,
-                    conf=args.det_thresh,
-                    persist=True,
-                    tracker=tracker_cfg,
-                    verbose=False,
-                    predictor=SPADPosePredictor,
-                    spad=True,
-                    spad_pre="bayes",
-                    spad_clear_states=first_chunk,
-                    spad_bayes_kwargs=spad_bayes_kwargs,
-                    spad_collapse="frames",
-                    spad_rgb_mode=spad_rgb_mode,
-                    spad_packed_reduce=args.packed_reduce,
-                    spad_bayer_pattern=args.bayer_pattern,
-                    spad_packed_ch_order=args.packed_ch_order,
-                    spad_swap_rb=getattr(args, "spad_swap_rb", False),
+                with torch.inference_mode():
+                    video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
+                    raw_preds = qnn_model(video_tensor)
+                    preds = _postprocess_pose_predictions(
+                        raw_preds,
+                        conf=args.det_thresh,
+                        iou=args.iou,
+                        nc=len(names),
+                        max_det=args.max_det,
+                        kpt_shape=kpt_shape,
+                    )
+                    recon_frames_bgr = _recon_frames_bgr(qnn_model, batch_index=0)
+                results = _results_from_preds(
+                    preds,
+                    recon_frames_bgr,
+                    names,
+                    prefix=f"{sample_name}_cube{video_idx:05d}_t{t0:06d}_{t1:06d}",
+                    kpt_shape=kpt_shape,
                 )
-                first_chunk = False
 
                 bg_bgr = None
                 if args.vis_bg == "sum":
-                    bg = cube_chunk.astype(np.float32).sum(axis=2)
-                    bg = bg / (bg.max() + 1e-6)
-                    bg_u8 = (bg * 255.0).round().astype(np.uint8)
-                    bg_bgr = np.repeat(bg_u8[:, :, None], 3, axis=2)
+                    bg_bgr = _raw_sum_bgr(raw_chunk)
 
                 for i, r in enumerate(results):
-                    # 彻底修复的 vis_bg 逻辑：因为我们重载了 postprocess，r.orig_img 就是完美对应的贝叶斯重构 RGB 帧！
+                    r = _apply_tracker(r, tracker)
                     if args.vis_bg == "recon" and getattr(r, "orig_img", None) is not None:
-                        vis = r.orig_img.copy()
+                        vis = np.ascontiguousarray(r.orig_img.copy())
                     else:
-                        vis = bg_bgr.copy() if bg_bgr is not None else np.zeros((cube_chunk.shape[0], cube_chunk.shape[1], 3), dtype=np.uint8)
+                        vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(r.orig_img)
 
-                    if r.boxes is not None and r.boxes.id is not None:
-                        track_id = r.boxes.id.cpu().numpy()
+                    if r.boxes is not None and len(r.boxes):
+                        track_ids = r.boxes.id
+                        if track_ids is None:
+                            track_ids = torch.arange(len(r.boxes), device=r.boxes.data.device)
+                        track_id = track_ids.cpu().numpy()
                         boxes = r.boxes.xyxy.cpu().numpy()
                         box_confs = r.boxes.conf.cpu().numpy()
                         handedness = r.boxes.cls.cpu().numpy()
 
-                        if hasattr(r, "keypoints") and r.keypoints is not None:
-                            poses = r.keypoints.xy.cpu().numpy()  # (n,K,2)
-                            pose_confs = r.keypoints.conf.cpu().numpy()  # (n,K)
-                            poses = np.concatenate([poses, pose_confs[..., None]], axis=2)  # (n,K,3)
-                        else:
-                            poses = None
+                        poses = None
+                        if getattr(r, "keypoints", None) is not None:
+                            poses = r.keypoints.data.cpu().numpy()
 
                         for j, tid in enumerate(track_id):
                             box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
                             vis = draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
-                            if poses is not None:
+                            if poses is not None and j < len(poses):
                                 vis = draw_pose(vis, poses[j])
 
                     out_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
