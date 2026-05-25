@@ -27,6 +27,7 @@ visualizations.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -168,40 +169,75 @@ def _looks_like_hwt(arr: np.ndarray) -> bool:
     return arr.ndim == 3 and arr.shape[0] == arr.shape[1] and arr.shape[2] != arr.shape[1]
 
 
-def _coerce_to_raw_video(arr: np.ndarray, *, packed_ch_order: str) -> list[np.ndarray]:
-    """Normalize supported input layouts to raw `(T,H,W,1)` clips."""
+@dataclass(frozen=True)
+class RawVideoSource:
+    """One lazily-sliced video source."""
+
+    array: np.ndarray
+    layout: str
+
+
+def _video_sources_from_array(arr: np.ndarray) -> list[RawVideoSource]:
+    """Describe supported layouts without materializing the full raw video."""
     if _is_packed_spad(arr):
-        return [_packed_frames_to_raw_video(arr, ch_order=packed_ch_order)]
-
+        return [RawVideoSource(arr, "packed")]
     if arr.ndim == 4 and arr.shape[-1] == 1:
-        return [arr.astype(np.uint8, copy=False)]
-
+        return [RawVideoSource(arr, "thwc1")]
     if arr.ndim == 3:
-        if _looks_like_hwt(arr):
-            return [np.transpose(arr, (2, 0, 1))[:, :, :, None].astype(np.uint8, copy=False)]
-        return [arr[:, :, :, None].astype(np.uint8, copy=False)]
-
+        return [RawVideoSource(arr, "hwt" if _looks_like_hwt(arr) else "thw")]
     if arr.ndim == 4:
-        return [np.transpose(arr[i], (2, 0, 1))[:, :, :, None].astype(np.uint8, copy=False) for i in range(arr.shape[0])]
-
+        return [RawVideoSource(arr[i], "hwt") for i in range(arr.shape[0])]
     raise ValueError(f"Unsupported input shape: {arr.shape}")
 
 
-def _iter_raw_videos_from_sample_path(in_path: Path, *, packed_ch_order: str):
-    """Yield raw `(T,H,W,1)` videos from a sample path."""
+def _iter_raw_video_sources_from_sample_path(in_path: Path):
+    """Yield lazy video sources from a sample path."""
     if in_path.is_dir():
         files = sorted([p for p in in_path.iterdir() if p.suffix.lower() == ".npy"])
         for p in files:
-            for video in _coerce_to_raw_video(_np_load(p), packed_ch_order=packed_ch_order):
-                yield video
+            yield from _video_sources_from_array(_np_load(p))
         return
 
     if in_path.suffix.lower() == ".npy":
-        for video in _coerce_to_raw_video(_np_load(in_path), packed_ch_order=packed_ch_order):
-            yield video
+        yield from _video_sources_from_array(_np_load(in_path))
         return
 
     raise ValueError(f"Unsupported input path: {in_path}")
+
+
+def _video_num_bins(source: RawVideoSource) -> int:
+    """Return the raw time length of a source."""
+    if source.layout in {"packed", "thwc1", "thw"}:
+        return int(source.array.shape[0])
+    if source.layout == "hwt":
+        return int(source.array.shape[2])
+    raise ValueError(f"Unsupported source layout: {source.layout}")
+
+
+def _slice_raw_chunk(source: RawVideoSource, t0: int, t1: int, *, packed_ch_order: str) -> np.ndarray:
+    """Load one raw `(T,H,W,1)` chunk from a lazy source."""
+    if source.layout == "packed":
+        packed = np.asarray(source.array[t0:t1])
+        return _packed_frames_to_raw_video(packed, ch_order=packed_ch_order)
+    if source.layout == "thwc1":
+        return np.ascontiguousarray(source.array[t0:t1].astype(np.uint8, copy=False))
+    if source.layout == "thw":
+        return np.ascontiguousarray(source.array[t0:t1, :, :, None].astype(np.uint8, copy=False))
+    if source.layout == "hwt":
+        return np.ascontiguousarray(np.transpose(source.array[:, :, t0:t1], (2, 0, 1))[:, :, :, None].astype(np.uint8, copy=False))
+    raise ValueError(f"Unsupported source layout: {source.layout}")
+
+
+def _maybe_zero_pad_raw_chunk(raw_chunk: np.ndarray, target_t: int, *, enabled: bool) -> np.ndarray:
+    """Optionally zero-pad the tail chunk to the target time length."""
+    if not enabled or raw_chunk.shape[0] >= target_t:
+        return raw_chunk
+    pad_t = int(target_t) - int(raw_chunk.shape[0])
+    if pad_t <= 0:
+        return raw_chunk
+    pad_shape = (pad_t, raw_chunk.shape[1], raw_chunk.shape[2], raw_chunk.shape[3])
+    pad = np.zeros(pad_shape, dtype=raw_chunk.dtype)
+    return np.ascontiguousarray(np.concatenate((raw_chunk, pad), axis=0))
 
 
 def _cfg_get(cfg: Any, key: str, default=None):
@@ -311,6 +347,12 @@ def main():
         help="If >0, split each raw video into chunks of this many bins. If 0, use the train-time QNN window length when available, else full video.",
     )
     ap.add_argument("--cube_chunk_stride", type=int, default=0, help="Stride for chunking; default uses cube_chunk_t (no overlap)")
+    ap.add_argument(
+        "--tail_pad_zero",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Zero-pad the final short chunk up to `cube_chunk_t` before inference.",
+    )
     ap.add_argument("--vis_bg", type=str, default="recon", choices=["sum", "recon"], help="Visualization background")
 
     args = ap.parse_args()
@@ -352,13 +394,10 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
 
         tracker.reset()
-        video_iter = _iter_raw_videos_from_sample_path(sample_path, packed_ch_order=args.packed_ch_order)
+        video_iter = _iter_raw_video_sources_from_sample_path(sample_path)
 
-        for video_idx, raw_video in enumerate(tqdm(video_iter, desc=f"Processing video [{sample_name}]")):
-            if raw_video.ndim != 4 or raw_video.shape[-1] != 1:
-                raise ValueError(f"Expected raw video (T,H,W,1), got {raw_video.shape}")
-
-            T = raw_video.shape[0]
+        for video_idx, source in enumerate(tqdm(video_iter, desc=f"Processing video [{sample_name}]")):
+            T = _video_num_bins(source)
             if int(args.cube_chunk_t) > 0:
                 chunk_t = int(args.cube_chunk_t)
             elif trained_chunk_t is not None:
@@ -369,7 +408,8 @@ def main():
 
             for t0 in range(0, T, stride):
                 t1 = min(T, t0 + chunk_t)
-                raw_chunk = np.ascontiguousarray(raw_video[t0:t1])
+                raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
+                raw_chunk = _maybe_zero_pad_raw_chunk(raw_chunk, chunk_t, enabled=bool(args.tail_pad_zero))
                 if raw_chunk.shape[0] == 0:
                     continue
 
