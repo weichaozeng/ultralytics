@@ -403,7 +403,11 @@ def main():
             elif trained_chunk_t is not None:
                 chunk_t = min(int(trained_chunk_t), T)
             else:
-                chunk_t = T
+                raise ValueError(
+                    "Unable to infer train-time QNN window length from checkpoint. "
+                    "Pass --cube_chunk_t explicitly, e.g. --cube_chunk_t 65 for qnn_output_frames=1,qnn_subsampling=64. "
+                    f"Refusing to process the full video as one chunk (T={T}), which is likely to OOM."
+                )
             stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
 
             for t0 in range(0, T, stride):
@@ -425,6 +429,8 @@ def main():
                         kpt_shape=kpt_shape,
                     )
                     recon_frames_bgr = _recon_frames_bgr(qnn_model, batch_index=0)
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 results = _results_from_preds(
                     preds,
                     recon_frames_bgr,
