@@ -401,12 +401,20 @@ def main():
             if int(args.cube_chunk_t) > 0:
                 chunk_t = int(args.cube_chunk_t)
             elif trained_chunk_t is not None:
-                chunk_t = min(int(trained_chunk_t), T)
+                chunk_t = int(trained_chunk_t)
             else:
                 raise ValueError(
                     "Unable to infer train-time QNN window length from checkpoint. "
                     "Pass --cube_chunk_t explicitly, e.g. --cube_chunk_t 64 for qnn_output_frames=1,qnn_subsampling=64. "
                     f"Refusing to process the full video as one chunk (T={T}), which is likely to OOM."
+                )
+            if chunk_t <= 0:
+                raise ValueError(f"cube_chunk_t must be positive, got {chunk_t}")
+            subsampling = int(getattr(getattr(qnn_model, "integrator", None), "subsampling", 1) or 1)
+            if chunk_t < subsampling:
+                raise ValueError(
+                    f"cube_chunk_t={chunk_t} is shorter than integrator subsampling={subsampling}, "
+                    "which would produce zero reconstructed frames. Increase --cube_chunk_t or use the checkpoint default."
                 )
             stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
 
