@@ -264,7 +264,7 @@ def _trained_chunk_t(model) -> int | None:
     subsampling = getattr(getattr(model, "integrator", None), "subsampling", None)
     if output_frames is None or subsampling is None:
         return None
-    return int(output_frames) * int(subsampling) + 1
+    return int(output_frames) * int(subsampling)
 
 
 def _recon_frames_bgr(model, batch_index: int = 0) -> list[np.ndarray]:
@@ -405,7 +405,7 @@ def main():
             else:
                 raise ValueError(
                     "Unable to infer train-time QNN window length from checkpoint. "
-                    "Pass --cube_chunk_t explicitly, e.g. --cube_chunk_t 65 for qnn_output_frames=1,qnn_subsampling=64. "
+                    "Pass --cube_chunk_t explicitly, e.g. --cube_chunk_t 64 for qnn_output_frames=1,qnn_subsampling=64. "
                     f"Refusing to process the full video as one chunk (T={T}), which is likely to OOM."
                 )
             stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
