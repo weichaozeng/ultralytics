@@ -454,7 +454,7 @@ def main():
                 for i, r in enumerate(results):
                     r = _apply_tracker(r, tracker)
                     if args.vis_bg == "recon" and getattr(r, "orig_img", None) is not None:
-                        vis = np.ascontiguousarray(r.orig_img.copy())
+                        vis = np.ascontiguousarray(r.orig_img.copy())[:, :, ::-1]
                     else:
                         vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(r.orig_img)
 
