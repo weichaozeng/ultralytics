@@ -210,14 +210,16 @@ def _slice_raw_chunk(source: RawVideoSource, t0: int, t1: int, *, packed_ch_orde
 
 
 def _maybe_zero_pad_raw_chunk(raw_chunk: np.ndarray, target_t: int, *, enabled: bool) -> np.ndarray:
-    """Optionally zero-pad the tail chunk to the target time length."""
+    """Optionally tail-pad the final chunk by repeating its last frame."""
     if not enabled or raw_chunk.shape[0] >= target_t:
         return raw_chunk
     pad_t = int(target_t) - int(raw_chunk.shape[0])
     if pad_t <= 0:
         return raw_chunk
-    pad_shape = (pad_t, raw_chunk.shape[1], raw_chunk.shape[2], raw_chunk.shape[3])
-    pad = np.zeros(pad_shape, dtype=raw_chunk.dtype)
+    if raw_chunk.shape[0] == 0:
+        return raw_chunk
+    last = raw_chunk[-1:, :, :, :]
+    pad = np.repeat(last, pad_t, axis=0)
     return np.ascontiguousarray(np.concatenate((raw_chunk, pad), axis=0))
 
 
@@ -355,10 +357,10 @@ def main():
     )
     ap.add_argument("--cube_chunk_stride", type=int, default=0, help="Stride for chunking; default uses cube_chunk_t (no overlap)")
     ap.add_argument(
-        "--tail_pad_zero",
+        "--tail_pad",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Zero-pad the final short chunk up to `cube_chunk_t` before inference.",
+        help="Pad the final short chunk by repeating its last frame up to `cube_chunk_t` before inference.",
     )
     ap.add_argument("--vis_bg", type=str, default="recon", choices=["sum", "recon"], help="Visualization background")
     ap.add_argument(
@@ -440,7 +442,7 @@ def main():
             for t0 in range(0, T, stride):
                 t1 = min(T, t0 + chunk_t)
                 raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
-                raw_chunk = _maybe_zero_pad_raw_chunk(raw_chunk, chunk_t, enabled=bool(args.tail_pad_zero))
+                raw_chunk = _maybe_zero_pad_raw_chunk(raw_chunk, chunk_t, enabled=bool(args.tail_pad))
                 if raw_chunk.shape[0] == 0:
                     continue
 
