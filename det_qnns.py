@@ -360,7 +360,7 @@ def main():
         "--tail_pad",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Pad the final short chunk by repeating its last frame up to `cube_chunk_t` before inference.",
+        help="Pad final short chunk by repeating its last frame; with --no-tail_pad, run the short tail chunk as-is.",
     )
     ap.add_argument("--vis_bg", type=str, default="recon", choices=["sum", "recon"], help="Visualization background")
     ap.add_argument(
