@@ -7,6 +7,8 @@ import types
 from copy import deepcopy
 from pathlib import Path
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -755,13 +757,25 @@ class QNNPoseModel(PoseModel):
 
     @staticmethod
     def _qnn_raw_recons_to_rgb_frames(raw_hwt):
-        """Convert PPB raw Bayer reconstructions Hraw,Wraw,T into T,3,H,W RGB-like frames."""
-        r = raw_hwt[0::2, 0::2, :]
-        g1 = raw_hwt[0::2, 1::2, :]
-        g2 = raw_hwt[1::2, 0::2, :]
-        b = raw_hwt[1::2, 1::2, :]
-        g = 0.5 * (g1 + g2)
-        return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
+        """Convert PPB raw Bayer Hraw,Wraw,T to T,3,H/2,W/2 via demosaic(1024)->resize(512)."""
+        if not torch.is_tensor(raw_hwt) or raw_hwt.ndim != 3:
+            raise ValueError(f"Expected raw_hwt tensor with shape (Hraw,Wraw,T), got {type(raw_hwt)}")
+
+        h_raw, w_raw, t = map(int, raw_hwt.shape)
+        if h_raw % 2 != 0 or w_raw % 2 != 0:
+            raise ValueError(f"Raw reconstruction must have even H/W, got {(h_raw, w_raw)}")
+
+        target_hw = (w_raw // 2, h_raw // 2)  # cv2.resize expects (W,H)
+        raw_hwt_np = raw_hwt.detach().float().cpu().numpy()
+        frame_ll = []
+        for ti in range(t):
+            raw_u8 = np.clip(raw_hwt_np[:, :, ti] * 255.0, 0, 255).astype(np.uint8)
+            rgb_1024 = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
+            rgb_512 = cv2.resize(rgb_1024, target_hw, interpolation=cv2.INTER_AREA)
+            frame_ll.append(torch.from_numpy(rgb_512).permute(2, 0, 1).float() / 255.0)
+
+        out = torch.stack(frame_ll, dim=0).contiguous()  # T,3,H/2,W/2
+        return out.to(raw_hwt.device)
 
     @staticmethod
     def _qnn_flatten_temporal(x):

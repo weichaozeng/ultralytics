@@ -273,14 +273,14 @@ def _ppb_demosaic_recon_frames_bgr(model) -> list[np.ndarray]:
 
 
 def _raw_sum_bgr(raw_video: np.ndarray) -> np.ndarray:
+    """Sum raw over time, demosaic at full Bayer size, then downsample to model canvas."""
+    if raw_video.ndim != 4 or raw_video.shape[-1] != 1:
+        raise ValueError(f"Expected raw chunk shape (T,H,W,1), got {raw_video.shape}")
     raw_sum = raw_video[..., 0].astype(np.float32).sum(axis=0)
-    r = raw_sum[0::2, 0::2]
-    g = 0.5 * (raw_sum[0::2, 1::2] + raw_sum[1::2, 0::2])
-    b = raw_sum[1::2, 1::2]
-    rgb = np.stack((r, g, b), axis=2)
-    rgb /= rgb.max() + 1e-6
-    rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-    return np.ascontiguousarray(rgb_u8[:, :, ::-1])
+    raw_u8 = np.clip((raw_sum / max(float(raw_video.shape[0]), 1.0)) * 255.0, 0, 255).astype(np.uint8)
+    rgb_1024 = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
+    rgb_512 = cv2.resize(rgb_1024, (raw_u8.shape[1] // 2, raw_u8.shape[0] // 2), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(rgb_512[:, :, ::-1])
 
 
 def _raw_sum_readrgb_like_bgr(raw_video: np.ndarray) -> np.ndarray:
