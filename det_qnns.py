@@ -268,6 +268,17 @@ def _raw_sum_bgr(raw_video: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(rgb_u8[:, :, ::-1])
 
 
+def _raw_sum_readrgb_like_bgr(raw_video: np.ndarray) -> np.ndarray:
+    """Match read_rgb.py style: mean over time then Bayer RG demosaic."""
+    if raw_video.ndim != 4 or raw_video.shape[-1] != 1:
+        raise ValueError(f"Expected raw chunk shape (T,H,W,1), got {raw_video.shape}")
+    t = max(int(raw_video.shape[0]), 1)
+    raw_sum = raw_video[..., 0].astype(np.float32).sum(axis=0)
+    raw_u8 = np.clip((raw_sum / float(t)) * 255.0, 0, 255).astype(np.uint8)
+    rgb = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
+    return np.ascontiguousarray(rgb[:, :, ::-1])
+
+
 def _postprocess_pose_predictions(raw_preds, *, conf: float, iou: float, nc: int, max_det: int, kpt_shape) -> list[torch.Tensor]:
     raw = raw_preds[0] if isinstance(raw_preds, (list, tuple)) and torch.is_tensor(raw_preds[0]) else raw_preds
     preds = nms.non_max_suppression(raw, conf, iou, nc=nc, multi_label=True, max_det=max_det)
@@ -335,6 +346,12 @@ def main():
         help="Zero-pad the final short chunk up to `cube_chunk_t` before inference.",
     )
     ap.add_argument("--vis_bg", type=str, default="recon", choices=["sum", "recon"], help="Visualization background")
+    ap.add_argument(
+        "--save_readrgb_compare",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also save a read_rgb-like Bayer->RGB visualization with suffix '_readrgb'.",
+    )
 
     args = ap.parse_args()
 
@@ -431,6 +448,7 @@ def main():
                 bg_bgr = None
                 if args.vis_bg == "sum":
                     bg_bgr = _raw_sum_bgr(raw_chunk)
+                compare_bg_bgr = _raw_sum_readrgb_like_bgr(raw_chunk) if bool(args.save_readrgb_compare) else None
 
                 for i, r in enumerate(results):
                     r = _apply_tracker(r, tracker)
@@ -438,6 +456,7 @@ def main():
                         vis = np.ascontiguousarray(r.orig_img.copy())
                     else:
                         vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(r.orig_img)
+                    vis_readrgb = compare_bg_bgr.copy() if compare_bg_bgr is not None else None
 
                     if r.boxes is not None and len(r.boxes):
                         track_ids = r.boxes.id
@@ -457,9 +476,16 @@ def main():
                             vis = draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
                             if poses is not None and j < len(poses):
                                 vis = draw_pose(vis, poses[j])
+                            if vis_readrgb is not None:
+                                vis_readrgb = draw_bbox(vis_readrgb, int(tid), box_xyxyc, float(handedness[j]))
+                                if poses is not None and j < len(poses):
+                                    vis_readrgb = draw_pose(vis_readrgb, poses[j])
 
                     out_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
                     cv2.imwrite(str(out_path), vis)
+                    if vis_readrgb is not None:
+                        compare_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}_readrgb.png"
+                        cv2.imwrite(str(compare_path), vis_readrgb)
                     global_frame_idx += 1
 
 
