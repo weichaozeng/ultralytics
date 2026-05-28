@@ -257,6 +257,21 @@ def _recon_frames_bgr(model, batch_index: int = 0) -> list[np.ndarray]:
     return [np.ascontiguousarray(frame) for frame in bgr]
 
 
+def _ppb_demosaic_recon_frames_bgr(model) -> list[np.ndarray]:
+    """Build 1024x1024 BGR frames from PPB Bayer recon via OpenCV demosaic."""
+    integrator = getattr(model, "integrator", None)
+    recons = getattr(integrator, "recons_tensor", None) if integrator is not None else None
+    if recons is None:
+        return []
+    raw_hwt = recons.detach().float().cpu().numpy()
+    frames_bgr = []
+    for ti in range(raw_hwt.shape[2]):
+        raw_u8 = np.clip(raw_hwt[:, :, ti] * 255.0, 0, 255).astype(np.uint8)
+        rgb = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
+        frames_bgr.append(np.ascontiguousarray(rgb[:, :, ::-1]))
+    return frames_bgr
+
+
 def _raw_sum_bgr(raw_video: np.ndarray) -> np.ndarray:
     raw_sum = raw_video[..., 0].astype(np.float32).sum(axis=0)
     r = raw_sum[0::2, 0::2]
@@ -351,6 +366,12 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Also save a read_rgb-like Bayer->RGB visualization with suffix '_readrgb'.",
+    )
+    ap.add_argument(
+        "--save_ppb_demosaic_compare",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also save PPB raw -> Bayer demosaic visualization with suffix '_ppbdm'.",
     )
 
     args = ap.parse_args()
@@ -449,6 +470,7 @@ def main():
                 if args.vis_bg == "sum":
                     bg_bgr = _raw_sum_bgr(raw_chunk)
                 compare_bg_bgr = _raw_sum_readrgb_like_bgr(raw_chunk) if bool(args.save_readrgb_compare) else None
+                compare_ppbdm_frames = _ppb_demosaic_recon_frames_bgr(qnn_model) if bool(args.save_ppb_demosaic_compare) else []
 
                 for i, r in enumerate(results):
                     r = _apply_tracker(r, tracker)
@@ -456,7 +478,21 @@ def main():
                         vis = np.ascontiguousarray(r.orig_img.copy())
                     else:
                         vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(r.orig_img)
-                    vis_readrgb = compare_bg_bgr.copy() if compare_bg_bgr is not None else None
+                    vis_readrgb = None
+                    if compare_bg_bgr is not None:
+                        vh, vw = vis.shape[:2]
+                        if compare_bg_bgr.shape[:2] != (vh, vw):
+                            vis_readrgb = cv2.resize(compare_bg_bgr, (vw, vh), interpolation=cv2.INTER_AREA)
+                        else:
+                            vis_readrgb = compare_bg_bgr.copy()
+                    vis_ppbdm = None
+                    if i < len(compare_ppbdm_frames):
+                        vh, vw = vis.shape[:2]
+                        src = compare_ppbdm_frames[i]
+                        if src.shape[:2] != (vh, vw):
+                            vis_ppbdm = cv2.resize(src, (vw, vh), interpolation=cv2.INTER_AREA)
+                        else:
+                            vis_ppbdm = src.copy()
 
                     if r.boxes is not None and len(r.boxes):
                         track_ids = r.boxes.id
@@ -480,12 +516,19 @@ def main():
                                 vis_readrgb = draw_bbox(vis_readrgb, int(tid), box_xyxyc, float(handedness[j]))
                                 if poses is not None and j < len(poses):
                                     vis_readrgb = draw_pose(vis_readrgb, poses[j])
+                            if vis_ppbdm is not None:
+                                vis_ppbdm = draw_bbox(vis_ppbdm, int(tid), box_xyxyc, float(handedness[j]))
+                                if poses is not None and j < len(poses):
+                                    vis_ppbdm = draw_pose(vis_ppbdm, poses[j])
 
                     out_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
                     cv2.imwrite(str(out_path), vis)
                     if vis_readrgb is not None:
                         compare_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}_readrgb.png"
                         cv2.imwrite(str(compare_path), vis_readrgb)
+                    if vis_ppbdm is not None:
+                        compare_ppbdm_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}_ppbdm.png"
+                        cv2.imwrite(str(compare_ppbdm_path), vis_ppbdm)
                     global_frame_idx += 1
 
 
