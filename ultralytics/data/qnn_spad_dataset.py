@@ -12,6 +12,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from ultralytics.data.spad_packed import packed_frames_to_raw_bayer
+
 
 @dataclass(frozen=True)
 class QNNWindow:
@@ -157,28 +159,8 @@ class QNNSpadPoseDataset(Dataset):
             raise IndexError(f"SPAD slice [{spad_start}:{spad_end}] exceeds {window.spad_path} shape {arr.shape}")
 
         packed = np.asarray(arr[spad_start:spad_end])
-        raw = self._packed_rggb_expand_to_raw(packed, ch_order=self.packed_ch_order)
+        raw = packed_frames_to_raw_bayer(packed, ch_order=self.packed_ch_order)
         return raw[:, :, :, None].astype(np.uint8, copy=False)
-
-    @staticmethod
-    def _packed_rggb_expand_to_raw(frames_packed: np.ndarray, *, ch_order: str = "RGB") -> np.ndarray:
-        """Convert packed `(T,H,Wpacked,3)` bytes to raw Bayer `(T,2H,2W)` bits."""
-        if frames_packed.ndim != 4 or frames_packed.shape[-1] != 3:
-            raise ValueError(f"Expected packed SPAD shape (T,H,Wpacked,3), got {frames_packed.shape}")
-
-        unpacked = np.unpackbits(frames_packed, axis=2)
-        if ch_order == "BGR":
-            r_ch, g_ch, b_ch = 2, 1, 0
-        else:
-            r_ch, g_ch, b_ch = 0, 1, 2
-
-        t, h, w, _ = unpacked.shape
-        raw = np.zeros((t, h * 2, w * 2), dtype=np.uint8)
-        raw[:, 0::2, 0::2] = unpacked[:, :, :, r_ch]
-        raw[:, 0::2, 1::2] = unpacked[:, :, :, g_ch]
-        raw[:, 1::2, 0::2] = unpacked[:, :, :, g_ch]
-        raw[:, 1::2, 1::2] = unpacked[:, :, :, b_ch]
-        return raw
 
     def _labels_for_window(self, window: QNNWindow):
         ann = self.annotations[window.name]

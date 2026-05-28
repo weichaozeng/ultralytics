@@ -17,7 +17,8 @@ Expected input formats
     * (T, H, W)          raw SPAD clip
     * (H, W, T)          legacy raw photon cube
     * (N, H, W, T)       sequence of legacy raw photon cubes
-    * (T, H, Wpacked, 3) VisionSIM packed frames (expanded to raw RGGB on load)
+    * (T, H, Wpacked, 3) synthetic packed R,G,B (G duplicated to both Bayer G sites on load)
+    * (T, H, Wpacked, 4) real packed R,G1,G2,B (RGGB sites filled separately on load)
 
 The checkpoint reconstructs `T'` RGB-like frames internally. This script runs the model,
 postprocesses detections, applies optional ByteTrack/BoT-SORT tracking, and saves per-frame
@@ -37,6 +38,7 @@ import torch
 from tqdm import tqdm
 
 from ultralytics import YOLO
+from ultralytics.data.spad_packed import is_packed_spad, packed_frames_to_raw_bayer
 from ultralytics.engine.results import Results
 from ultralytics.trackers.track import TRACKER_MAP
 from ultralytics.utils import IterableSimpleNamespace, YAML, nms
@@ -139,30 +141,9 @@ def draw_pose(img_bgr: np.ndarray, pose_kpts: np.ndarray, thresh: float = 0.5, k
 def _packed_frames_to_raw_video(
     frames_packed: np.ndarray, *, expected_w: int = 512, ch_order: str = "RGB"
 ) -> np.ndarray:
-    """Convert VisionSIM packed frames `(T,H,Wpacked,3)` to raw `(T,2H,2W,1)`."""
-    if frames_packed.ndim != 4 or frames_packed.shape[-1] != 3:
-        raise ValueError(f"Expected packed frames (T,H,Wpacked,3), got shape={frames_packed.shape}")
-
-    unpacked = np.unpackbits(frames_packed, axis=2)
-    if unpacked.shape[2] > expected_w:
-        unpacked = unpacked[:, :, :expected_w, :]
-
-    if ch_order.upper() == "BGR":
-        r_ch, g_ch, b_ch = 2, 1, 0
-    else:
-        r_ch, g_ch, b_ch = 0, 1, 2
-
-    t, h, w, _ = unpacked.shape
-    raw = np.zeros((t, h * 2, w * 2), dtype=np.uint8)
-    raw[:, 0::2, 0::2] = unpacked[:, :, :, r_ch]
-    raw[:, 0::2, 1::2] = unpacked[:, :, :, g_ch]
-    raw[:, 1::2, 0::2] = unpacked[:, :, :, g_ch]
-    raw[:, 1::2, 1::2] = unpacked[:, :, :, b_ch]
+    """Convert packed `(T,H,Wpacked,3|4)` to raw `(T,2H,2W,1)`."""
+    raw = packed_frames_to_raw_bayer(frames_packed, expected_w=expected_w, ch_order=ch_order)
     return raw[:, :, :, None]
-
-
-def _is_packed_spad(arr: np.ndarray) -> bool:
-    return arr.ndim == 4 and arr.shape[-1] == 3 and arr.shape[2] in (64, 128)
 
 
 def _looks_like_hwt(arr: np.ndarray) -> bool:
@@ -179,7 +160,7 @@ class RawVideoSource:
 
 def _video_sources_from_array(arr: np.ndarray) -> list[RawVideoSource]:
     """Describe supported layouts without materializing the full raw video."""
-    if _is_packed_spad(arr):
+    if is_packed_spad(arr):
         return [RawVideoSource(arr, "packed")]
     if arr.ndim == 4 and arr.shape[-1] == 1:
         return [RawVideoSource(arr, "thwc1")]
