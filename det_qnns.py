@@ -276,19 +276,12 @@ def _recon_frames_bgr(model, batch_index: int = 0) -> list[np.ndarray]:
     return [np.ascontiguousarray(frame) for frame in bgr]
 
 
-def _ppb_demosaic_recon_frames_bgr(model) -> list[np.ndarray]:
-    """Build 1024x1024 BGR frames from PPB Bayer recon via OpenCV demosaic."""
-    integrator = getattr(model, "integrator", None)
-    recons = getattr(integrator, "recons_tensor", None) if integrator is not None else None
-    if recons is None:
-        return []
-    raw_hwt = recons.detach().float().cpu().numpy()
-    frames_bgr = []
-    for ti in range(raw_hwt.shape[2]):
-        raw_u8 = np.clip(raw_hwt[:, :, ti] * 255.0, 0, 255).astype(np.uint8)
-        rgb = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
-        frames_bgr.append(np.ascontiguousarray(rgb[:, :, ::-1]))
-    return frames_bgr
+def _resize_to_shape_bgr(img_bgr: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
+    """Resize a BGR image only when it does not already match the target H/W."""
+    target_h, target_w = map(int, shape_hw)
+    if img_bgr.shape[:2] == (target_h, target_w):
+        return np.ascontiguousarray(img_bgr.copy())
+    return cv2.resize(img_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
 
 def _raw_sum_bgr(raw_video: np.ndarray, *, packed_nch: int) -> np.ndarray:
@@ -302,14 +295,14 @@ def _raw_sum_bgr(raw_video: np.ndarray, *, packed_nch: int) -> np.ndarray:
     return np.ascontiguousarray(rgb[:, :, ::-1])
 
 
-def _raw_sum_readrgb_like_bgr(raw_video: np.ndarray) -> np.ndarray:
-    """Match read_rgb.py style: mean over time then Bayer RG demosaic."""
+def _raw_sum_readrgb_like_bgr(raw_video: np.ndarray, *, packed_nch: int) -> np.ndarray:
+    """Mean over time, then visualize with the same packed-channel semantics as QNN input."""
     if raw_video.ndim != 4 or raw_video.shape[-1] != 1:
         raise ValueError(f"Expected raw chunk shape (T,H,W,1), got {raw_video.shape}")
     t = max(int(raw_video.shape[0]), 1)
     raw_sum = raw_video[..., 0].astype(np.float32).sum(axis=0)
     raw_u8 = np.clip((raw_sum / float(t)) * 255.0, 0, 255).astype(np.uint8)
-    rgb = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
+    rgb = bayer_plane_to_rgb_u8(raw_u8, packed_nch=int(packed_nch))
     return np.ascontiguousarray(rgb[:, :, ::-1])
 
 
@@ -381,17 +374,12 @@ def main():
     )
     ap.add_argument("--vis_bg", type=str, default="recon", choices=["sum", "recon"], help="Visualization background")
     ap.add_argument(
-        "--save_readrgb_compare",
+        "--save_readrgb",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Also save a read_rgb-like Bayer->RGB visualization with suffix '_readrgb'.",
+        help="Also save the direct read_rgb-style sum visualization with suffix '_readrgb'.",
     )
-    ap.add_argument(
-        "--save_ppb_demosaic_compare",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Also save PPB raw -> Bayer demosaic visualization with suffix '_ppbdm'.",
-    )
+    ap.add_argument("--save_ppb_demosaic_compare", action=argparse.BooleanOptionalAction, default=False, help=argparse.SUPPRESS)
 
     args = ap.parse_args()
 
@@ -494,30 +482,20 @@ def main():
                 bg_bgr = None
                 if args.vis_bg == "sum":
                     bg_bgr = _raw_sum_bgr(raw_chunk, packed_nch=source.packed_nch)
-                compare_bg_bgr = _raw_sum_readrgb_like_bgr(raw_chunk) if bool(args.save_readrgb_compare) else None
-                compare_ppbdm_frames = _ppb_demosaic_recon_frames_bgr(qnn_model) if bool(args.save_ppb_demosaic_compare) else []
+                readrgb_bgr = _raw_sum_readrgb_like_bgr(raw_chunk, packed_nch=source.packed_nch) if bool(args.save_readrgb) else None
 
                 for i, r in enumerate(results):
                     r = _apply_tracker(r, tracker)
+                    recon = (
+                        np.ascontiguousarray(r.orig_img.copy())
+                        if getattr(r, "orig_img", None) is not None
+                        else np.zeros((512, 512, 3), dtype=np.uint8)
+                    )
                     if args.vis_bg == "recon" and getattr(r, "orig_img", None) is not None:
-                        vis = np.ascontiguousarray(r.orig_img.copy())
+                        vis = recon.copy()
                     else:
-                        vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(r.orig_img)
-                    vis_readrgb = None
-                    if compare_bg_bgr is not None:
-                        vh, vw = vis.shape[:2]
-                        if compare_bg_bgr.shape[:2] != (vh, vw):
-                            vis_readrgb = cv2.resize(compare_bg_bgr, (vw, vh), interpolation=cv2.INTER_AREA)
-                        else:
-                            vis_readrgb = compare_bg_bgr.copy()
-                    vis_ppbdm = None
-                    if i < len(compare_ppbdm_frames):
-                        vh, vw = vis.shape[:2]
-                        src = compare_ppbdm_frames[i]
-                        if src.shape[:2] != (vh, vw):
-                            vis_ppbdm = cv2.resize(src, (vw, vh), interpolation=cv2.INTER_AREA)
-                        else:
-                            vis_ppbdm = src.copy()
+                        vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(recon)
+                    readrgb = _resize_to_shape_bgr(readrgb_bgr, vis.shape[:2]) if readrgb_bgr is not None else None
 
                     if r.boxes is not None and len(r.boxes):
                         track_ids = r.boxes.id
@@ -537,23 +515,14 @@ def main():
                             vis = draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
                             if poses is not None and j < len(poses):
                                 vis = draw_pose(vis, poses[j])
-                            if vis_readrgb is not None:
-                                vis_readrgb = draw_bbox(vis_readrgb, int(tid), box_xyxyc, float(handedness[j]))
-                                if poses is not None and j < len(poses):
-                                    vis_readrgb = draw_pose(vis_readrgb, poses[j])
-                            if vis_ppbdm is not None:
-                                vis_ppbdm = draw_bbox(vis_ppbdm, int(tid), box_xyxyc, float(handedness[j]))
-                                if poses is not None and j < len(poses):
-                                    vis_ppbdm = draw_pose(vis_ppbdm, poses[j])
 
                     out_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}.png"
                     cv2.imwrite(str(out_path), vis)
-                    if vis_readrgb is not None:
-                        compare_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}_readrgb.png"
-                        cv2.imwrite(str(compare_path), vis_readrgb)
-                    if vis_ppbdm is not None:
-                        compare_ppbdm_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}_ppbdm.png"
-                        cv2.imwrite(str(compare_ppbdm_path), vis_ppbdm)
+                    recon_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}_recon.png"
+                    cv2.imwrite(str(recon_path), recon)
+                    if readrgb is not None:
+                        readrgb_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}_readrgb.png"
+                        cv2.imwrite(str(readrgb_path), readrgb)
                     global_frame_idx += 1
 
 
