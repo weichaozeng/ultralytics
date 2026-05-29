@@ -92,9 +92,8 @@ def _recon_canvas(model, si: int, image_size: int) -> np.ndarray:
     if t >= frames.shape[0]:
         return np.zeros((image_size, image_size, 3), dtype=np.uint8)
     img = frames[t, b].detach().float().cpu().permute(1, 2, 0).numpy()
-    img = img - img.min()
-    img = img / (img.max() + 1e-6)
-    return np.clip(img * 255.0, 0, 255).astype(np.uint8)
+    rgb_u8 = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(rgb_u8[:, :, ::-1])
 
 
 def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
@@ -126,6 +125,8 @@ def _run_qnn_eval_visualization(trainer, args, *, epoch_idx: int):
     with torch.no_grad():
         for batch_i, batch in enumerate(loader):
             batch = trainer.preprocess_batch(batch)
+            if "packed_nch" in batch:
+                model.qnn_packed_nch = int(batch["packed_nch"])
             preds = model(batch["img"])
             loss, loss_items = model.loss(batch, preds)
             processed = _postprocess_pose(

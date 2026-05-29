@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ultralytics.data.spad_packed import packed_frames_to_raw_bayer
+from ultralytics.data.spad_packed import infer_packed_nch, packed_frames_to_raw_bayer
 
 
 @dataclass(frozen=True)
@@ -135,10 +135,11 @@ class QNNSpadPoseDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         window = self.windows[index]
-        img = self._load_raw_window(window)
+        img, packed_nch = self._load_raw_window(window)
         cls, bboxes, keypoints, batch_idx = self._labels_for_window(window)
         return {
             "img": torch.from_numpy(img),
+            "packed_nch": int(packed_nch),
             "cls": cls,
             "bboxes": bboxes,
             "keypoints": keypoints,
@@ -159,8 +160,9 @@ class QNNSpadPoseDataset(Dataset):
             raise IndexError(f"SPAD slice [{spad_start}:{spad_end}] exceeds {window.spad_path} shape {arr.shape}")
 
         packed = np.asarray(arr[spad_start:spad_end])
+        packed_nch = infer_packed_nch(arr)
         raw = packed_frames_to_raw_bayer(packed, ch_order=self.packed_ch_order)
-        return raw[:, :, :, None].astype(np.uint8, copy=False)
+        return raw[:, :, :, None].astype(np.uint8, copy=False), packed_nch
 
     def _labels_for_window(self, window: QNNWindow):
         ann = self.annotations[window.name]
@@ -247,6 +249,7 @@ class QNNSpadPoseDataset(Dataset):
 
         new_batch["im_file"] = [b["im_file"] for b in batch]
         new_batch["output_frames"] = [b["output_frames"] for b in batch]
+        new_batch["packed_nch"] = int(batch[0]["packed_nch"])
         new_batch["ori_shape"] = [b["ori_shape"] for b in batch]
         new_batch["resized_shape"] = [b["resized_shape"] for b in batch]
         return new_batch

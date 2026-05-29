@@ -634,6 +634,7 @@ class QNNPoseModel(PoseModel):
         self.qnn_ssd_state_dim = qnn_ssd_state_dim
         self.qnn_ssd_head_divisor = qnn_ssd_head_divisor
         self.qnn_ssd_kwargs = dict(qnn_ssd_kwargs or {})
+        self.qnn_packed_nch = 3
 
         super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
 
@@ -737,7 +738,8 @@ class QNNPoseModel(PoseModel):
         for b in range(bsz):
             photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
             recons = self.integrator.process_photon_cube(photon_cube, clear_states=True)
-            frames = self._qnn_raw_recons_to_rgb_frames(recons)
+            packed_nch = int(getattr(self, "qnn_packed_nch", 3) or 3)
+            frames = self._qnn_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
             frame_ll.append(frames)
 
             if t_index_ll is None:
@@ -771,8 +773,12 @@ class QNNPoseModel(PoseModel):
         return idx[:num_frames]
 
     @staticmethod
-    def _qnn_raw_recons_to_rgb_frames(raw_hwt):
-        """Convert PPB raw Bayer Hraw,Wraw,T to T,3,H/2,W/2 via demosaic(1024)->resize(512)."""
+    def _qnn_raw_recons_to_rgb_frames(raw_hwt, *, packed_nch: int = 3):
+        """Convert PPB raw Bayer Hraw,Wraw,T to T,3,H/2,W/2.
+
+        Synthetic packed (3ch): RGGB plane subsample.
+        Real packed / true Bayer (4ch): demosaic at full res then resize to half.
+        """
         if not torch.is_tensor(raw_hwt) or raw_hwt.ndim != 3:
             raise ValueError(f"Expected raw_hwt tensor with shape (Hraw,Wraw,T), got {type(raw_hwt)}")
 
@@ -781,6 +787,14 @@ class QNNPoseModel(PoseModel):
             return torch.zeros((0, 3, h_raw // 2, w_raw // 2), dtype=torch.float32, device=raw_hwt.device)
         if h_raw % 2 != 0 or w_raw % 2 != 0:
             raise ValueError(f"Raw reconstruction must have even H/W, got {(h_raw, w_raw)}")
+
+        if int(packed_nch) == 3:
+            r = raw_hwt[0::2, 0::2, :]
+            g1 = raw_hwt[0::2, 1::2, :]
+            g2 = raw_hwt[1::2, 0::2, :]
+            b = raw_hwt[1::2, 1::2, :]
+            g = 0.5 * (g1 + g2)
+            return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
 
         target_hw = (w_raw // 2, h_raw // 2)  # cv2.resize expects (W,H)
         raw_hwt_np = raw_hwt.detach().float().cpu().numpy()

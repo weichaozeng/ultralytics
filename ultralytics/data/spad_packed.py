@@ -7,6 +7,13 @@ import numpy as np
 PACKED_WIDTHS = (64, 128)
 
 
+def infer_packed_nch(arr: np.ndarray) -> int:
+    """Infer packed channel semantics from a SPAD array layout."""
+    if arr.ndim == 4 and arr.shape[-1] in (3, 4) and arr.shape[2] in PACKED_WIDTHS:
+        return int(arr.shape[-1])
+    return 4
+
+
 def is_packed_spad(arr: np.ndarray) -> bool:
     """True for `(T, H, Wpacked, 3)` synthetic or `(T, H, Wpacked, 4)` real RGGB planes."""
     return (
@@ -60,3 +67,28 @@ def packed_frames_to_raw_bayer(
     raw[:, 1::2, 0::2] = unpacked[:, :, :, g_ch]
     raw[:, 1::2, 1::2] = unpacked[:, :, :, b_ch]
     return raw
+
+
+def bayer_plane_to_rgb_u8(raw_hw: np.ndarray, *, packed_nch: int) -> np.ndarray:
+    """Map one full-resolution Bayer frame to RGB uint8 at half resolution.
+
+    - ``packed_nch=3`` (synthetic): direct RGGB plane subsample (no demosaic).
+    - ``packed_nch=4`` (real / true Bayer): OpenCV RG demosaic then resize if needed.
+    """
+    if raw_hw.ndim != 2:
+        raise ValueError(f"Expected Bayer frame (H,W), got shape={raw_hw.shape}")
+    raw_u8 = raw_hw if raw_hw.dtype == np.uint8 else np.clip(raw_hw, 0, 255).astype(np.uint8)
+    h, w = raw_u8.shape
+    if int(packed_nch) == 3:
+        r = raw_u8[0::2, 0::2]
+        g = (0.5 * (raw_u8[0::2, 1::2].astype(np.float32) + raw_u8[1::2, 0::2].astype(np.float32))).astype(np.uint8)
+        b = raw_u8[1::2, 1::2]
+        return np.stack((r, g, b), axis=2)
+
+    import cv2
+
+    rgb = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
+    target = (w // 2, h // 2)
+    if rgb.shape[1] != target[0] or rgb.shape[0] != target[1]:
+        rgb = cv2.resize(rgb, target, interpolation=cv2.INTER_AREA)
+    return rgb

@@ -38,7 +38,7 @@ import torch
 from tqdm import tqdm
 
 from ultralytics import YOLO
-from ultralytics.data.spad_packed import is_packed_spad, packed_frames_to_raw_bayer
+from ultralytics.data.spad_packed import bayer_plane_to_rgb_u8, infer_packed_nch, is_packed_spad, packed_frames_to_raw_bayer
 from ultralytics.engine.results import Results
 from ultralytics.trackers.track import TRACKER_MAP
 from ultralytics.utils import IterableSimpleNamespace, YAML, nms
@@ -156,18 +156,19 @@ class RawVideoSource:
 
     array: np.ndarray
     layout: str
+    packed_nch: int = 4
 
 
 def _video_sources_from_array(arr: np.ndarray) -> list[RawVideoSource]:
     """Describe supported layouts without materializing the full raw video."""
     if is_packed_spad(arr):
-        return [RawVideoSource(arr, "packed")]
+        return [RawVideoSource(arr, "packed", packed_nch=infer_packed_nch(arr))]
     if arr.ndim == 4 and arr.shape[-1] == 1:
-        return [RawVideoSource(arr, "thwc1")]
+        return [RawVideoSource(arr, "thwc1", packed_nch=4)]
     if arr.ndim == 3:
-        return [RawVideoSource(arr, "hwt" if _looks_like_hwt(arr) else "thw")]
+        return [RawVideoSource(arr, "hwt" if _looks_like_hwt(arr) else "thw", packed_nch=4)]
     if arr.ndim == 4:
-        return [RawVideoSource(arr[i], "hwt") for i in range(arr.shape[0])]
+        return [RawVideoSource(arr[i], "hwt", packed_nch=4) for i in range(arr.shape[0])]
     raise ValueError(f"Unsupported input shape: {arr.shape}")
 
 
@@ -290,15 +291,15 @@ def _ppb_demosaic_recon_frames_bgr(model) -> list[np.ndarray]:
     return frames_bgr
 
 
-def _raw_sum_bgr(raw_video: np.ndarray) -> np.ndarray:
-    """Sum raw over time, demosaic at full Bayer size, then downsample to model canvas."""
+def _raw_sum_bgr(raw_video: np.ndarray, *, packed_nch: int) -> np.ndarray:
+    """Sum raw over time, then map Bayer to RGB using packed channel semantics."""
     if raw_video.ndim != 4 or raw_video.shape[-1] != 1:
         raise ValueError(f"Expected raw chunk shape (T,H,W,1), got {raw_video.shape}")
+    t = max(int(raw_video.shape[0]), 1)
     raw_sum = raw_video[..., 0].astype(np.float32).sum(axis=0)
-    raw_u8 = np.clip((raw_sum / max(float(raw_video.shape[0]), 1.0)) * 255.0, 0, 255).astype(np.uint8)
-    rgb_1024 = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
-    rgb_512 = cv2.resize(rgb_1024, (raw_u8.shape[1] // 2, raw_u8.shape[0] // 2), interpolation=cv2.INTER_AREA)
-    return np.ascontiguousarray(rgb_512[:, :, ::-1])
+    raw_u8 = np.clip((raw_sum / float(t)) * 255.0, 0, 255).astype(np.uint8)
+    rgb = bayer_plane_to_rgb_u8(raw_u8, packed_nch=int(packed_nch))
+    return np.ascontiguousarray(rgb[:, :, ::-1])
 
 
 def _raw_sum_readrgb_like_bgr(raw_video: np.ndarray) -> np.ndarray:
@@ -466,6 +467,8 @@ def main():
                 if raw_chunk is None:
                     continue
 
+                qnn_model.qnn_packed_nch = int(source.packed_nch)
+
                 with torch.inference_mode():
                     video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
                     raw_preds = qnn_model(video_tensor)
@@ -490,7 +493,7 @@ def main():
 
                 bg_bgr = None
                 if args.vis_bg == "sum":
-                    bg_bgr = _raw_sum_bgr(raw_chunk)
+                    bg_bgr = _raw_sum_bgr(raw_chunk, packed_nch=source.packed_nch)
                 compare_bg_bgr = _raw_sum_readrgb_like_bgr(raw_chunk) if bool(args.save_readrgb_compare) else None
                 compare_ppbdm_frames = _ppb_demosaic_recon_frames_bgr(qnn_model) if bool(args.save_ppb_demosaic_compare) else []
 

@@ -239,6 +239,11 @@ class QNNPoseTrainer(PoseTrainer):
 
     def preprocess_batch(self, batch: dict) -> dict:
         """Move QNN video batches to device without applying image-style normalization."""
+        if "packed_nch" in batch:
+            packed_nch = int(batch["packed_nch"])
+            self.model.qnn_packed_nch = packed_nch
+            if getattr(self, "ema", None) is not None and getattr(self.ema, "ema", None) is not None:
+                self.ema.ema.qnn_packed_nch = packed_nch
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
