@@ -245,6 +245,11 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def _output_dir(save_root: Path, sample_name: str, video_idx: int) -> Path:
+    """Per-video output folder, e.g. ``sample/video00000``."""
+    return save_root / sample_name / f"video{video_idx:05d}"
+
+
 def main():
     ap = argparse.ArgumentParser(description="SPAD preprocess comparison before standard YOLO pose detection")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory, root directory, or .npy path")
@@ -258,14 +263,18 @@ def main():
     ap.add_argument("--det_thresh", type=float, default=0.4)
     ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort"])
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
+   # perpixelbayesian
     ap.add_argument("--ppb_gamma", type=float, default=5e-4)
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
+    # velintegrator
     ap.add_argument("--vel_max_shift", type=int, default=16)
+    ap.add_argument("--vel_patch_size", type=int, default=64, help="Local patch size for vel (0 = global)")
     ap.add_argument("--vel_downsample", type=int, default=4)
     ap.add_argument("--vel_quantile", type=float, default=1.0)
     ap.add_argument("--vel_normalize", action=argparse.BooleanOptionalAction, default=False)
+    # vis
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
     ap.add_argument("--vis_percentile", type=float, default=99.5)
     ap.add_argument("--vis_gamma", type=float, default=2.2)
@@ -303,6 +312,7 @@ def main():
     vel = VelIntegrator(
         chunk_size=int(args.chunk_size),
         max_shift=int(args.vel_max_shift),
+        patch_size=int(args.vel_patch_size),
         estimate_downsample=int(args.vel_downsample),
         normalize=bool(args.vel_normalize),
         quantile=float(args.vel_quantile),
@@ -321,7 +331,11 @@ def main():
             stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else int(args.chunk_size)
 
             first_chunk = True
+            cube_idx = 0
             frame_idx_by_pre = {name: 0 for name in preprocessors}
+            out_dir = _output_dir(save_root, sample_name, video_idx)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
             for t0 in range(0, n_bins, stride):
                 t1 = min(t0 + int(args.chunk_size), n_bins)
                 raw_chunk = _slice_raw(source, t0, t1, packed_ch_order=args.packed_ch_order)
@@ -350,16 +364,19 @@ def main():
                         device=args.device,
                     )
 
-                    out_dir = save_root / sample_name / name
-                    out_dir.mkdir(parents=True, exist_ok=True)
                     for frame_bgr, result in zip(frames_bgr, results):
-                        recon_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{frame_idx_by_pre[name]:07d}_recon.png"
-                        overlay_path = out_dir / f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{frame_idx_by_pre[name]:07d}_overlay.png"
+                        stem = (
+                            f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}"
+                            f"_frame{frame_idx_by_pre[name]:07d}_{name}"
+                        )
+                        recon_path = out_dir / f"{stem}_recon.png"
+                        overlay_path = out_dir / f"{stem}_overlay.png"
                         cv2.imwrite(str(recon_path), frame_bgr)
                         cv2.imwrite(str(overlay_path), _draw_results(frame_bgr, result))
                         frame_idx_by_pre[name] += 1
 
                 first_chunk = False
+                cube_idx += 1
 
 
 if __name__ == "__main__":
