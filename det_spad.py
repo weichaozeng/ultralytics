@@ -5,7 +5,7 @@ This script does not use QNNPoseModel. It converts SPAD chunks into RGB-like
 frames with one of:
 - sum: temporal mean over the chunk
 - ppb: PerPixelBayesian reconstruction
-- vel: velocity-compensated integration
+- vel: detection-guided velocity-compensated integration
 
 The resulting frames are passed to an unmodified pretrained YOLO pose model.
 """
@@ -201,6 +201,19 @@ def _preprocess_vel(raw_chunk: np.ndarray, *, packed_nch: int, device: torch.dev
     return _raw_hwt_to_rgb_float(recons, packed_nch=packed_nch)
 
 
+def _extract_track_centers(result) -> tuple[np.ndarray, np.ndarray]:
+    """Return track IDs and box centers (x, y) in detection image coordinates."""
+    if result.boxes is None or len(result.boxes) == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros((0, 2), dtype=np.float32)
+    track_ids = result.boxes.id
+    if track_ids is None:
+        track_ids = torch.arange(len(result.boxes), device=result.boxes.data.device)
+    ids = track_ids.detach().cpu().numpy().astype(np.int64).reshape(-1)
+    boxes = result.boxes.xyxy.detach().cpu().numpy()
+    centers = np.stack([(boxes[:, 0] + boxes[:, 2]) * 0.5, (boxes[:, 1] + boxes[:, 3]) * 0.5], axis=1).astype(np.float32)
+    return ids, centers
+
+
 def _run_detector_on_frames(model: YOLO, frames_bgr: list[np.ndarray], *, conf: float, tracker_cfg: str, device: str):
     kwargs = {"conf": conf, "persist": True, "tracker": tracker_cfg, "verbose": False}
     if device:
@@ -270,8 +283,7 @@ def main():
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
     # velintegrator
     ap.add_argument("--vel_max_shift", type=int, default=16)
-    ap.add_argument("--vel_patch_size", type=int, default=64, help="Local patch size for vel (0 = global)")
-    ap.add_argument("--vel_downsample", type=int, default=4)
+    ap.add_argument("--vel_patch_size", type=int, default=0, help="Per-patch vel from tracks in patch (0 = global median)")
     ap.add_argument("--vel_quantile", type=float, default=1.0)
     ap.add_argument("--vel_normalize", action=argparse.BooleanOptionalAction, default=False)
     # vis
@@ -313,7 +325,6 @@ def main():
         chunk_size=int(args.chunk_size),
         max_shift=int(args.vel_max_shift),
         patch_size=int(args.vel_patch_size),
-        estimate_downsample=int(args.vel_downsample),
         normalize=bool(args.vel_normalize),
         quantile=float(args.vel_quantile),
     ).to(device)
@@ -329,6 +340,10 @@ def main():
         for video_idx, source in enumerate(tqdm(sources, desc=f"Processing [{sample_name}]")):
             n_bins = _num_bins(source)
             stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else int(args.chunk_size)
+
+            if "vel" in preprocessors:
+                vel.reset()
+                _reset_tracker(models["vel"])
 
             first_chunk = True
             cube_idx = 0
@@ -364,6 +379,7 @@ def main():
                         device=args.device,
                     )
 
+                    raw_hw = (int(raw_chunk.shape[1]), int(raw_chunk.shape[2]))
                     for frame_bgr, result in zip(frames_bgr, results):
                         stem = (
                             f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}"
@@ -374,6 +390,14 @@ def main():
                         cv2.imwrite(str(recon_path), frame_bgr)
                         cv2.imwrite(str(overlay_path), _draw_results(frame_bgr, result))
                         frame_idx_by_pre[name] += 1
+                        if name == "vel":
+                            track_ids, centers = _extract_track_centers(result)
+                            vel.push_detection(
+                                track_ids,
+                                centers,
+                                det_hw=frame_bgr.shape[:2],
+                                raw_hw=raw_hw,
+                            )
 
                 first_chunk = False
                 cube_idx += 1
