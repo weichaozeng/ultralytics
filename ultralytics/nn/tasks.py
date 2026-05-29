@@ -742,7 +742,7 @@ class QNNPoseModel(PoseModel):
 
             if t_index_ll is None:
                 subsampling = int(getattr(self.integrator, "subsampling", 1) or 1)
-                t_index_ll = list(range(subsampling, subsampling * (frames.shape[0] + 1), subsampling))
+                t_index_ll = self._qnn_recon_t_indices(int(photon_cube.shape[2]), subsampling, int(frames.shape[0]))
 
         frame_counts = {frames.shape[0] for frames in frame_ll}
         if len(frame_counts) != 1:
@@ -756,12 +756,29 @@ class QNNPoseModel(PoseModel):
         return frames_t_b_c_h_w, self.qnn_t_index_ll
 
     @staticmethod
+    def _qnn_recon_t_indices(t_raw: int, subsampling: int, num_frames: int) -> list[int]:
+        """Map each reconstructed frame to its ending raw-bin index within the chunk."""
+        if num_frames <= 0 or t_raw <= 0:
+            return []
+        subsampling = max(int(subsampling), 1)
+        t_raw = int(t_raw)
+        if t_raw < subsampling:
+            return [t_raw][:num_frames]
+        full = t_raw // subsampling
+        idx = [(i + 1) * subsampling for i in range(full)]
+        if t_raw % subsampling != 0:
+            idx.append(t_raw)
+        return idx[:num_frames]
+
+    @staticmethod
     def _qnn_raw_recons_to_rgb_frames(raw_hwt):
         """Convert PPB raw Bayer Hraw,Wraw,T to T,3,H/2,W/2 via demosaic(1024)->resize(512)."""
         if not torch.is_tensor(raw_hwt) or raw_hwt.ndim != 3:
             raise ValueError(f"Expected raw_hwt tensor with shape (Hraw,Wraw,T), got {type(raw_hwt)}")
 
         h_raw, w_raw, t = map(int, raw_hwt.shape)
+        if t <= 0:
+            return torch.zeros((0, 3, h_raw // 2, w_raw // 2), dtype=torch.float32, device=raw_hwt.device)
         if h_raw % 2 != 0 or w_raw % 2 != 0:
             raise ValueError(f"Raw reconstruction must have even H/W, got {(h_raw, w_raw)}")
 

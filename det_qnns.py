@@ -209,18 +209,34 @@ def _slice_raw_chunk(source: RawVideoSource, t0: int, t1: int, *, packed_ch_orde
     raise ValueError(f"Unsupported source layout: {source.layout}")
 
 
-def _maybe_zero_pad_raw_chunk(raw_chunk: np.ndarray, target_t: int, *, enabled: bool) -> np.ndarray:
-    """Optionally tail-pad the final chunk by repeating its last frame."""
-    if not enabled or raw_chunk.shape[0] >= target_t:
-        return raw_chunk
-    pad_t = int(target_t) - int(raw_chunk.shape[0])
-    if pad_t <= 0:
+def _pad_raw_chunk_repeat_last(raw_chunk: np.ndarray, target_t: int) -> np.ndarray:
+    """Pad a raw chunk to ``target_t`` by repeating its last frame."""
+    if raw_chunk.shape[0] >= target_t:
         return raw_chunk
     if raw_chunk.shape[0] == 0:
         return raw_chunk
+    pad_t = int(target_t) - int(raw_chunk.shape[0])
     last = raw_chunk[-1:, :, :, :]
     pad = np.repeat(last, pad_t, axis=0)
     return np.ascontiguousarray(np.concatenate((raw_chunk, pad), axis=0))
+
+
+def _prepare_raw_chunk_for_qnn(
+    raw_chunk: np.ndarray,
+    *,
+    chunk_t: int,
+    tail_pad_full: bool,
+) -> np.ndarray | None:
+    """Prepare one raw chunk for QNN inference.
+
+    - ``tail_pad_full=True``: pad short tail chunks up to ``chunk_t``.
+    - ``tail_pad_full=False``: keep the natural tail length (PPB handles T < subsampling).
+    """
+    if raw_chunk.shape[0] == 0:
+        return None
+    if tail_pad_full and raw_chunk.shape[0] < chunk_t:
+        raw_chunk = _pad_raw_chunk_repeat_last(raw_chunk, chunk_t)
+    return raw_chunk
 
 
 def _cfg_get(cfg: Any, key: str, default=None):
@@ -345,7 +361,7 @@ def main():
     ap.add_argument("--iou", type=float, default=0.7)
     ap.add_argument("--max_det", type=int, default=20)
     ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort"])
-    ap.add_argument("--frame_rate", type=int, default=30, help="Tracker frame-rate hint")
+    ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
 
     # Raw clip chunking
@@ -360,7 +376,7 @@ def main():
         "--tail_pad",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Pad final short chunk by repeating its last frame; with --no-tail_pad, run the short tail chunk as-is.",
+        help="Pad final short chunk to cube_chunk_t; with --no-tail_pad, run short tails at natural length.",
     )
     ap.add_argument("--vis_bg", type=str, default="recon", choices=["sum", "recon"], help="Visualization background")
     ap.add_argument(
@@ -442,8 +458,12 @@ def main():
             for t0 in range(0, T, stride):
                 t1 = min(T, t0 + chunk_t)
                 raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
-                raw_chunk = _maybe_zero_pad_raw_chunk(raw_chunk, chunk_t, enabled=bool(args.tail_pad))
-                if raw_chunk.shape[0] == 0:
+                raw_chunk = _prepare_raw_chunk_for_qnn(
+                    raw_chunk,
+                    chunk_t=chunk_t,
+                    tail_pad_full=bool(args.tail_pad),
+                )
+                if raw_chunk is None:
                     continue
 
                 with torch.inference_mode():

@@ -72,9 +72,14 @@ class PerPixelBayesian(nn.Module):
 
         if (_h, _w, _t) != (self._h, self._w, self._t):
             self._t = _t
-            self.recons_tensor = torch.zeros(
-                (_h, _w, self._t // self.subsampling), device=device, dtype=dtype
-            )
+            if self._t <= 0:
+                out_t = 0
+            elif self._t < self.subsampling:
+                # Short tail cubes still emit one reconstruction at the final EMA state.
+                out_t = 1
+            else:
+                out_t = self._t // self.subsampling
+            self.recons_tensor = torch.zeros((_h, _w, out_t), device=device, dtype=dtype)
 
         if (_h, _w) != (self._h, self._w):
             self._h, self._w = _h, _w
@@ -161,6 +166,9 @@ class PerPixelBayesian(nn.Module):
             if (t_index + 1) % self.subsampling == 0:
                 self.recons_tensor[..., t_index // self.subsampling] = self.ema
 
+        if self._t > 0 and self._t < self.subsampling:
+            self.recons_tensor[..., 0] = self.ema
+
     def _update_forecaster_and_laplace_torch(self, reward: Tensor, t_index: int):
         """Performs a vectorized update of the BOCPD state for all pixels."""
         reward = reward.unsqueeze(-1)
@@ -205,6 +213,8 @@ class PerPixelBayesian(nn.Module):
 
     def clamp_recons(self, recons: Tensor) -> Tensor:
         """Clamps and optionally normalizes the reconstruction."""
+        if recons.numel() == 0:
+            return recons
         max_value = 1.0
         if self.normalize:
             max_value = torch_quantile(recons, self.quantile).clamp(min=1e-6)
