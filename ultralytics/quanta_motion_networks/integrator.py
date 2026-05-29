@@ -26,6 +26,12 @@ class VelIntegrator(nn.Module):
     displacement (global) or per-patch median among tracks inside each patch is
     used. The first two chunks use zero velocity.
 
+    Shifting the interleaved Bayer ``raw`` plane directly swaps R/G/B sites and
+    causes color fringing after averaging. Default ``compensate_space='rgb'``
+    demosaics each time slice first, shifts R/G/B jointly at half resolution, then
+    averages (returns ``(3, H/2, W/2)``). Use ``compensate_space='raw'`` only for
+    comparison.
+
     Call :meth:`push_detection` after running the detector on each integrated frame
     before processing the next chunk.
     """
@@ -35,6 +41,7 @@ class VelIntegrator(nn.Module):
         chunk_size: int = 320,
         max_shift: int = 16,
         patch_size: int = 0,
+        compensate_space: str = "rgb",
         normalize: bool = False,
         quantile: float = 1.0,
     ):
@@ -42,8 +49,12 @@ class VelIntegrator(nn.Module):
         self.chunk_size = int(chunk_size)
         self.max_shift = int(max_shift)
         self.patch_size = int(patch_size)
+        self.compensate_space = str(compensate_space).lower()
+        if self.compensate_space not in {"rgb", "raw"}:
+            raise ValueError(f"compensate_space must be 'rgb' or 'raw', got {compensate_space!r}")
         self.normalize = bool(normalize)
         self.quantile = float(quantile)
+        self.outputs_rgb: bool = self.compensate_space == "rgb"
 
         self.prev_det_2: _DetSnapshot | None = None
         self.prev_det_1: _DetSnapshot | None = None
@@ -133,6 +144,32 @@ class VelIntegrator(nn.Module):
         vx = int(np.clip(round(dx), -ms, ms))
         vy = int(np.clip(round(dy), -ms, ms))
         return vx, vy
+
+    @staticmethod
+    def _raw_shift_to_rgb(vx: int, vy: int) -> tuple[int, int]:
+        """Map a displacement estimated in full-resolution raw coords to RGB grid."""
+        return int(round(vx / 2.0)), int(round(vy / 2.0))
+
+    @staticmethod
+    def _photon_cube_to_rgb_tchw(cube: Tensor, packed_nch: int) -> Tensor:
+        """Convert ``(H, W, T)`` raw/bayer cube to ``(T, 3, H/2, W/2)`` float RGB."""
+        h_raw, w_raw, t = map(int, cube.shape)
+        if int(packed_nch) == 3:
+            r = cube[0::2, 0::2, :]
+            g = 0.5 * (cube[0::2, 1::2, :] + cube[1::2, 0::2, :])
+            b = cube[1::2, 1::2, :]
+            return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
+
+        import cv2
+
+        frames = []
+        raw_np = cube.detach().float().cpu().numpy()
+        for ti in range(t):
+            raw_u8 = np.clip(raw_np[:, :, ti] * 255.0, 0, 255).astype(np.uint8)
+            rgb = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
+            rgb = cv2.resize(rgb, (w_raw // 2, h_raw // 2), interpolation=cv2.INTER_AREA)
+            frames.append(torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0)
+        return torch.stack(frames, dim=0).to(device=cube.device)
 
     def _aggregate_displacement(self, disps: np.ndarray) -> tuple[int, int]:
         if disps.size == 0:
@@ -259,6 +296,43 @@ class VelIntegrator(nn.Module):
 
         return accum / float(t)
 
+    def _integrate_global_rgb(self, rgb_tchw: Tensor, vx: int, vy: int) -> Tensor:
+        """Shift all RGB channels jointly; ``vx,vy`` are in raw coords."""
+        vx_r, vy_r = self._raw_shift_to_rgb(vx, vy)
+        t = int(rgb_tchw.shape[0])
+        accum = torch.zeros_like(rgb_tchw[0])
+        denom = max(t - 1, 1)
+        for ti in range(t):
+            alpha = (t - 1 - ti) / denom
+            dx = int(round(alpha * vx_r))
+            dy = int(round(alpha * vy_r))
+            for ch in range(3):
+                accum[ch] += self._shift2d(rgb_tchw[ti, ch], dx, dy)
+        return accum / float(t)
+
+    def _integrate_local_rgb(self, rgb_tchw: Tensor, vx_grid: Tensor, vy_grid: Tensor) -> Tensor:
+        h, w = int(rgb_tchw.shape[2]), int(rgb_tchw.shape[3])
+        ps = max(int(self.patch_size) // 2, 1)
+        t = int(rgb_tchw.shape[0])
+        nh, nw = vx_grid.shape
+        accum = torch.zeros(3, h, w, device=rgb_tchw.device, dtype=rgb_tchw.dtype)
+        denom = max(t - 1, 1)
+        vx_flat = (vx_grid.reshape(-1).float() / 2.0).round().long()
+        vy_flat = (vy_grid.reshape(-1).float() / 2.0).round().long()
+
+        for ti in range(t):
+            alpha = (t - 1 - ti) / denom
+            for ch in range(3):
+                frame = rgb_tchw[ti, ch]
+                padded = self._pad_to_multiple(frame, ps)
+                patches, _, _ = self._image_to_patches(padded, ps)
+                dx = (alpha * vx_flat.float()).round().long()
+                dy = (alpha * vy_flat.float()).round().long()
+                shifted = self._shift2d_batch_multi(patches, dx, dy)
+                accum[ch] += self._patches_to_image(shifted, nh, nw, ps, h, w)
+
+        return accum / float(t)
+
     def _clamp_recons(self, recons: Tensor) -> Tensor:
         if recons.numel() == 0:
             return recons
@@ -281,6 +355,12 @@ class VelIntegrator(nn.Module):
             self.normalize = bool(kwargs["normalize"])
         if "quantile" in kwargs and kwargs["quantile"] is not None:
             self.quantile = float(kwargs["quantile"])
+        if "compensate_space" in kwargs and kwargs["compensate_space"] is not None:
+            space = str(kwargs["compensate_space"]).lower()
+            if space not in {"rgb", "raw"}:
+                raise ValueError(f"compensate_space must be 'rgb' or 'raw', got {space!r}")
+            self.compensate_space = space
+            self.outputs_rgb = space == "rgb"
 
         cube = photon_cube.float()
         h, w = int(cube.shape[0]), int(cube.shape[1])
@@ -290,13 +370,25 @@ class VelIntegrator(nn.Module):
             self.last_velocity_vx = vx_grid
             self.last_velocity_vy = vy_grid
             self.last_velocity = (int(vx_grid.float().mean().item()), int(vy_grid.float().mean().item()))
-            integrated = self._integrate_local(cube, vx_grid, vy_grid)
+            if self.compensate_space == "rgb":
+                packed_nch = int(kwargs.get("packed_nch", 4))
+                rgb_tchw = self._photon_cube_to_rgb_tchw(cube, packed_nch)
+                integrated = self._integrate_local_rgb(rgb_tchw, vx_grid, vy_grid)
+            else:
+                integrated = self._integrate_local(cube, vx_grid, vy_grid)
         else:
             vx, vy = self._estimate_velocity_global()
             self.last_velocity = (vx, vy)
             self.last_velocity_vx = None
             self.last_velocity_vy = None
-            integrated = self._integrate_global(cube, vx, vy)
+            if self.compensate_space == "rgb":
+                packed_nch = int(kwargs.get("packed_nch", 4))
+                rgb_tchw = self._photon_cube_to_rgb_tchw(cube, packed_nch)
+                integrated = self._integrate_global_rgb(rgb_tchw, vx, vy)
+            else:
+                integrated = self._integrate_global(cube, vx, vy)
 
         integrated = self._clamp_recons(integrated)
+        if self.compensate_space == "rgb":
+            return integrated
         return integrated[..., None]

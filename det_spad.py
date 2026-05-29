@@ -197,7 +197,9 @@ def _preprocess_ppb(raw_chunk: np.ndarray, *, packed_nch: int, device: torch.dev
 
 def _preprocess_vel(raw_chunk: np.ndarray, *, packed_nch: int, device: torch.device, integrator: VelIntegrator, clear_states: bool, **kwargs) -> torch.Tensor:
     raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
-    recons = integrator.process_photon_cube(raw, clear_states=clear_states)
+    recons = integrator.process_photon_cube(raw, clear_states=clear_states, packed_nch=packed_nch)
+    if integrator.outputs_rgb:
+        return recons.unsqueeze(0)
     return _raw_hwt_to_rgb_float(recons, packed_nch=packed_nch)
 
 
@@ -284,6 +286,7 @@ def main():
     # velintegrator
     ap.add_argument("--vel_max_shift", type=int, default=16)
     ap.add_argument("--vel_patch_size", type=int, default=0, help="Per-patch vel from tracks in patch (0 = global median)")
+    ap.add_argument("--vel_compensate", type=str, default="rgb", choices=["rgb", "raw"], help="Shift in RGB (avoids Bayer color fringing) or raw")
     ap.add_argument("--vel_quantile", type=float, default=1.0)
     ap.add_argument("--vel_normalize", action=argparse.BooleanOptionalAction, default=False)
     # vis
@@ -325,6 +328,7 @@ def main():
         chunk_size=int(args.chunk_size),
         max_shift=int(args.vel_max_shift),
         patch_size=int(args.vel_patch_size),
+        compensate_space=str(args.vel_compensate),
         normalize=bool(args.vel_normalize),
         quantile=float(args.vel_quantile),
     ).to(device)
