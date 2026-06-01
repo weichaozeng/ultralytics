@@ -203,41 +203,142 @@ def _make_eval_callback(args, *, baseline: bool = False):
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Train QNNPoseModel on VisionSIM SPAD data")
-    ap.add_argument("--ckpt", type=str, required=True)
-    ap.add_argument("--gt-root", type=str, required=True)
-    ap.add_argument("--spad-root", type=str, required=True)
-    ap.add_argument("--project", type=str, default="runs/qnn_pose")
-    ap.add_argument("--name", type=str, default="debug")
-    ap.add_argument("--device", type=str, default="0")
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--batch", type=int, default=1)
-    ap.add_argument("--workers", type=int, default=0)
-    ap.add_argument("--imgsz", type=int, default=512)
-    ap.add_argument("--lr0", type=float, default=1e-3)
-    ap.add_argument("--weight-decay", type=float, default=5e-4)
-    ap.add_argument("--amp", action="store_true")
-    ap.add_argument("--val", action="store_true", help="Also run the built-in Ultralytics validator (experimental for QNN batches)")
-    ap.add_argument("--test-keywords", type=str, default="attic")
-    ap.add_argument("--qnn-output-frames", type=int, default=1)
-    ap.add_argument("--qnn-stride-frames", type=int, default=0)
-    ap.add_argument("--qnn-spad-per-gt", type=int, default=64)
-    ap.add_argument("--qnn-subsampling", type=int, default=64)
-    ap.add_argument("--qnn-bocpd-gamma", type=float, default=5e-4)
-    ap.add_argument("--qnn-quantile", type=float, default=1.0)
-    ap.add_argument("--qnn-min-filter-size", type=int, default=7)
-    ap.add_argument("--qnn-ssd-after-layers", type=str, default=None)
-    ap.add_argument("--qnn-ssd-state-dim", type=int, default=8)
-    ap.add_argument("--qnn-ssd-head-divisor", type=int, default=4)
-    ap.add_argument("--qnn-freeze-detector", action="store_true", default=True)
-    ap.add_argument("--viz-period", type=int, default=1)
+    ap = argparse.ArgumentParser(
+        description="Train QNNPoseModel on VisionSIM SPAD data",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("--ckpt", type=str, required=True, help="Path to pretrained YOLO pose checkpoint (.pt)")
+    ap.add_argument(
+        "--gt-root",
+        type=str,
+        required=True,
+        help="VisionSIM GT root; each video subdir must contain hand_ann.json",
+    )
+    ap.add_argument(
+        "--spad-root",
+        type=str,
+        required=True,
+        help="VisionSIM packed SPAD root; each video subdir must contain frames.npy",
+    )
+    ap.add_argument("--project", type=str, default="runs/qnn_pose", help="Ultralytics project directory for runs")
+    ap.add_argument("--name", type=str, default="debug", help="Run name under --project")
+    ap.add_argument("--device", type=str, default="0", help="CUDA device id(s), e.g. 0 or 0,1; use cpu for CPU")
+    ap.add_argument("--epochs", type=int, default=30, help="Training epochs")
+    ap.add_argument("--batch", type=int, default=1, help="Batch size; keep at 1 while debugging large SPAD windows")
+    ap.add_argument("--workers", type=int, default=0, help="DataLoader worker processes")
+    ap.add_argument("--imgsz", type=int, default=512, help="Square image size for normalized bbox/keypoint labels")
+    ap.add_argument("--lr0", type=float, default=1e-3, help="Initial learning rate")
+    ap.add_argument("--weight-decay", type=float, default=5e-4, help="Optimizer weight decay")
+    ap.add_argument("--amp", action="store_true", help="Enable automatic mixed precision training")
+    ap.add_argument(
+        "--val",
+        action="store_true",
+        help="Also run the built-in Ultralytics validator (experimental for QNN batches)",
+    )
+    ap.add_argument(
+        "--test-keywords",
+        type=str,
+        default="white-room",
+        help="Comma-separated substrings; matching video names go to val/test split",
+    )
+    ap.add_argument(
+        "--qnn-output-frames",
+        type=int,
+        default=1,
+        help=(
+            "Reconstructed output frames (and pose labels) per training window. "
+            "Each frame needs raw SPAD bins; use 1 or 4 for smoke tests before scaling up."
+        ),
+    )
+    ap.add_argument(
+        "--qnn-stride-frames",
+        type=int,
+        default=64,
+        help=(
+            "Sliding-window stride in GT frame units when enumerating training windows. "
+            "0 falls back to --qnn-output-frames."
+        ),
+    )
+    ap.add_argument(
+        "--qnn-spad-per-gt",
+        type=int,
+        default=64,
+        help=(
+            "Raw SPAD time bins per one GT annotation frame. "
+            "Controls GT/SPAD temporal alignment (spad_start = gt_start * this value)."
+            "8,000 / 125 = 64"
+        ),
+    )
+    ap.add_argument(
+        "--qnn-subsampling",
+        type=int,
+        default=320,
+        help=(
+            "Shared temporal downsampling factor: (1) PerPixelBayesian raw-bin aggregation per "
+            "reconstructed frame; (2) SPAD bins between consecutive output-frame labels "
+            "(spad_len = output_frames * subsampling + 1)."
+        ),
+    )
+    ap.add_argument(
+        "--qnn-bocpd-gamma",
+        type=float,
+        default=5e-4,
+        help="PerPixelBayesian BOCPD hazard rate; higher values adapt faster to photon-rate changes",
+    )
+    ap.add_argument(
+        "--qnn-quantile",
+        type=float,
+        default=1.0,
+        help="PPB normalization upper quantile (1.0 = use max; lower values suppress hot pixels)",
+    )
+    ap.add_argument(
+        "--qnn-min-filter-size",
+        type=int,
+        default=8,
+        help="Odd kernel size for min-filter smoothing of per-pixel runlength estimates in PPB",
+    )
+    ap.add_argument(
+        "--qnn-ssd-after-layers",
+        type=str,
+        default=None,
+        help="Comma-separated YOLO layer indices after which SSD blocks are inserted (default: 0,2,4,6)",
+    )
+    ap.add_argument(
+        "--qnn-ssd-state-dim",
+        type=int,
+        default=8,
+        help="Hidden state dimension of each SSD (semi-separable dynamics) temporal block",
+    )
+    ap.add_argument(
+        "--qnn-ssd-head-divisor",
+        type=int,
+        default=4,
+        help="SSD head_dim = YOLO feature channels // this divisor (must divide channels evenly)",
+    )
+    ap.add_argument(
+        "--qnn-freeze-detector",
+        action="store_true",
+        default=True,
+        help="Freeze pretrained YOLO detector layers; only QNN modules (PPB + SSD) are trained",
+    )
+    ap.add_argument(
+        "--viz-period",
+        type=int,
+        default=5,
+        help="Run QNN eval visualization every N epochs (0 disables periodic viz; epoch 0 baseline always runs)",
+    )
     ap.add_argument("--eval-max-batches", type=int, default=-1, help="-1 evaluates the full test split")
     ap.add_argument("--eval-seed", type=int, default=0, help="Seed for random eval batch selection")
     ap.add_argument("--viz-batches", type=int, default=1, help="Number of eval batches to visualize")
-    ap.add_argument("--viz-frames", type=int, default=4)
-    ap.add_argument("--viz-conf", type=float, default=0.25)
-    ap.add_argument("--viz-iou", type=float, default=0.7)
-    ap.add_argument("--viz-max-det", type=int, default=20)
+    ap.add_argument(
+        "--viz-frames",
+        type=int,
+        default=4,
+        help="Max reconstructed frames to save per visualized batch (recon + overlay PNGs)",
+    )
+    ap.add_argument("--viz-conf", type=float, default=0.4, help="Confidence threshold for viz NMS/predictions")
+    ap.add_argument("--viz-iou", type=float, default=0.7, help="IoU threshold for viz NMS")
+    ap.add_argument("--viz-max-det", type=int, default=20, help="Max detections per frame in viz NMS")
     return ap.parse_args()
 
 
