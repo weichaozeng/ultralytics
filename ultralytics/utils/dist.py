@@ -25,6 +25,34 @@ def find_free_network_port() -> int:
         return s.getsockname()[1]  # port
 
 
+def _ddp_ultralytics_roots() -> list[str]:
+    """Return sys.path entries that expose a local ``ultralytics`` package."""
+    roots: list[str] = []
+    seen: set[str] = set()
+    for entry in sys.path:
+        if not entry:
+            continue
+        root = os.path.abspath(entry)
+        if root in seen:
+            continue
+        if os.path.isdir(os.path.join(root, "ultralytics")):
+            roots.append(root)
+            seen.add(root)
+    return roots
+
+
+def _prepend_pythonpath(paths: list[str]) -> None:
+    """Ensure local repo roots are visible to DDP child processes."""
+    if not paths:
+        return
+    existing = os.environ.get("PYTHONPATH", "")
+    parts = [p for p in existing.split(os.pathsep) if p]
+    for path in reversed(paths):
+        if path not in parts:
+            parts.insert(0, path)
+    os.environ["PYTHONPATH"] = os.pathsep.join(parts)
+
+
 def generate_ddp_file(trainer):
     """Generate a DDP (Distributed Data Parallel) file for multi-GPU training.
 
@@ -46,9 +74,19 @@ def generate_ddp_file(trainer):
         - Training initialization code
     """
     module, name = f"{trainer.__class__.__module__}.{trainer.__class__.__name__}".rsplit(".", 1)
+    sys_paths = _ddp_ultralytics_roots()
+    path_setup = ""
+    if sys_paths:
+        path_setup = f"""
+import sys
+for _p in {sys_paths!r}:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+"""
 
     content = f"""
 # Ultralytics Multi-GPU training temp file (should be automatically deleted after use)
+{path_setup}
 overrides = {vars(trainer.args)}
 
 if __name__ == "__main__":
@@ -88,6 +126,7 @@ def generate_ddp_command(trainer):
 
     if not trainer.resume:
         shutil.rmtree(trainer.save_dir)  # remove the save_dir
+    _prepend_pythonpath(_ddp_ultralytics_roots())
     file = generate_ddp_file(trainer)
     dist_cmd = "torch.distributed.run" if TORCH_1_9 else "torch.distributed.launch"
     port = find_free_network_port()

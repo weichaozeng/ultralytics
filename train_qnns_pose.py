@@ -7,8 +7,14 @@ Start small. A raw SPAD window is large after unpacking, so debug with
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
 from typing import Any
+
+_REPO_ROOT = Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import cv2
 import numpy as np
@@ -222,9 +228,19 @@ def parse_args():
     )
     ap.add_argument("--project", type=str, default="runs/qnn_pose", help="Ultralytics project directory for runs")
     ap.add_argument("--name", type=str, default="debug", help="Run name under --project")
-    ap.add_argument("--device", type=str, default="0", help="CUDA device id(s), e.g. 0 or 0,1; use cpu for CPU")
+    ap.add_argument(
+        "--device",
+        type=str,
+        default="0",
+        help="CUDA device id(s), e.g. 0 or 0,1; multi-GPU uses DDP and requires --batch >= number of GPUs",
+    )
     ap.add_argument("--epochs", type=int, default=30, help="Training epochs")
-    ap.add_argument("--batch", type=int, default=1, help="Batch size; keep at 1 while debugging large SPAD windows")
+    ap.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="Global batch size (split across GPUs under DDP); use >=2 with --device 0,1",
+    )
     ap.add_argument("--workers", type=int, default=0, help="DataLoader worker processes")
     ap.add_argument("--imgsz", type=int, default=512, help="Square image size for normalized bbox/keypoint labels")
     ap.add_argument("--lr0", type=float, default=1e-3, help="Initial learning rate")
@@ -294,7 +310,7 @@ def parse_args():
     ap.add_argument(
         "--qnn-min-filter-size",
         type=int,
-        default=8,
+        default=7,
         help="Odd kernel size for min-filter smoothing of per-pixel runlength estimates in PPB",
     )
     ap.add_argument(
@@ -339,11 +355,37 @@ def parse_args():
     ap.add_argument("--viz-conf", type=float, default=0.4, help="Confidence threshold for viz NMS/predictions")
     ap.add_argument("--viz-iou", type=float, default=0.7, help="IoU threshold for viz NMS")
     ap.add_argument("--viz-max-det", type=int, default=20, help="Max detections per frame in viz NMS")
-    return ap.parse_args()
+    args = ap.parse_args()
+    _validate_args(ap, args)
+    return args
+
+
+def _validate_args(ap: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    device = str(args.device).strip().lower()
+    if device not in {"cpu", "mps"} and "," in device:
+        n_gpus = len([x for x in device.split(",") if x.strip()])
+        if args.batch < n_gpus:
+            ap.error(
+                f"--batch {args.batch} is too small for {n_gpus} GPUs. "
+                f"Ultralytics DDP splits global batch across GPUs (per_gpu = batch // n_gpus). "
+                f"Use --batch >= {n_gpus}, e.g. --batch {n_gpus} for one sample per GPU."
+            )
+    if args.qnn_min_filter_size % 2 == 0:
+        ap.error(f"--qnn-min-filter-size must be odd, got {args.qnn_min_filter_size}")
+
+
+def _ensure_ddp_pythonpath() -> None:
+    """Make the local ultralytics repo importable in Ultralytics DDP subprocesses."""
+    repo_root = str(_REPO_ROOT)
+    existing = os.environ.get("PYTHONPATH", "")
+    parts = [p for p in existing.split(os.pathsep) if p]
+    if repo_root not in parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([repo_root, *parts]) if parts else repo_root
 
 
 def main():
     args = parse_args()
+    _ensure_ddp_pythonpath()
     cfg = dict(DEFAULT_CFG_DICT)
     cfg.update(
         {
