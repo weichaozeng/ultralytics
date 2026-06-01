@@ -226,7 +226,7 @@ def parse_args():
         required=True,
         help="VisionSIM packed SPAD root; each video subdir must contain frames.npy",
     )
-    ap.add_argument("--project", type=str, default="runs/qnn_pose", help="Ultralytics project directory for runs")
+    ap.add_argument("--project", type=str, default="Runs/qnn_pose", help="Ultralytics project directory for runs")
     ap.add_argument("--name", type=str, default="debug", help="Run name under --project")
     ap.add_argument(
         "--device",
@@ -260,7 +260,7 @@ def parse_args():
     ap.add_argument(
         "--qnn-output-frames",
         type=int,
-        default=1,
+        default=10,
         help=(
             "Reconstructed output frames (and pose labels) per training window. "
             "Each frame needs raw SPAD bins; use 1 or 4 for smoke tests before scaling up."
@@ -349,7 +349,7 @@ def parse_args():
     ap.add_argument(
         "--viz-frames",
         type=int,
-        default=4,
+        default=10,
         help="Max reconstructed frames to save per visualized batch (recon + overlay PNGs)",
     )
     ap.add_argument("--viz-conf", type=float, default=0.4, help="Confidence threshold for viz NMS/predictions")
