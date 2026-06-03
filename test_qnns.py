@@ -118,6 +118,7 @@ def _frame_record_from_result(
     chunk_start: int,
     chunk_end: int,
     output_frame_idx: int,
+    source_bin: int,
 ) -> dict[str, Any]:
     image_shape = None
     if getattr(result, "orig_img", None) is not None:
@@ -131,6 +132,8 @@ def _frame_record_from_result(
         "chunk_start_bin": int(chunk_start),
         "chunk_end_bin": int(chunk_end),
         "output_frame_idx": int(output_frame_idx),
+        "source_bin": int(source_bin),
+        "source_time_index": float(source_bin),
         "image_shape": image_shape,
         "detections": _detections_from_result(result, names),
     }
@@ -166,6 +169,11 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Pad final short chunk to cube_chunk_t; with --no-tail_pad, run short tails at natural length.",
+    )
+    ap.add_argument(
+        "--drop_tail",
+        action="store_true",
+        help="Drop the final chunk when it has fewer than cube_chunk_t bins.",
     )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing JSON files")
     return ap.parse_args()
@@ -224,6 +232,7 @@ def main():
                 "frame_rate": int(args.frame_rate),
                 "packed_ch_order": args.packed_ch_order,
                 "tail_pad": bool(args.tail_pad),
+                "drop_tail": bool(args.drop_tail),
                 "names": _names_to_dict(names),
                 "kpt_shape": list(map(int, kpt_shape)),
             },
@@ -270,6 +279,8 @@ def main():
 
             for chunk_idx, t0 in enumerate(range(0, total_bins, stride)):
                 t1 = min(total_bins, t0 + chunk_t)
+                if bool(args.drop_tail) and (t1 - t0) < chunk_t:
+                    continue
                 raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
                 raw_chunk = _prepare_raw_chunk_for_qnn(
                     raw_chunk,
@@ -316,6 +327,7 @@ def main():
 
                 for output_frame_idx, result in enumerate(results):
                     result = _apply_tracker(result, tracker)
+                    source_bin = int(t0 + output_frame_idx * subsampling)
                     chunk_record["frames"].append(
                         _frame_record_from_result(
                             result,
@@ -326,6 +338,7 @@ def main():
                             chunk_start=t0,
                             chunk_end=t1,
                             output_frame_idx=output_frame_idx,
+                            source_bin=source_bin,
                         )
                     )
                     global_frame_idx += 1
