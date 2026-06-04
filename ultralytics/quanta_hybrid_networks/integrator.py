@@ -1,0 +1,258 @@
+"""Hybrid SPAD integrators with PerPixelBayesian-compatible streaming API."""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+from ultralytics.quanta_neural_networks.ops.array_ops import torch_quantile
+from ultralytics.quanta_neural_networks.ops.image import nearest_neighbor_inpaint
+
+
+class GatedMultiScaleEMA(nn.Module):
+    """
+    White-box spatio-temporal integration for SPAD sensors.
+
+    Parallel causal 1D convolutions compute multi-scale EMAs; Difference-of-EMAs
+    drives RBF soft-routing across scales. Exposes the same ``process_photon_cube``
+    contract as :class:`~ultralytics.quanta_neural_networks.integrator.PerPixelBayesian`.
+    """
+
+    def __init__(
+        self,
+        alphas: list[float] | None = None,
+        chunk_size: int = 320,
+        kernel_size: int = 64,
+        v_threshold: float = 0.1,
+        gating_sharpness: float = 20.0,
+        subsampling: int = 1,
+        hot_pixel_mask: np.ndarray | None = None,
+        normalize: bool = False,
+        quantile: float = 1.0,
+        gating_tau: float = 0.1,
+    ):
+        """
+        :param alphas: Per-scale EMA decay rates (larger alpha = faster response).
+        :param chunk_size: Temporal block length for block-wise streaming integration.
+        :param kernel_size: Causal FIR length used by ``conv1d`` (EMA memory horizon).
+        :param v_threshold: DoE magnitude threshold for motion gating.
+        :param gating_sharpness: Sigmoid sharpness on motion score.
+        :param subsampling: Output temporal subsampling (same role as PerPixelBayesian).
+        :param hot_pixel_mask: Optional hot-pixel mask for inpainting.
+        :param normalize: If True, normalize reconstruction by quantile.
+        :param quantile: Upper quantile used when ``normalize`` is True.
+        :param gating_tau: RBF softmax temperature for scale routing.
+        """
+        super().__init__()
+
+        if alphas is None:
+            alphas = [0.5, 0.1, 0.05, 0.01, 0.005]
+
+        self.chunk_size = max(int(chunk_size), 1)
+        self.kernel_size = max(int(kernel_size), 1)
+        self.v_threshold = float(v_threshold)
+        self.gating_sharpness = float(gating_sharpness)
+        self.subsampling = max(int(subsampling), 1)
+        self.hot_pixel_mask = hot_pixel_mask
+        self.normalize = bool(normalize)
+        self.quantile = float(quantile)
+        self.gating_tau = float(gating_tau)
+
+        self.alphas = sorted(alphas, reverse=True)
+        self.num_scales = len(self.alphas)
+
+        centers = torch.linspace(1.0, 0.0, self.num_scales).view(1, self.num_scales, 1)
+        self.register_buffer("channel_centers", centers)
+        self._rebuild_ema_kernel()
+
+        self.t_absolute = 0
+        self._h, self._w, self._t = None, None, None
+        self._stream_padding: Tensor | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(chunk_size={self.chunk_size}, kernel_size={self.kernel_size}, "
+            f"subsampling={self.subsampling}, num_scales={self.num_scales}, v_threshold={self.v_threshold})"
+        )
+
+    def _rebuild_ema_kernel(self, device: torch.device | str | None = None) -> None:
+        """Rebuild causal FIR kernels after ``kernel_size`` changes."""
+        kernel = torch.zeros(self.num_scales, 1, self.kernel_size, dtype=torch.float32)
+        for m, alpha in enumerate(self.alphas):
+            lags = torch.arange(self.kernel_size - 1, -1, -1, dtype=torch.float32)
+            kernel[m, 0, :] = alpha * torch.pow(1 - alpha, lags)
+        if device is None and hasattr(self, "ema_kernel"):
+            device = self.ema_kernel.device
+        kernel = kernel.to(device or "cpu")
+        if hasattr(self, "ema_kernel"):
+            del self.ema_kernel
+        self.register_buffer("ema_kernel", kernel)
+
+    def update_hyperparams(self, **kwargs) -> None:
+        """Dynamically update attributes; rebuild FIR kernels when ``kernel_size`` changes."""
+        old_kernel_size = int(self.kernel_size)
+        for name, value in kwargs.items():
+            if hasattr(self, name) and value is not None:
+                setattr(self, name, value)
+        if int(self.kernel_size) != old_kernel_size:
+            self.kernel_size = max(int(self.kernel_size), 1)
+            self._rebuild_ema_kernel()
+        if "chunk_size" in kwargs and kwargs["chunk_size"] is not None:
+            self.chunk_size = max(int(self.chunk_size), 1)
+
+    def set_cube(self, photon_cube: Tensor) -> None:
+        """Record input cube shape (mirrors PerPixelBayesian)."""
+        self._h, self._w, self._t = map(int, photon_cube.shape)
+
+    def clamp_recons(self, recons: Tensor) -> Tensor:
+        """Clamp and optionally normalize reconstruction."""
+        if recons.numel() == 0:
+            return recons
+        max_value = 1.0
+        if self.normalize:
+            max_value = torch_quantile(recons, self.quantile).clamp(min=1e-6)
+        return (recons / max_value).clamp(0, 1)
+
+    @staticmethod
+    def _tail_padding(x: Tensor, x_padded: Tensor, *, pad_tail: int) -> Tensor:
+        """Return the last ``pad_tail`` raw samples for cross-block FIR continuity."""
+        if pad_tail <= 0:
+            return x.new_zeros(x.shape[0], 1, 0)
+        if x.shape[-1] >= pad_tail:
+            return x[:, :, -pad_tail:].contiguous()
+        if x.shape[-1] > 0:
+            return x_padded[:, :, -pad_tail:].contiguous()
+        return x.new_zeros(x.shape[0], 1, 0)
+
+    @torch.no_grad()
+    def _forward_fused(
+        self,
+        photon_cube: Tensor,
+        last_chunk_padding: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Core gated multi-scale EMA integration on one temporal segment.
+
+        :param photon_cube: ``[H, W, T_seg]`` boolean or float tensor.
+        :param last_chunk_padding: ``[H*W, 1, kernel_size-1]`` for FIR continuity.
+        :return: Fused ``[H, W, T_seg]`` and tail padding for the next segment/call.
+        """
+        h, w, t = map(int, photon_cube.shape)
+        x = photon_cube.reshape(h * w, 1, t).float()
+
+        pad_left = self.kernel_size - 1
+        if last_chunk_padding is not None and last_chunk_padding.numel():
+            x_padded = torch.cat([last_chunk_padding, x], dim=-1)
+        else:
+            x_padded = F.pad(x, (pad_left, 0)) if pad_left > 0 else x
+
+        y_all = F.conv1d(x_padded, self.ema_kernel)
+
+        y_fast = y_all[:, 0:1, :]
+        y_slow = y_all[:, -1:, :]
+        v_t = torch.abs(y_fast - y_slow)
+        motion_score = torch.sigmoid(self.gating_sharpness * (v_t - self.v_threshold))
+
+        # [H*W, 1, T] - [1, num_scales, 1] -> [H*W, num_scales, T]; softmax over scales (dim=1)
+        distance_sq = torch.pow(motion_score - self.channel_centers, 2)
+        weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
+        out_flat = torch.sum(weights * y_all, dim=1)
+
+        next_padding = self._tail_padding(x, x_padded, pad_tail=pad_left)
+        return out_flat.view(h, w, t), next_padding
+
+    def _integrate_timeline(self, photon_cube: Tensor, *, carry_stream: bool) -> Tensor:
+        """Integrate ``[H, W, T]`` in blocks of ``chunk_size``; carry ``kernel_size`` FIR padding."""
+        h, w, t = map(int, photon_cube.shape)
+        if t == 0:
+            return photon_cube.new_zeros(h, w, 0)
+
+        padding = self._stream_padding if carry_stream else None
+        parts: list[Tensor] = []
+        pos = 0
+        while pos < t:
+            end = min(pos + self.chunk_size, t)
+            fused, padding = self._forward_fused(photon_cube[:, :, pos:end], padding)
+            parts.append(fused)
+            pos = end
+
+        if carry_stream:
+            self._stream_padding = padding
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+
+    def _subsample_reconstruction(self, fused_hwt: Tensor) -> Tensor:
+        """Apply PerPixelBayesian-style temporal subsampling to a dense timeline."""
+        h, w, t = map(int, fused_hwt.shape)
+        if t <= 0:
+            return fused_hwt.new_zeros(h, w, 0)
+        if t < self.subsampling:
+            out = fused_hwt.new_zeros(h, w, 1)
+            out[..., 0] = fused_hwt[..., -1]
+            return out
+
+        # Equivalent to (t_index + 1) % subsampling == 0 at t_index = subsampling-1, 2*subsampling-1, ...
+        return fused_hwt[..., self.subsampling - 1 :: self.subsampling]
+
+    @torch.no_grad()
+    def process_photon_cube(
+        self,
+        photon_cube: Tensor,
+        subsampling: int | None = None,
+        hot_pixel_mask: np.ndarray | None = None,
+        quantile: float | None = None,
+        normalize: bool | None = None,
+        clear_states: bool = True,
+        chunk_size: int | None = None,
+        kernel_size: int | None = None,
+        v_threshold: float | None = None,
+        gating_sharpness: float | None = None,
+        gating_tau: float | None = None,
+        **kwargs,
+    ) -> Tensor:
+        """
+        Integrate a photon cube and return subsampled reconstruction ``[H, W, T']``.
+
+        API and temporal subsampling match
+        :meth:`ultralytics.quanta_neural_networks.integrator.PerPixelBayesian.process_photon_cube`.
+        """
+        del kwargs  # BOCPD-only kwargs ignored for hybrid integrator
+
+        if clear_states:
+            self.t_absolute = 0
+            self._stream_padding = None
+
+        self.update_hyperparams(
+            subsampling=subsampling,
+            hot_pixel_mask=hot_pixel_mask,
+            normalize=normalize,
+            quantile=quantile,
+            chunk_size=chunk_size,
+            kernel_size=kernel_size,
+            v_threshold=v_threshold,
+            gating_sharpness=gating_sharpness,
+            gating_tau=gating_tau,
+        )
+
+        self.set_cube(photon_cube)
+        fused = self._integrate_timeline(photon_cube, carry_stream=not clear_states)
+        recons = self._subsample_reconstruction(fused)
+
+        if self.hot_pixel_mask is not None:
+            recons = nearest_neighbor_inpaint(recons, self.hot_pixel_mask)
+
+        recons = self.clamp_recons(recons)
+        self.t_absolute += self._t
+        return recons
+
+    def forward(
+        self,
+        photon_cube: Tensor,
+        last_chunk_padding: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Low-level forward on one segment (dense ``[H, W, T]``). Prefer ``process_photon_cube`` for QNN training.
+        """
+        return self._forward_fused(photon_cube, last_chunk_padding)

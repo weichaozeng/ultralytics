@@ -7,6 +7,8 @@ frames with one of:
 - ppb: PerPixelBayesian reconstruction
 - vel: detection-guided velocity-compensated integration
 
+- hyb: GatedMultiScaleEMA (parallel multi-scale FIR + soft routing)
+
 The resulting frames are passed to an unmodified pretrained YOLO pose model.
 """
 
@@ -24,6 +26,7 @@ from tqdm import tqdm
 
 from ultralytics import YOLO
 from ultralytics.data.spad_packed import infer_packed_nch, is_packed_spad, packed_frames_to_raw_bayer
+from ultralytics.quanta_hybrid_networks.integrator import GatedMultiScaleEMA
 from ultralytics.quanta_motion_networks.integrator import VelIntegrator
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
 
@@ -195,6 +198,20 @@ def _preprocess_ppb(raw_chunk: np.ndarray, *, packed_nch: int, device: torch.dev
     return _raw_hwt_to_rgb_float(recons, packed_nch=packed_nch)
 
 
+def _preprocess_hyb(
+    raw_chunk: np.ndarray,
+    *,
+    packed_nch: int,
+    device: torch.device,
+    integrator: GatedMultiScaleEMA,
+    clear_states: bool,
+    **kwargs,
+) -> torch.Tensor:
+    raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
+    recons = integrator.process_photon_cube(raw, clear_states=clear_states)
+    return _raw_hwt_to_rgb_float(recons, packed_nch=packed_nch)
+
+
 def _preprocess_vel(raw_chunk: np.ndarray, *, packed_nch: int, device: torch.device, integrator: VelIntegrator, clear_states: bool, **kwargs) -> torch.Tensor:
     raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
     recons = integrator.process_photon_cube(raw, clear_states=clear_states, packed_nch=packed_nch)
@@ -271,7 +288,7 @@ def main():
     ap.add_argument("--in_glob", type=str, default=None, help="Optional glob for a root folder containing sample directories")
     ap.add_argument("--ckpt", type=str, required=True, help="Standard pretrained YOLO pose checkpoint")
     ap.add_argument("--save_dir", type=str, required=True)
-    ap.add_argument("--pre", type=str, default="sum,ppb,vel", help="Comma-separated preprocessors: sum,ppb,vel")
+    ap.add_argument("--pre", type=str, default="sum,ppb,vel", help="Comma-separated preprocessors: sum,ppb,vel,hyb")
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--chunk_stride", type=int, default=0)
     ap.add_argument("--device", type=str, default="")
@@ -283,6 +300,13 @@ def main():
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
+    # gated multi-scale EMA (hybrid)
+    ap.add_argument("--hyb_kernel_size", type=int, default=64, help="FIR kernel length for hyb integrator")
+    ap.add_argument("--hyb_v_threshold", type=float, default=0.1)
+    ap.add_argument("--hyb_gating_sharpness", type=float, default=20.0)
+    ap.add_argument("--hyb_gating_tau", type=float, default=0.1)
+    ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--hyb_quantile", type=float, default=1.0)
     # velintegrator
     ap.add_argument("--vel_max_shift", type=int, default=16)
     ap.add_argument("--vel_patch_size", type=int, default=0, help="Per-patch vel from tracks in patch (0 = global median)")
@@ -309,7 +333,7 @@ def main():
         raise FileNotFoundError(f"No inputs matched: {in_path}/{args.in_glob}")
 
     preprocessors = [x.strip() for x in args.pre.split(",") if x.strip()]
-    invalid = sorted(set(preprocessors) - {"sum", "ppb", "vel"})
+    invalid = sorted(set(preprocessors) - {"sum", "ppb", "vel", "hyb"})
     if invalid:
         raise ValueError(f"Unsupported preprocessors: {invalid}")
 
@@ -331,6 +355,16 @@ def main():
         compensate_space=str(args.vel_compensate),
         normalize=bool(args.vel_normalize),
         quantile=float(args.vel_quantile),
+    ).to(device)
+    hyb = GatedMultiScaleEMA(
+        chunk_size=int(args.chunk_size),
+        kernel_size=int(args.hyb_kernel_size),
+        subsampling=int(args.chunk_size),
+        v_threshold=float(args.hyb_v_threshold),
+        gating_sharpness=float(args.hyb_gating_sharpness),
+        gating_tau=float(args.hyb_gating_tau),
+        normalize=bool(args.hyb_normalize),
+        quantile=float(args.hyb_quantile),
     ).to(device)
 
     for sample_path in sample_paths:
@@ -366,6 +400,8 @@ def main():
                         frames = _preprocess_sum(raw_chunk, packed_nch=source.packed_nch, device=device)
                     elif name == "ppb":
                         frames = _preprocess_ppb(raw_chunk, packed_nch=source.packed_nch, device=device, integrator=ppb, clear_states=first_chunk)
+                    elif name == "hyb":
+                        frames = _preprocess_hyb(raw_chunk, packed_nch=source.packed_nch, device=device, integrator=hyb, clear_states=first_chunk)
                     else:
                         frames = _preprocess_vel(raw_chunk, packed_nch=source.packed_nch, device=device, integrator=vel, clear_states=first_chunk)
 

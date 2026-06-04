@@ -292,7 +292,7 @@ def parse_args():
         help=(
             "Shared temporal downsampling factor: (1) PerPixelBayesian raw-bin aggregation per "
             "reconstructed frame; (2) SPAD bins between consecutive output-frame labels "
-            "(spad_len = output_frames * subsampling + 1)."
+            "(spad_len = output_frames * subsampling)."
         ),
     )
     ap.add_argument(

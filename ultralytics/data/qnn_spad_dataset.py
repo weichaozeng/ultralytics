@@ -152,7 +152,7 @@ class QNNSpadPoseDataset(Dataset):
 
     def _load_raw_window(self, window: QNNWindow) -> np.ndarray:
         spad_start = window.gt_start * self.spad_per_gt
-        spad_len = window.output_frames * window.spad_step + 1
+        spad_len = window.output_frames * window.spad_step
         spad_end = spad_start + spad_len
 
         arr = np.load(window.spad_path, mmap_mode="r")
