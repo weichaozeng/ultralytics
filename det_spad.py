@@ -341,38 +341,50 @@ def main():
     tracker_cfg = f"{args.tracker}.yaml"
 
     models = {name: YOLO(args.ckpt) for name in preprocessors}
-    ppb = PerPixelBayesian(
-        subsampling=int(args.chunk_size),
-        bocpd_gamma=float(args.ppb_gamma),
-        normalize=bool(args.ppb_normalize),
-        quantile=float(args.ppb_quantile),
-        min_filter_size=int(args.ppb_min_filter_size),
-    ).to(device)
-    vel = VelIntegrator(
-        chunk_size=int(args.chunk_size),
-        max_shift=int(args.vel_max_shift),
-        patch_size=int(args.vel_patch_size),
-        compensate_space=str(args.vel_compensate),
-        normalize=bool(args.vel_normalize),
-        quantile=float(args.vel_quantile),
-    ).to(device)
-    hyb = GatedMultiScaleEMA(
-        chunk_size=int(args.chunk_size),
-        kernel_size=int(args.hyb_kernel_size),
-        subsampling=int(args.chunk_size),
-        v_threshold=float(args.hyb_v_threshold),
-        gating_sharpness=float(args.hyb_gating_sharpness),
-        gating_tau=float(args.hyb_gating_tau),
-        normalize=bool(args.hyb_normalize),
-        quantile=float(args.hyb_quantile),
-    ).to(device)
+    ppb = (
+        PerPixelBayesian(
+            subsampling=int(args.chunk_size),
+            bocpd_gamma=float(args.ppb_gamma),
+            normalize=bool(args.ppb_normalize),
+            quantile=float(args.ppb_quantile),
+            min_filter_size=int(args.ppb_min_filter_size),
+        ).to(device)
+        if "ppb" in preprocessors
+        else None
+    )
+    vel = (
+        VelIntegrator(
+            chunk_size=int(args.chunk_size),
+            max_shift=int(args.vel_max_shift),
+            patch_size=int(args.vel_patch_size),
+            compensate_space=str(args.vel_compensate),
+            normalize=bool(args.vel_normalize),
+            quantile=float(args.vel_quantile),
+        ).to(device)
+        if "vel" in preprocessors
+        else None
+    )
+    hyb = (
+        GatedMultiScaleEMA(
+            chunk_size=int(args.chunk_size),
+            kernel_size=int(args.hyb_kernel_size),
+            subsampling=int(args.chunk_size),
+            v_threshold=float(args.hyb_v_threshold),
+            gating_sharpness=float(args.hyb_gating_sharpness),
+            gating_tau=float(args.hyb_gating_tau),
+            normalize=bool(args.hyb_normalize),
+            quantile=float(args.hyb_quantile),
+        ).to(device)
+        if "hyb" in preprocessors
+        else None
+    )
 
     for sample_path in sample_paths:
         sample_name = sample_path.name if sample_path.is_dir() else sample_path.stem
         for model in models.values():
             _reset_tracker(model)
-        ppb.reset() if hasattr(ppb, "reset") else None
-        vel.reset()
+        if vel is not None:
+            vel.reset()
 
         sources = list(_iter_sources(sample_path))
         for video_idx, source in enumerate(tqdm(sources, desc=f"Processing [{sample_name}]")):
@@ -401,7 +413,13 @@ def main():
                     elif name == "ppb":
                         frames = _preprocess_ppb(raw_chunk, packed_nch=source.packed_nch, device=device, integrator=ppb, clear_states=first_chunk)
                     elif name == "hyb":
-                        frames = _preprocess_hyb(raw_chunk, packed_nch=source.packed_nch, device=device, integrator=hyb, clear_states=first_chunk)
+                        frames = _preprocess_hyb(
+                            raw_chunk,
+                            packed_nch=source.packed_nch,
+                            device=device,
+                            integrator=hyb,
+                            clear_states=first_chunk,
+                        )
                     else:
                         frames = _preprocess_vel(raw_chunk, packed_nch=source.packed_nch, device=device, integrator=vel, clear_states=first_chunk)
 

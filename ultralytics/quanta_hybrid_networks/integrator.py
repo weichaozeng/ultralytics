@@ -153,10 +153,8 @@ class GatedMultiScaleEMA(nn.Module):
 
         y_fast = y_all[:, 0:1, :]
         y_slow = y_all[:, -1:, :]
-        v_t = torch.abs(y_fast - y_slow)
-        motion_score = torch.sigmoid(self.gating_sharpness * (v_t - self.v_threshold))
+        motion_score = torch.sigmoid(self.gating_sharpness * (torch.abs(y_fast - y_slow) - self.v_threshold))
 
-        # [H*W, 1, T] - [1, num_scales, 1] -> [H*W, num_scales, T]; softmax over scales (dim=1)
         distance_sq = torch.pow(motion_score - self.channel_centers, 2)
         weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
         out_flat = torch.sum(weights * y_all, dim=1)
