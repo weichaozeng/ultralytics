@@ -33,6 +33,7 @@ class GatedMultiScaleEMA(nn.Module):
         normalize: bool = False,
         quantile: float = 1.0,
         gating_tau: float = 0.1,
+        spatial_batch_size: int = 16384,
     ):
         """
         :param alphas: Per-scale EMA decay rates (larger alpha = faster response).
@@ -45,6 +46,7 @@ class GatedMultiScaleEMA(nn.Module):
         :param normalize: If True, normalize reconstruction by quantile.
         :param quantile: Upper quantile used when ``normalize`` is True.
         :param gating_tau: RBF softmax temperature for scale routing.
+        :param spatial_batch_size: Pixels per ``conv1d`` batch in ``_forward_fused`` (lower uses less VRAM).
         """
         super().__init__()
 
@@ -60,6 +62,7 @@ class GatedMultiScaleEMA(nn.Module):
         self.normalize = bool(normalize)
         self.quantile = float(quantile)
         self.gating_tau = float(gating_tau)
+        self.spatial_batch_size = max(int(spatial_batch_size), 1)
 
         self.alphas = sorted(alphas, reverse=True)
         self.num_scales = len(self.alphas)
@@ -102,6 +105,8 @@ class GatedMultiScaleEMA(nn.Module):
             self._rebuild_ema_kernel()
         if "chunk_size" in kwargs and kwargs["chunk_size"] is not None:
             self.chunk_size = max(int(self.chunk_size), 1)
+        if "spatial_batch_size" in kwargs and kwargs["spatial_batch_size"] is not None:
+            self.spatial_batch_size = max(int(self.spatial_batch_size), 1)
 
     def set_cube(self, photon_cube: Tensor) -> None:
         """Record input cube shape (mirrors PerPixelBayesian)."""
@@ -132,35 +137,61 @@ class GatedMultiScaleEMA(nn.Module):
         self,
         photon_cube: Tensor,
         last_chunk_padding: Tensor | None = None,
+        spatial_batch_size: int | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """
-        Core gated multi-scale EMA integration on one temporal segment.
-
-        :param photon_cube: ``[H, W, T_seg]`` boolean or float tensor.
-        :param last_chunk_padding: ``[H*W, 1, kernel_size-1]`` for FIR continuity.
-        :return: Fused ``[H, W, T_seg]`` and tail padding for the next segment/call.
-        """
+        """Memory-efficient spatial-batched gated multi-scale EMA integration."""
         h, w, t = map(int, photon_cube.shape)
-        x = photon_cube.reshape(h * w, 1, t).float()
-
+        num_pixels = h * w
         pad_left = self.kernel_size - 1
-        if last_chunk_padding is not None and last_chunk_padding.numel():
-            x_padded = torch.cat([last_chunk_padding, x], dim=-1)
-        else:
-            x_padded = F.pad(x, (pad_left, 0)) if pad_left > 0 else x
+        batch_size = (
+            self.spatial_batch_size
+            if spatial_batch_size is None
+            else max(int(spatial_batch_size), 1)
+        )
 
-        y_all = F.conv1d(x_padded, self.ema_kernel)
+        out_fused_flat = torch.empty((num_pixels, t), device=photon_cube.device, dtype=torch.float32)
+        pad_len = pad_left if t > 0 else 0
+        next_padding_out = (
+            torch.empty((num_pixels, 1, pad_len), device=photon_cube.device, dtype=torch.float32)
+            if pad_len > 0
+            else None
+        )
 
-        y_fast = y_all[:, 0:1, :]
-        y_slow = y_all[:, -1:, :]
-        motion_score = torch.sigmoid(self.gating_sharpness * (torch.abs(y_fast - y_slow) - self.v_threshold))
+        x_flat = photon_cube.reshape(num_pixels, 1, t).float()
+        pad_flat = (
+            last_chunk_padding.view(num_pixels, 1, -1)
+            if last_chunk_padding is not None and last_chunk_padding.numel()
+            else None
+        )
 
-        distance_sq = torch.pow(motion_score - self.channel_centers, 2)
-        weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
-        out_flat = torch.sum(weights * y_all, dim=1)
+        for i in range(0, num_pixels, batch_size):
+            end_i = min(i + batch_size, num_pixels)
+            x_batch = x_flat[i:end_i]
+            pad_batch = pad_flat[i:end_i] if pad_flat is not None else None
 
-        next_padding = self._tail_padding(x, x_padded, pad_tail=pad_left)
-        return out_flat.view(h, w, t), next_padding
+            if pad_batch is not None:
+                x_padded = torch.cat([pad_batch, x_batch], dim=-1)
+            elif pad_left > 0:
+                x_padded = F.pad(x_batch, (pad_left, 0))
+            else:
+                x_padded = x_batch
+
+            y_all = F.conv1d(x_padded, self.ema_kernel)
+
+            y_fast = y_all[:, 0:1, :]
+            y_slow = y_all[:, -1:, :]
+            motion_score = torch.sigmoid(
+                self.gating_sharpness * (torch.abs(y_fast - y_slow) - self.v_threshold)
+            )
+
+            distance_sq = torch.pow(motion_score - self.channel_centers, 2)
+            weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
+            out_fused_flat[i:end_i] = torch.sum(weights * y_all, dim=1)
+
+            if next_padding_out is not None:
+                next_padding_out[i:end_i] = self._tail_padding(x_batch, x_padded, pad_tail=pad_left)
+
+        return out_fused_flat.view(h, w, t), next_padding_out
 
     def _integrate_timeline(self, photon_cube: Tensor, *, carry_stream: bool) -> Tensor:
         """Integrate ``[H, W, T]`` in blocks of ``chunk_size``; carry ``kernel_size`` FIR padding."""
