@@ -36,7 +36,7 @@ class GatedMultiScaleEMA(nn.Module):
         spatial_batch_size: int = 16384,
     ):
         """
-        :param alphas: Per-scale EMA decay rates (larger alpha = faster response).
+        :param alphas: Per-scale EMA decay rates (larger alpha = faster response; default fastest ≈10-bin FIR memory).
         :param chunk_size: Temporal block length for block-wise streaming integration.
         :param kernel_size: Causal FIR length used by ``conv1d`` (EMA memory horizon).
         :param v_threshold: DoE magnitude threshold for motion gating.
@@ -51,7 +51,8 @@ class GatedMultiScaleEMA(nn.Module):
         super().__init__()
 
         if alphas is None:
-            alphas = [0.5, 0.1, 0.05, 0.01, 0.005]
+            # Fastest α≈0.07 → ~10-bin half-mass memory at kernel_size=64 (was 0.5 ≈ 1 bin).
+            alphas = [0.07, 0.05, 0.02, 0.01, 0.005]
 
         self.chunk_size = max(int(chunk_size), 1)
         self.kernel_size = max(int(kernel_size), 1)
@@ -82,11 +83,16 @@ class GatedMultiScaleEMA(nn.Module):
         )
 
     def _rebuild_ema_kernel(self, device: torch.device | str | None = None) -> None:
-        """Rebuild causal FIR kernels after ``kernel_size`` changes."""
+        """Rebuild causal FIR kernels after ``kernel_size`` changes.
+
+        Each scale uses ``alpha * (1-alpha)^lag`` (fast → recent-heavy, slow → flatter),
+        then normalizes so taps sum to 1 within ``kernel_size`` (unit DC gain for 0/1 input).
+        """
         kernel = torch.zeros(self.num_scales, 1, self.kernel_size, dtype=torch.float32)
         for m, alpha in enumerate(self.alphas):
             lags = torch.arange(self.kernel_size - 1, -1, -1, dtype=torch.float32)
-            kernel[m, 0, :] = alpha * torch.pow(1 - alpha, lags)
+            taps = alpha * torch.pow(1 - alpha, lags)
+            kernel[m, 0, :] = taps / taps.sum().clamp(min=1e-12)
         if device is None and hasattr(self, "ema_kernel"):
             device = self.ema_kernel.device
         kernel = kernel.to(device or "cpu")
