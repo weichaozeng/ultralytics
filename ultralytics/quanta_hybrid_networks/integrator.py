@@ -17,8 +17,9 @@ class GatedMultiScaleEMA(nn.Module):
     White-box spatio-temporal integration for SPAD sensors.
 
     Non-overlapping ``kernel_size`` bins are convolved (no cross-block padding) to one
-    gated value per block; block outputs are fused with a per-pixel softmax over
-    ``motion_score``. Exposes the same ``process_photon_cube`` contract as
+    gated value per block; static regions average all blocks for denoising, while
+    moving regions use the latest block only to avoid multi-block motion ghosts.
+    Exposes the same ``process_photon_cube`` contract as
     :class:`~ultralytics.quanta_neural_networks.integrator.PerPixelBayesian`.
     """
 
@@ -46,7 +47,7 @@ class GatedMultiScaleEMA(nn.Module):
         :param hot_pixel_mask: Optional hot-pixel mask for inpainting.
         :param normalize: If True, normalize reconstruction by quantile.
         :param quantile: Upper quantile used when ``normalize`` is True.
-        :param gating_tau: RBF temperature for per-scale routing; also softmax temperature across time blocks.
+        :param gating_tau: RBF temperature for per-scale routing within each time block.
         :param spatial_batch_size: Pixels per ``conv1d`` batch (lower uses less VRAM).
         """
         super().__init__()
@@ -177,7 +178,11 @@ class GatedMultiScaleEMA(nn.Module):
         Tile ``[H, W, T]`` into non-overlapping ``kernel_size`` segments; aggregate block outputs.
 
         Each block: ``kernel_size``-bin conv → per-pixel gated ``fused_b`` and ``motion_score_b``.
-        Chunk output: per-pixel ``softmax(motion_score_b)`` weighted mean over blocks → ``[H, W, 1]``.
+        Chunk output blends block means vs. the latest block (per pixel):
+
+        - low peak ``motion_score`` across blocks → ``mean(fused_b)`` (denoise, all windows contribute)
+        - high peak motion → ``fused_{B-1}`` only (avoid ghosting from misaligned block snapshots)
+
         Remainder bins ``T % kernel_size`` are ignored (no padding).
         """
         h, w, t = map(int, photon_cube.shape)
@@ -197,9 +202,17 @@ class GatedMultiScaleEMA(nn.Module):
 
         fused_hwb = torch.stack(fused_stack, dim=-1)
         motion_hwb = torch.stack(motion_stack, dim=-1)
-        block_weights = F.softmax(motion_hwb / self.gating_tau, dim=-1)
-        out = torch.sum(block_weights * fused_hwb, dim=-1, keepdim=True)
-        return out
+
+        if n_blocks == 1:
+            return fused_hwb[..., -1:]
+
+        fused_mean = fused_hwb.mean(dim=-1, keepdim=True)
+        fused_last = fused_hwb[..., -1:]
+        motion_peak = motion_hwb.max(dim=-1, keepdim=True).values
+        motion_blend = torch.sigmoid(
+            self.gating_sharpness * (motion_peak - self.v_threshold)
+        )
+        return (1.0 - motion_blend) * fused_mean + motion_blend * fused_last
 
     def _subsample_reconstruction(self, fused_hwt: Tensor) -> Tensor:
         """Apply PerPixelBayesian-style temporal subsampling to a dense timeline."""
