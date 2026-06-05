@@ -303,6 +303,12 @@ def main():
     # gated multi-scale EMA (hybrid)
     ap.add_argument("--hyb_kernel_size", type=int, default=64, help="FIR kernel length for hyb integrator")
     ap.add_argument("--hyb_v_threshold", type=float, default=0.1)
+    ap.add_argument(
+        "--hyb_blend_threshold",
+        type=float,
+        default=0.5,
+        help="motion_peak threshold for chunk mean/last blend (score in [0, 1])",
+    )
     ap.add_argument("--hyb_gating_sharpness", type=float, default=20.0)
     ap.add_argument("--hyb_gating_tau", type=float, default=0.1)
     ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
@@ -382,6 +388,7 @@ def main():
             kernel_size=int(args.hyb_kernel_size),
             subsampling=int(args.chunk_size),
             v_threshold=float(args.hyb_v_threshold),
+            blend_threshold=float(args.hyb_blend_threshold),
             gating_sharpness=float(args.hyb_gating_sharpness),
             gating_tau=float(args.hyb_gating_tau),
             normalize=bool(args.hyb_normalize),

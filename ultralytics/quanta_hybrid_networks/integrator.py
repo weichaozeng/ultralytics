@@ -29,6 +29,7 @@ class GatedMultiScaleEMA(nn.Module):
         chunk_size: int = 320,
         kernel_size: int = 64,
         v_threshold: float = 0.1,
+        blend_threshold: float = 0.5,
         gating_sharpness: float = 20.0,
         subsampling: int = 1,
         hot_pixel_mask: np.ndarray | None = None,
@@ -43,8 +44,9 @@ class GatedMultiScaleEMA(nn.Module):
         :param alphas: Per-scale EMA decay rates (larger alpha = faster response; default fastest ≈10-bin FIR memory).
         :param chunk_size: Nominal raw window length (``det_spad`` slicing); integration tiles by ``kernel_size`` only.
         :param kernel_size: FIR length; each non-overlapping segment must contain exactly this many bins.
-        :param v_threshold: DoE magnitude threshold for motion gating.
-        :param gating_sharpness: Sigmoid sharpness on motion score.
+        :param v_threshold: DoE magnitude threshold for per-block motion score.
+        :param blend_threshold: ``motion_peak`` threshold for chunk mean/last blend (score in ``[0, 1]``).
+        :param gating_sharpness: Sigmoid sharpness on motion score and blend gate.
         :param subsampling: Output temporal subsampling (same role as PerPixelBayesian).
         :param hot_pixel_mask: Optional hot-pixel mask for inpainting.
         :param normalize: If True, normalize reconstruction by quantile.
@@ -69,6 +71,7 @@ class GatedMultiScaleEMA(nn.Module):
         self.chunk_size = max(int(chunk_size), 1)
         self.kernel_size = max(int(kernel_size), 1)
         self.v_threshold = float(v_threshold)
+        self.blend_threshold = float(blend_threshold)
         self.gating_sharpness = float(gating_sharpness)
         self.subsampling = max(int(subsampling), 1)
         self.hot_pixel_mask = hot_pixel_mask
@@ -92,7 +95,8 @@ class GatedMultiScaleEMA(nn.Module):
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(chunk_size={self.chunk_size}, kernel_size={self.kernel_size}, "
-            f"subsampling={self.subsampling}, num_scales={self.num_scales}, v_threshold={self.v_threshold})"
+            f"subsampling={self.subsampling}, num_scales={self.num_scales}, "
+            f"v_threshold={self.v_threshold}, blend_threshold={self.blend_threshold})"
         )
 
     def _rebuild_ema_kernel(self, device: torch.device | str | None = None) -> None:
@@ -265,7 +269,7 @@ class GatedMultiScaleEMA(nn.Module):
             if self.peak_min_filter_size > 1:
                 motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
             motion_blend = torch.sigmoid(
-                self.gating_sharpness * (motion_peak - self.v_threshold)
+                self.gating_sharpness * (motion_peak - self.blend_threshold)
             )
             debug = {
                 "motion_blocks": motion_hwb,
@@ -282,7 +286,7 @@ class GatedMultiScaleEMA(nn.Module):
         if self.peak_min_filter_size > 1:
             motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
         motion_blend = torch.sigmoid(
-            self.gating_sharpness * (motion_peak.unsqueeze(-1) - self.v_threshold)
+            self.gating_sharpness * (motion_peak.unsqueeze(-1) - self.blend_threshold)
         ).squeeze(-1)
         out = (1.0 - motion_blend.unsqueeze(-1)) * fused_mean + motion_blend.unsqueeze(-1) * fused_last
         debug = {
@@ -336,6 +340,7 @@ class GatedMultiScaleEMA(nn.Module):
         chunk_size: int | None = None,
         kernel_size: int | None = None,
         v_threshold: float | None = None,
+        blend_threshold: float | None = None,
         gating_sharpness: float | None = None,
         gating_tau: float | None = None,
         min_filter_size: int | None = None,
@@ -360,6 +365,7 @@ class GatedMultiScaleEMA(nn.Module):
             chunk_size=chunk_size,
             kernel_size=kernel_size,
             v_threshold=v_threshold,
+            blend_threshold=blend_threshold,
             gating_sharpness=gating_sharpness,
             gating_tau=gating_tau,
             min_filter_size=min_filter_size,
@@ -389,6 +395,7 @@ class GatedMultiScaleEMA(nn.Module):
         chunk_size: int | None = None,
         kernel_size: int | None = None,
         v_threshold: float | None = None,
+        blend_threshold: float | None = None,
         gating_sharpness: float | None = None,
         gating_tau: float | None = None,
         min_filter_size: int | None = None,
@@ -413,6 +420,7 @@ class GatedMultiScaleEMA(nn.Module):
             chunk_size=chunk_size,
             kernel_size=kernel_size,
             v_threshold=v_threshold,
+            blend_threshold=blend_threshold,
             gating_sharpness=gating_sharpness,
             gating_tau=gating_tau,
             min_filter_size=min_filter_size,
