@@ -36,6 +36,7 @@ class GatedMultiScaleEMA(nn.Module):
         quantile: float = 1.0,
         gating_tau: float = 0.1,
         spatial_batch_size: int = 16384,
+        min_filter_size: int = 7,
     ):
         """
         :param alphas: Per-scale EMA decay rates (larger alpha = faster response; default fastest ≈10-bin FIR memory).
@@ -49,8 +50,13 @@ class GatedMultiScaleEMA(nn.Module):
         :param quantile: Upper quantile used when ``normalize`` is True.
         :param gating_tau: RBF temperature for per-scale routing within each time block.
         :param spatial_batch_size: Pixels per ``conv1d`` batch (lower uses less VRAM).
+        :param min_filter_size: Odd spatial min-pool on block ``motion_score`` before scale routing (1 = off).
         """
         super().__init__()
+
+        min_filter_size = max(int(min_filter_size), 1)
+        if min_filter_size % 2 == 0:
+            raise ValueError("min_filter_size must be odd (or 1 to disable spatial min-pool)")
 
         if alphas is None:
             alphas = [0.07, 0.05, 0.02, 0.01, 0.005]
@@ -65,6 +71,7 @@ class GatedMultiScaleEMA(nn.Module):
         self.quantile = float(quantile)
         self.gating_tau = float(gating_tau)
         self.spatial_batch_size = max(int(spatial_batch_size), 1)
+        self.min_filter_size = min_filter_size
 
         self.alphas = sorted(alphas, reverse=True)
         self.num_scales = len(self.alphas)
@@ -113,6 +120,11 @@ class GatedMultiScaleEMA(nn.Module):
             self.chunk_size = max(int(self.chunk_size), 1)
         if "spatial_batch_size" in kwargs and kwargs["spatial_batch_size"] is not None:
             self.spatial_batch_size = max(int(self.spatial_batch_size), 1)
+        if "min_filter_size" in kwargs and kwargs["min_filter_size"] is not None:
+            mfs = max(int(self.min_filter_size), 1)
+            if mfs % 2 == 0:
+                raise ValueError("min_filter_size must be odd (or 1 to disable spatial min-pool)")
+            self.min_filter_size = mfs
 
     def set_cube(self, photon_cube: Tensor) -> None:
         """Record input cube shape (mirrors PerPixelBayesian)."""
@@ -127,6 +139,16 @@ class GatedMultiScaleEMA(nn.Module):
             max_value = torch_quantile(recons, self.quantile).clamp(min=1e-6)
         return (recons / max_value).clamp(0, 1)
 
+    @staticmethod
+    def min_pool2d(x: Tensor, kernel_size: int) -> Tensor:
+        """2D min-pool on ``[H, W]`` (same implementation as PerPixelBayesian)."""
+        x_batched = x.unsqueeze(0).unsqueeze(0)
+        padding = (kernel_size - 1) // 2
+        pooled = -F.max_pool2d(
+            -x_batched, kernel_size=kernel_size, stride=1, padding=padding
+        )
+        return pooled.squeeze(0).squeeze(0)
+
     @torch.no_grad()
     def _gate_conv_block(
         self,
@@ -136,7 +158,7 @@ class GatedMultiScaleEMA(nn.Module):
         """
         Convolve one non-overlapping ``[H, W, kernel_size]`` segment (no padding).
 
-        :return: ``fused [H, W]``, ``motion_score [H, W]`` (block-level scalar per pixel).
+        :return: ``fused [H, W]``, ``motion_score [H, W]`` (spatially min-pooled when configured).
         """
         h, w, t_seg = map(int, photon_block.shape)
         if t_seg != self.kernel_size:
@@ -151,7 +173,12 @@ class GatedMultiScaleEMA(nn.Module):
             else max(int(spatial_batch_size), 1)
         )
         fused_flat = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
-        motion_flat = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
+        motion_raw = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
+        y_cache = torch.empty(
+            (num_pixels, self.num_scales),
+            device=photon_block.device,
+            dtype=torch.float32,
+        )
         x_flat = photon_block.reshape(num_pixels, 1, self.kernel_size).float()
 
         for i in range(0, num_pixels, batch_size):
@@ -165,12 +192,24 @@ class GatedMultiScaleEMA(nn.Module):
                 self.gating_sharpness * (torch.abs(y_fast - y_slow) - self.v_threshold)
             )
 
-            distance_sq = torch.pow(motion_score - self.channel_centers, 2)
-            scale_weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
-            fused_flat[i:end_i] = torch.sum(scale_weights * y_all, dim=1).squeeze(-1)
-            motion_flat[i:end_i] = motion_score.squeeze(-1).squeeze(-1)
+            y_cache[i:end_i] = y_all.squeeze(-1)
+            motion_raw[i:end_i] = motion_score.squeeze(-1).squeeze(-1)
 
-        return fused_flat.view(h, w), motion_flat.view(h, w)
+        motion_map = motion_raw.view(h, w)
+        if self.min_filter_size > 1:
+            motion_map = self.min_pool2d(motion_map, self.min_filter_size)
+        motion_flat = motion_map.reshape(num_pixels)
+
+        for i in range(0, num_pixels, batch_size):
+            end_i = min(i + batch_size, num_pixels)
+            motion_batch = motion_flat[i:end_i].view(-1, 1, 1)
+            y_batch = y_cache[i:end_i].unsqueeze(-1)
+
+            distance_sq = torch.pow(motion_batch - self.channel_centers, 2)
+            scale_weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
+            fused_flat[i:end_i] = torch.sum(scale_weights * y_batch, dim=1).squeeze(-1)
+
+        return fused_flat.view(h, w), motion_map
 
     @torch.no_grad()
     def _integrate_blocks(self, photon_cube: Tensor) -> Tensor:
@@ -240,6 +279,7 @@ class GatedMultiScaleEMA(nn.Module):
         v_threshold: float | None = None,
         gating_sharpness: float | None = None,
         gating_tau: float | None = None,
+        min_filter_size: int | None = None,
         **kwargs,
     ) -> Tensor:
         """
@@ -262,6 +302,7 @@ class GatedMultiScaleEMA(nn.Module):
             v_threshold=v_threshold,
             gating_sharpness=gating_sharpness,
             gating_tau=gating_tau,
+            min_filter_size=min_filter_size,
         )
 
         self.set_cube(photon_cube)
