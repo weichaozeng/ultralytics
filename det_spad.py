@@ -307,7 +307,18 @@ def main():
     ap.add_argument("--hyb_gating_tau", type=float, default=0.1)
     ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hyb_quantile", type=float, default=1.0)
-    ap.add_argument("--hyb_min_filter_size", type=int, default=7, help="Odd min-pool on block motion_score (1 = off)")
+    ap.add_argument(
+        "--hyb_min_filter_size",
+        type=int,
+        default=7,
+        help="Odd min-pool on per-block motion_score before scale routing (1 = off; smaller = sharper edges)",
+    )
+    ap.add_argument(
+        "--hyb_peak_min_filter_size",
+        type=int,
+        default=7,
+        help="Odd min-pool on chunk motion_peak before block mean/last blend (1 = off)",
+    )
     # velintegrator
     ap.add_argument("--vel_max_shift", type=int, default=16)
     ap.add_argument("--vel_patch_size", type=int, default=0, help="Per-patch vel from tracks in patch (0 = global median)")
@@ -376,6 +387,7 @@ def main():
             normalize=bool(args.hyb_normalize),
             quantile=float(args.hyb_quantile),
             min_filter_size=int(args.hyb_min_filter_size),
+            peak_min_filter_size=int(args.hyb_peak_min_filter_size),
         ).to(device)
         if "hyb" in preprocessors
         else None

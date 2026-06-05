@@ -37,6 +37,7 @@ class GatedMultiScaleEMA(nn.Module):
         gating_tau: float = 0.1,
         spatial_batch_size: int = 16384,
         min_filter_size: int = 7,
+        peak_min_filter_size: int = 7,
     ):
         """
         :param alphas: Per-scale EMA decay rates (larger alpha = faster response; default fastest ≈10-bin FIR memory).
@@ -50,13 +51,17 @@ class GatedMultiScaleEMA(nn.Module):
         :param quantile: Upper quantile used when ``normalize`` is True.
         :param gating_tau: RBF temperature for per-scale routing within each time block.
         :param spatial_batch_size: Pixels per ``conv1d`` batch (lower uses less VRAM).
-        :param min_filter_size: Odd spatial min-pool on block ``motion_score`` before scale routing (1 = off).
+        :param min_filter_size: Odd min-pool on per-block ``motion_score`` before scale routing (1 = off).
+        :param peak_min_filter_size: Odd min-pool on chunk ``motion_peak`` before block mean/last blend (1 = off).
         """
         super().__init__()
 
         min_filter_size = max(int(min_filter_size), 1)
-        if min_filter_size % 2 == 0:
-            raise ValueError("min_filter_size must be odd (or 1 to disable spatial min-pool)")
+        peak_min_filter_size = max(int(peak_min_filter_size), 1)
+        if min_filter_size % 2 == 0 or peak_min_filter_size % 2 == 0:
+            raise ValueError(
+                "min_filter_size and peak_min_filter_size must be odd (or 1 to disable min-pool)"
+            )
 
         if alphas is None:
             alphas = [0.07, 0.05, 0.02, 0.01, 0.005]
@@ -72,6 +77,7 @@ class GatedMultiScaleEMA(nn.Module):
         self.gating_tau = float(gating_tau)
         self.spatial_batch_size = max(int(spatial_batch_size), 1)
         self.min_filter_size = min_filter_size
+        self.peak_min_filter_size = peak_min_filter_size
 
         self.alphas = sorted(alphas, reverse=True)
         self.num_scales = len(self.alphas)
@@ -123,8 +129,13 @@ class GatedMultiScaleEMA(nn.Module):
         if "min_filter_size" in kwargs and kwargs["min_filter_size"] is not None:
             mfs = max(int(self.min_filter_size), 1)
             if mfs % 2 == 0:
-                raise ValueError("min_filter_size must be odd (or 1 to disable spatial min-pool)")
+                raise ValueError("min_filter_size must be odd (or 1 to disable min-pool)")
             self.min_filter_size = mfs
+        if "peak_min_filter_size" in kwargs and kwargs["peak_min_filter_size"] is not None:
+            pmfs = max(int(self.peak_min_filter_size), 1)
+            if pmfs % 2 == 0:
+                raise ValueError("peak_min_filter_size must be odd (or 1 to disable min-pool)")
+            self.peak_min_filter_size = pmfs
 
     def set_cube(self, photon_cube: Tensor) -> None:
         """Record input cube shape (mirrors PerPixelBayesian)."""
@@ -222,6 +233,9 @@ class GatedMultiScaleEMA(nn.Module):
         - low peak ``motion_score`` across blocks → ``mean(fused_b)`` (denoise, all windows contribute)
         - high peak motion → ``fused_{B-1}`` only (avoid ghosting from misaligned block snapshots)
 
+        ``motion_peak`` is min-pooled spatially (``peak_min_filter_size``) before the blend, analogous to PPB
+        runlength pooling: static neighbours pull pixels toward block averaging.
+
         Remainder bins ``T % kernel_size`` are ignored (no padding).
         """
         h, w, t = map(int, photon_cube.shape)
@@ -247,9 +261,11 @@ class GatedMultiScaleEMA(nn.Module):
 
         fused_mean = fused_hwb.mean(dim=-1, keepdim=True)
         fused_last = fused_hwb[..., -1:]
-        motion_peak = motion_hwb.max(dim=-1, keepdim=True).values
+        motion_peak = motion_hwb.max(dim=-1).values
+        if self.peak_min_filter_size > 1:
+            motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
         motion_blend = torch.sigmoid(
-            self.gating_sharpness * (motion_peak - self.v_threshold)
+            self.gating_sharpness * (motion_peak.unsqueeze(-1) - self.v_threshold)
         )
         return (1.0 - motion_blend) * fused_mean + motion_blend * fused_last
 
@@ -280,6 +296,7 @@ class GatedMultiScaleEMA(nn.Module):
         gating_sharpness: float | None = None,
         gating_tau: float | None = None,
         min_filter_size: int | None = None,
+        peak_min_filter_size: int | None = None,
         **kwargs,
     ) -> Tensor:
         """
@@ -303,6 +320,7 @@ class GatedMultiScaleEMA(nn.Module):
             gating_sharpness=gating_sharpness,
             gating_tau=gating_tau,
             min_filter_size=min_filter_size,
+            peak_min_filter_size=peak_min_filter_size,
         )
 
         self.set_cube(photon_cube)
