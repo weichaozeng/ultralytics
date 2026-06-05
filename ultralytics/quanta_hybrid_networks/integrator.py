@@ -223,6 +223,77 @@ class GatedMultiScaleEMA(nn.Module):
         return fused_flat.view(h, w), motion_map
 
     @torch.no_grad()
+    def _integrate_blocks_with_motion(
+        self, photon_cube: Tensor
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """
+        Integrate ``[H, W, T]`` and return fused output plus per-pixel motion debug maps.
+
+        Debug tensors (raw Bayer resolution ``[H, W]`` unless noted):
+
+        - ``motion_blocks``: block ``motion_score`` after scale min-pool, ``[H, W, B]``
+        - ``motion_peak_raw``: ``max`` over blocks before peak min-pool
+        - ``motion_peak``: peak score after ``peak_min_filter_size`` min-pool
+        - ``motion_blend``: chunk-level blend toward last block, ``[H, W]`` in ``[0, 1]``
+        """
+        h, w, t = map(int, photon_cube.shape)
+        ks = self.kernel_size
+        n_blocks = t // ks
+        empty_debug = {
+            "motion_blocks": photon_cube.new_zeros(h, w, 0),
+            "motion_peak_raw": photon_cube.new_zeros(h, w),
+            "motion_peak": photon_cube.new_zeros(h, w),
+            "motion_blend": photon_cube.new_zeros(h, w),
+        }
+        if n_blocks == 0:
+            return photon_cube.new_zeros(h, w, 1 if t > 0 else 0), empty_debug
+
+        fused_stack = []
+        motion_stack = []
+        for b in range(n_blocks):
+            seg = photon_cube[:, :, b * ks : (b + 1) * ks]
+            fused_b, motion_b = self._gate_conv_block(seg)
+            fused_stack.append(fused_b)
+            motion_stack.append(motion_b)
+
+        fused_hwb = torch.stack(fused_stack, dim=-1)
+        motion_hwb = torch.stack(motion_stack, dim=-1)
+
+        if n_blocks == 1:
+            motion_peak_raw = motion_hwb[..., 0]
+            motion_peak = motion_peak_raw
+            if self.peak_min_filter_size > 1:
+                motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
+            motion_blend = torch.sigmoid(
+                self.gating_sharpness * (motion_peak - self.v_threshold)
+            )
+            debug = {
+                "motion_blocks": motion_hwb,
+                "motion_peak_raw": motion_peak_raw,
+                "motion_peak": motion_peak,
+                "motion_blend": motion_blend,
+            }
+            return fused_hwb[..., -1:], debug
+
+        fused_mean = fused_hwb.mean(dim=-1, keepdim=True)
+        fused_last = fused_hwb[..., -1:]
+        motion_peak_raw = motion_hwb.max(dim=-1).values
+        motion_peak = motion_peak_raw
+        if self.peak_min_filter_size > 1:
+            motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
+        motion_blend = torch.sigmoid(
+            self.gating_sharpness * (motion_peak.unsqueeze(-1) - self.v_threshold)
+        ).squeeze(-1)
+        out = (1.0 - motion_blend.unsqueeze(-1)) * fused_mean + motion_blend.unsqueeze(-1) * fused_last
+        debug = {
+            "motion_blocks": motion_hwb,
+            "motion_peak_raw": motion_peak_raw,
+            "motion_peak": motion_peak,
+            "motion_blend": motion_blend,
+        }
+        return out, debug
+
+    @torch.no_grad()
     def _integrate_blocks(self, photon_cube: Tensor) -> Tensor:
         """
         Tile ``[H, W, T]`` into non-overlapping ``kernel_size`` segments; aggregate block outputs.
@@ -238,36 +309,8 @@ class GatedMultiScaleEMA(nn.Module):
 
         Remainder bins ``T % kernel_size`` are ignored (no padding).
         """
-        h, w, t = map(int, photon_cube.shape)
-        ks = self.kernel_size
-        n_blocks = t // ks
-        if n_blocks == 0:
-            # Fewer than ``kernel_size`` bins: no full segment (zeros, matching short-tail API shape).
-            return photon_cube.new_zeros(h, w, 1 if t > 0 else 0)
-
-        fused_stack = []
-        motion_stack = []
-        for b in range(n_blocks):
-            seg = photon_cube[:, :, b * ks : (b + 1) * ks]
-            fused_b, motion_b = self._gate_conv_block(seg)
-            fused_stack.append(fused_b)
-            motion_stack.append(motion_b)
-
-        fused_hwb = torch.stack(fused_stack, dim=-1)
-        motion_hwb = torch.stack(motion_stack, dim=-1)
-
-        if n_blocks == 1:
-            return fused_hwb[..., -1:]
-
-        fused_mean = fused_hwb.mean(dim=-1, keepdim=True)
-        fused_last = fused_hwb[..., -1:]
-        motion_peak = motion_hwb.max(dim=-1).values
-        if self.peak_min_filter_size > 1:
-            motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
-        motion_blend = torch.sigmoid(
-            self.gating_sharpness * (motion_peak.unsqueeze(-1) - self.v_threshold)
-        )
-        return (1.0 - motion_blend) * fused_mean + motion_blend * fused_last
+        fused, _ = self._integrate_blocks_with_motion(photon_cube)
+        return fused
 
     def _subsample_reconstruction(self, fused_hwt: Tensor) -> Tensor:
         """Apply PerPixelBayesian-style temporal subsampling to a dense timeline."""
@@ -333,6 +376,59 @@ class GatedMultiScaleEMA(nn.Module):
         recons = self.clamp_recons(recons)
         self.t_absolute += self._t
         return recons
+
+    @torch.no_grad()
+    def process_photon_cube_with_motion(
+        self,
+        photon_cube: Tensor,
+        subsampling: int | None = None,
+        hot_pixel_mask: np.ndarray | None = None,
+        quantile: float | None = None,
+        normalize: bool | None = None,
+        clear_states: bool = True,
+        chunk_size: int | None = None,
+        kernel_size: int | None = None,
+        v_threshold: float | None = None,
+        gating_sharpness: float | None = None,
+        gating_tau: float | None = None,
+        min_filter_size: int | None = None,
+        peak_min_filter_size: int | None = None,
+        **kwargs,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """
+        Like :meth:`process_photon_cube`, also returning motion debug maps at raw resolution.
+
+        See :meth:`_integrate_blocks_with_motion` for debug tensor keys.
+        """
+        del kwargs
+
+        if clear_states:
+            self.t_absolute = 0
+
+        self.update_hyperparams(
+            subsampling=subsampling,
+            hot_pixel_mask=hot_pixel_mask,
+            normalize=normalize,
+            quantile=quantile,
+            chunk_size=chunk_size,
+            kernel_size=kernel_size,
+            v_threshold=v_threshold,
+            gating_sharpness=gating_sharpness,
+            gating_tau=gating_tau,
+            min_filter_size=min_filter_size,
+            peak_min_filter_size=peak_min_filter_size,
+        )
+
+        self.set_cube(photon_cube)
+        fused, motion_debug = self._integrate_blocks_with_motion(photon_cube)
+        recons = self._subsample_reconstruction(fused)
+
+        if self.hot_pixel_mask is not None:
+            recons = nearest_neighbor_inpaint(recons, self.hot_pixel_mask)
+
+        recons = self.clamp_recons(recons)
+        self.t_absolute += self._t
+        return recons, motion_debug
 
     def forward(self, photon_cube: Tensor) -> Tensor:
         """Low-level forward: block-tiled integration → ``[H, W, 1]`` (or ``[H,W,0]``)."""

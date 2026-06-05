@@ -1,10 +1,10 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Stitch det_spad outputs (sum / ppb / vel) into side-by-side comparison images.
+"""Stitch det_spad outputs (sum / ppb / vel / hyb) into side-by-side comparison images.
 
 Expected layout from ``det_spad.py``::
 
     {save_dir}/{sample}/video00000/cube00000_t000000_000320_frame0000000_sum_recon.png
-    {save_dir}/{sample}/video00000/cube00000_t000000_000320_frame0000000_vel_overlay.png
+    {save_dir}/{sample}/video00000/cube00000_t000000_000320_frame0000000_hyb_overlay.png
 
 For sample ``0428_wc/acq00002``, writes to ``0428_wc/acq00002_compare`` (sibling folder).
 
@@ -27,14 +27,17 @@ import numpy as np
 from tqdm import tqdm
 
 FNAME_RE = re.compile(
-    r"^(?P<stem>cube\d+_t\d+_\d+_frame\d+)_(?P<pre>sum|ppb|vel)_(?P<kind>recon|overlay)\.png$",
+    r"^(?P<stem>cube\d+_t\d+_\d+_frame\d+)_(?P<pre>sum|ppb|vel|hyb)_(?P<kind>recon|overlay)\.png$",
     re.IGNORECASE,
 )
+
+ALL_METHODS = ("sum", "ppb", "vel", "hyb")
 
 LABEL_COLORS = {
     "sum": (0, 255, 255),
     "ppb": (0, 255, 0),
     "vel": (255, 128, 0),
+    "hyb": (255, 0, 255),
 }
 
 
@@ -58,7 +61,12 @@ def _parse_args() -> argparse.Namespace:
         default="*/*",
         help="Glob under --save_dir for sample folders (default: */*)",
     )
-    ap.add_argument("--pre", type=str, default="sum,ppb,vel", help="Comma-separated methods, left-to-right order")
+    ap.add_argument(
+        "--pre",
+        type=str,
+        default=",".join(ALL_METHODS),
+        help="Comma-separated methods (sum,ppb,vel,hyb), left-to-right order",
+    )
     ap.add_argument("--kinds", type=str, default="recon,overlay", help="Comma-separated: recon, overlay")
     ap.add_argument("--gap", type=int, default=8, help="Pixels between panels")
     ap.add_argument("--label_h", type=int, default=28, help="Header height for method labels")
@@ -237,7 +245,7 @@ def main() -> None:
 
     methods = [x.strip().lower() for x in args.pre.split(",") if x.strip()]
     kinds = [x.strip().lower() for x in args.kinds.split(",") if x.strip()]
-    invalid_pre = sorted(set(methods) - {"sum", "ppb", "vel"})
+    invalid_pre = sorted(set(methods) - set(ALL_METHODS))
     invalid_kind = sorted(set(kinds) - {"recon", "overlay"})
     if invalid_pre:
         raise ValueError(f"Unsupported methods: {invalid_pre}")
