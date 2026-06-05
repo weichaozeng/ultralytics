@@ -169,11 +169,12 @@ class GatedMultiScaleEMA(nn.Module):
         self,
         photon_block: Tensor,
         spatial_batch_size: int | None = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """
         Convolve one non-overlapping ``[H, W, kernel_size]`` segment (no padding).
 
-        :return: ``fused [H, W]``, ``motion_score [H, W]`` (spatially min-pooled when configured).
+        :return: ``fused [H, W]``, ``motion_score [H, W]`` (spatially min-pooled when configured),
+            ``doe [H, W]`` raw ``|y_fast - y_slow|`` before sigmoid (no min-pool).
         """
         h, w, t_seg = map(int, photon_block.shape)
         if t_seg != self.kernel_size:
@@ -189,6 +190,7 @@ class GatedMultiScaleEMA(nn.Module):
         )
         fused_flat = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
         motion_raw = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
+        doe_raw = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
         y_cache = torch.empty(
             (num_pixels, self.num_scales),
             device=photon_block.device,
@@ -203,14 +205,17 @@ class GatedMultiScaleEMA(nn.Module):
 
             y_fast = y_all[:, 0:1, :]
             y_slow = y_all[:, -1:, :]
+            doe_abs = torch.abs(y_fast - y_slow).squeeze(-1).squeeze(-1)
             motion_score = torch.sigmoid(
-                self.gating_sharpness * (torch.abs(y_fast - y_slow) - self.v_threshold)
+                self.gating_sharpness * (doe_abs - self.v_threshold)
             )
 
             y_cache[i:end_i] = y_all.squeeze(-1)
             motion_raw[i:end_i] = motion_score.squeeze(-1).squeeze(-1)
+            doe_raw[i:end_i] = doe_abs
 
         motion_map = motion_raw.view(h, w)
+        doe_map = doe_raw.view(h, w)
         if self.min_filter_size > 1:
             motion_map = self.min_pool2d(motion_map, self.min_filter_size)
         motion_flat = motion_map.reshape(num_pixels)
@@ -224,7 +229,7 @@ class GatedMultiScaleEMA(nn.Module):
             scale_weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
             fused_flat[i:end_i] = torch.sum(scale_weights * y_batch, dim=1).squeeze(-1)
 
-        return fused_flat.view(h, w), motion_map
+        return fused_flat.view(h, w), motion_map, doe_map
 
     @torch.no_grad()
     def _integrate_blocks_with_motion(
@@ -236,8 +241,11 @@ class GatedMultiScaleEMA(nn.Module):
         Debug tensors (raw Bayer resolution ``[H, W]`` unless noted):
 
         - ``motion_blocks``: block ``motion_score`` after scale min-pool, ``[H, W, B]``
+        - ``doe_blocks``: block raw ``|y_fast - y_slow|`` before sigmoid, ``[H, W, B]``
         - ``motion_peak_raw``: ``max`` over blocks before peak min-pool
         - ``motion_peak``: peak score after ``peak_min_filter_size`` min-pool
+        - ``doe_peak_raw``: ``max`` over ``doe_blocks`` before peak min-pool
+        - ``doe_peak``: raw DoE peak after ``peak_min_filter_size`` min-pool
         - ``motion_blend``: chunk-level blend toward last block, ``[H, W]`` in ``[0, 1]``
         """
         h, w, t = map(int, photon_cube.shape)
@@ -245,8 +253,11 @@ class GatedMultiScaleEMA(nn.Module):
         n_blocks = t // ks
         empty_debug = {
             "motion_blocks": photon_cube.new_zeros(h, w, 0),
+            "doe_blocks": photon_cube.new_zeros(h, w, 0),
             "motion_peak_raw": photon_cube.new_zeros(h, w),
             "motion_peak": photon_cube.new_zeros(h, w),
+            "doe_peak_raw": photon_cube.new_zeros(h, w),
+            "doe_peak": photon_cube.new_zeros(h, w),
             "motion_blend": photon_cube.new_zeros(h, w),
         }
         if n_blocks == 0:
@@ -254,14 +265,22 @@ class GatedMultiScaleEMA(nn.Module):
 
         fused_stack = []
         motion_stack = []
+        doe_stack = []
         for b in range(n_blocks):
             seg = photon_cube[:, :, b * ks : (b + 1) * ks]
-            fused_b, motion_b = self._gate_conv_block(seg)
+            fused_b, motion_b, doe_b = self._gate_conv_block(seg)
             fused_stack.append(fused_b)
             motion_stack.append(motion_b)
+            doe_stack.append(doe_b)
 
         fused_hwb = torch.stack(fused_stack, dim=-1)
         motion_hwb = torch.stack(motion_stack, dim=-1)
+        doe_hwb = torch.stack(doe_stack, dim=-1)
+
+        doe_peak_raw = doe_hwb.max(dim=-1).values
+        doe_peak = doe_peak_raw
+        if self.peak_min_filter_size > 1:
+            doe_peak = self.min_pool2d(doe_peak, self.peak_min_filter_size)
 
         if n_blocks == 1:
             motion_peak_raw = motion_hwb[..., 0]
@@ -273,8 +292,11 @@ class GatedMultiScaleEMA(nn.Module):
             )
             debug = {
                 "motion_blocks": motion_hwb,
+                "doe_blocks": doe_hwb,
                 "motion_peak_raw": motion_peak_raw,
                 "motion_peak": motion_peak,
+                "doe_peak_raw": doe_peak_raw,
+                "doe_peak": doe_peak,
                 "motion_blend": motion_blend,
             }
             return fused_hwb[..., -1:], debug
@@ -291,8 +313,11 @@ class GatedMultiScaleEMA(nn.Module):
         out = (1.0 - motion_blend.unsqueeze(-1)) * fused_mean + motion_blend.unsqueeze(-1) * fused_last
         debug = {
             "motion_blocks": motion_hwb,
+            "doe_blocks": doe_hwb,
             "motion_peak_raw": motion_peak_raw,
             "motion_peak": motion_peak,
+            "doe_peak_raw": doe_peak_raw,
+            "doe_peak": doe_peak,
             "motion_blend": motion_blend,
         }
         return out, debug

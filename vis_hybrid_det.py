@@ -5,10 +5,14 @@ Writes per-chunk PNGs under ``{save_dir}/{sample}/videoXXXXX/``:
 
 - ``{stem}_hyb_recon.png`` — reconstruction (same tonemap as ``det_spad``)
 - ``{stem}_hyb_motion_peak.png`` — ``motion_peak`` heatmap (post peak min-pool)
+- ``{stem}_hyb_doe_peak.png`` — raw DoE peak ``max_b |y_fast-y_slow|`` (percentile-scaled)
 - ``{stem}_hyb_motion_blend.png`` — chunk blend weight toward last block
 - ``{stem}_hyb_motion_overlay.png`` — recon + ``motion_peak`` overlay
 - ``{stem}_hyb_motion_blocks.png`` — per-block ``motion_score`` strip (if B > 1)
-- ``{stem}_hyb_motion_mosaic.png`` — recon | peak | blend | overlay
+- ``{stem}_hyb_doe_blocks.png`` — per-block raw DoE strip (if B > 1)
+- ``{stem}_hyb_motion_hist.png`` — DoE peak vs motion_peak histograms
+- ``{stem}_hyb_motion_stats.txt`` — per-chunk percentile summary
+- ``{stem}_hyb_motion_mosaic.png`` — recon | doe_peak | motion_peak | motion_blend
 
 Example
 -------
@@ -166,6 +170,105 @@ def _score_to_heatmap(score01: np.ndarray, cmap_id: int) -> np.ndarray:
     return cv2.applyColorMap(u8, cmap_id)
 
 
+def _value_to_heatmap(values: np.ndarray, cmap_id: int, *, vmax: float) -> np.ndarray:
+    vmax = max(float(vmax), 1e-8)
+    u8 = (np.clip(values / vmax, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    return cv2.applyColorMap(u8, cmap_id)
+
+
+def _resolve_vmax(values: np.ndarray, *, fixed_vmax: float, percentile: float) -> float:
+    if fixed_vmax > 0.0:
+        return float(fixed_vmax)
+    return float(np.percentile(values, percentile))
+
+
+def _percentile_summary(values: np.ndarray, *, name: str, percentiles: tuple[float, ...]) -> list[str]:
+    flat = np.asarray(values, dtype=np.float64).reshape(-1)
+    lines = [f"[{name}] n={flat.size} min={flat.min():.6f} max={flat.max():.6f} mean={flat.mean():.6f}"]
+    for p in percentiles:
+        lines.append(f"  p{p:g} = {float(np.percentile(flat, p)):.6f}")
+    return lines
+
+
+def _draw_hist_panel(
+    *,
+    values: np.ndarray,
+    vmax: float,
+    bins: int,
+    color_bgr: tuple[int, int, int],
+    label: str,
+    panel_w: int,
+    panel_h: int,
+) -> np.ndarray:
+    hist, edges = np.histogram(np.asarray(values, dtype=np.float64).reshape(-1), bins=bins, range=(0.0, vmax))
+    hist = hist.astype(np.float64)
+    if hist.max() > 0:
+        hist /= hist.max()
+
+    margin_l, margin_b, margin_t = 48, 28, 22
+    plot_w = panel_w - margin_l - 8
+    plot_h = panel_h - margin_b - margin_t
+    panel = np.full((panel_h, panel_w, 3), 24, dtype=np.uint8)
+
+    x0, y0 = margin_l, margin_t
+    x1, y1 = margin_l + plot_w, margin_t + plot_h
+    cv2.rectangle(panel, (x0, y0), (x1, y1), (48, 48, 48), 1)
+
+    bar_w = max(plot_w // bins, 1)
+    for i, h_norm in enumerate(hist):
+        bar_h = int(round(h_norm * (plot_h - 2)))
+        bx0 = x0 + i * bar_w
+        bx1 = min(bx0 + bar_w - 1, x1 - 1)
+        by1 = y1 - 1
+        by0 = max(by1 - bar_h, y0 + 1)
+        cv2.rectangle(panel, (bx0, by0), (bx1, by1), color_bgr, -1)
+
+    cv2.putText(panel, label, (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(panel, "0", (x0, y1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(
+        panel,
+        f"{vmax:.3g}",
+        (x1 - 36, y1 + 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (180, 180, 180),
+        1,
+        cv2.LINE_AA,
+    )
+    return panel
+
+
+def _save_distribution_hist(
+    *,
+    out_path: Path,
+    doe_peak: np.ndarray,
+    motion_peak: np.ndarray,
+    doe_vmax: float,
+    v_threshold: float,
+    blend_threshold: float,
+) -> None:
+    panel_h, panel_w, bins = 180, 360, 48
+    top = _draw_hist_panel(
+        values=doe_peak,
+        vmax=doe_vmax,
+        bins=bins,
+        color_bgr=(80, 200, 255),
+        label=f"doe_peak (v_thr={v_threshold:g})",
+        panel_w=panel_w,
+        panel_h=panel_h,
+    )
+    bottom = _draw_hist_panel(
+        values=motion_peak,
+        vmax=1.0,
+        bins=bins,
+        color_bgr=(120, 220, 120),
+        label=f"motion_peak (blend_thr={blend_threshold:g})",
+        panel_w=panel_w,
+        panel_h=panel_h,
+    )
+    cv2.imwrite(str(out_path), np.vstack([top, bottom]))
+
+
 def _label_panel(img_bgr: np.ndarray, text: str, label_h: int = 26) -> np.ndarray:
     h, w = img_bgr.shape[:2]
     header = np.zeros((label_h, w, 3), dtype=np.uint8)
@@ -204,20 +307,28 @@ def _stitch_panels(panels: list[np.ndarray], labels: list[str], gap: int = 6) ->
     return out
 
 
-def _motion_block_strip(
-    motion_blocks: np.ndarray,
+def _block_strip(
+    blocks_hwb: np.ndarray,
     display_hw: tuple[int, int],
     cmap_id: int,
+    *,
+    score01: bool,
+    vmax: float,
+    label_prefix: str,
 ) -> np.ndarray | None:
-    """``motion_blocks`` shape ``[H, W, B]`` → labelled horizontal strip."""
-    if motion_blocks.ndim != 3 or motion_blocks.shape[2] <= 1:
+    """``blocks_hwb`` shape ``[H, W, B]`` → labelled horizontal strip."""
+    if blocks_hwb.ndim != 3 or blocks_hwb.shape[2] <= 1:
         return None
     panels = []
     labels = []
-    for b in range(motion_blocks.shape[2]):
-        disp = _resize_map_to_display(motion_blocks[:, :, b], display_hw)
-        panels.append(_score_to_heatmap(disp, cmap_id))
-        labels.append(f"block{b}")
+    for b in range(blocks_hwb.shape[2]):
+        disp = _resize_map_to_display(blocks_hwb[:, :, b], display_hw)
+        if score01:
+            heat = _score_to_heatmap(disp, cmap_id)
+        else:
+            heat = _value_to_heatmap(disp, cmap_id, vmax=vmax)
+        panels.append(heat)
+        labels.append(f"{label_prefix}{b}")
     return _stitch_panels(panels, labels)
 
 
@@ -230,8 +341,13 @@ def _save_motion_visuals(
     cmap_id: int,
     overlay_alpha: float,
     save_blocks: bool,
+    doe_vmax: float,
+    doe_percentile: float,
+    v_threshold: float,
+    blend_threshold: float,
 ) -> None:
     display_hw = recon_bgr.shape[:2]
+    percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
 
     def _tensor_hw(t: torch.Tensor) -> np.ndarray:
         return t.detach().float().cpu().numpy()
@@ -239,28 +355,80 @@ def _save_motion_visuals(
     motion_peak = _tensor_hw(motion_debug["motion_peak"])
     motion_blend = _tensor_hw(motion_debug["motion_blend"])
     motion_blocks = _tensor_hw(motion_debug["motion_blocks"])
+    doe_peak = _tensor_hw(motion_debug["doe_peak"])
+    doe_blocks = _tensor_hw(motion_debug["doe_blocks"])
+
+    doe_scale = _resolve_vmax(doe_peak, fixed_vmax=doe_vmax, percentile=doe_percentile)
 
     peak_disp = _resize_map_to_display(motion_peak, display_hw)
+    doe_disp = _resize_map_to_display(doe_peak, display_hw)
     blend_disp = _resize_map_to_display(motion_blend, display_hw)
     peak_heat = _score_to_heatmap(peak_disp, cmap_id)
+    doe_heat = _value_to_heatmap(doe_disp, cmap_id, vmax=doe_scale)
     blend_heat = _score_to_heatmap(blend_disp, cmap_id)
     overlay = _overlay_heatmap(recon_bgr, peak_heat, overlay_alpha)
 
     cv2.imwrite(str(out_dir / f"{stem}_hyb_recon.png"), recon_bgr)
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_peak.png"), peak_heat)
+    cv2.imwrite(str(out_dir / f"{stem}_hyb_doe_peak.png"), doe_heat)
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_blend.png"), blend_heat)
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_overlay.png"), overlay)
 
     mosaic = _stitch_panels(
-        [recon_bgr, peak_heat, blend_heat, overlay],
-        ["recon", "motion_peak", "motion_blend", "overlay"],
+        [recon_bgr, doe_heat, peak_heat, blend_heat],
+        ["recon", "doe_peak", "motion_peak", "motion_blend"],
     )
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_mosaic.png"), mosaic)
 
+    stats_lines = [
+        f"stem={stem}",
+        f"v_threshold={v_threshold}",
+        f"blend_threshold={blend_threshold}",
+        f"doe_vmax={doe_scale:.6f} (fixed={doe_vmax:g}, percentile={doe_percentile:g})",
+        "",
+    ]
+    stats_lines.extend(_percentile_summary(doe_blocks, name="doe_blocks", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(doe_peak, name="doe_peak", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(motion_blocks, name="motion_blocks", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(motion_peak, name="motion_peak", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(motion_blend, name="motion_blend", percentiles=percentiles))
+    stats_path = out_dir / f"{stem}_hyb_motion_stats.txt"
+    stats_path.write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
+
+    _save_distribution_hist(
+        out_path=out_dir / f"{stem}_hyb_motion_hist.png",
+        doe_peak=doe_peak,
+        motion_peak=motion_peak,
+        doe_vmax=doe_scale,
+        v_threshold=v_threshold,
+        blend_threshold=blend_threshold,
+    )
+
     if save_blocks:
-        block_strip = _motion_block_strip(motion_blocks, display_hw, cmap_id)
-        if block_strip is not None:
-            cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_blocks.png"), block_strip)
+        motion_strip = _block_strip(
+            motion_blocks,
+            display_hw,
+            cmap_id,
+            score01=True,
+            vmax=1.0,
+            label_prefix="score_b",
+        )
+        if motion_strip is not None:
+            cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_blocks.png"), motion_strip)
+        doe_strip = _block_strip(
+            doe_blocks,
+            display_hw,
+            cmap_id,
+            score01=False,
+            vmax=doe_scale,
+            label_prefix="doe_b",
+        )
+        if doe_strip is not None:
+            cv2.imwrite(str(out_dir / f"{stem}_hyb_doe_blocks.png"), doe_strip)
 
 
 def main() -> None:
@@ -290,6 +458,18 @@ def main() -> None:
     ap.add_argument("--vis_gamma", type=float, default=2.2)
     ap.add_argument("--colormap", type=str, default="turbo", choices=sorted(COLORMAPS))
     ap.add_argument("--overlay_alpha", type=float, default=0.45, help="Heatmap alpha on recon overlay")
+    ap.add_argument(
+        "--doe_vmax",
+        type=float,
+        default=0.0,
+        help="Fixed max for DoE heatmaps/histogram (0 = use --doe_percentile on doe_peak)",
+    )
+    ap.add_argument(
+        "--doe_percentile",
+        type=float,
+        default=99.5,
+        help="Percentile of doe_peak used as heatmap vmax when --doe_vmax=0",
+    )
     ap.add_argument("--no_blocks", action="store_true", help="Skip per-block motion strip PNG")
     args = ap.parse_args()
 
@@ -353,6 +533,10 @@ def main() -> None:
                 cmap_id=cmap_id,
                 overlay_alpha=float(args.overlay_alpha),
                 save_blocks=not args.no_blocks,
+                doe_vmax=float(args.doe_vmax),
+                doe_percentile=float(args.doe_percentile),
+                v_threshold=float(args.hyb_v_threshold),
+                blend_threshold=float(args.hyb_blend_threshold),
             )
             frame_idx += 1
 
