@@ -16,9 +16,10 @@ class GatedMultiScaleEMA(nn.Module):
     """
     White-box spatio-temporal integration for SPAD sensors.
 
-    Parallel causal 1D convolutions compute multi-scale EMAs; Difference-of-EMAs
-    drives RBF soft-routing across scales. Exposes the same ``process_photon_cube``
-    contract as :class:`~ultralytics.quanta_neural_networks.integrator.PerPixelBayesian`.
+    Non-overlapping ``kernel_size`` bins are convolved (no cross-block padding) to one
+    gated value per block; block outputs are fused with a per-pixel softmax over
+    ``motion_score``. Exposes the same ``process_photon_cube`` contract as
+    :class:`~ultralytics.quanta_neural_networks.integrator.PerPixelBayesian`.
     """
 
     def __init__(
@@ -37,21 +38,20 @@ class GatedMultiScaleEMA(nn.Module):
     ):
         """
         :param alphas: Per-scale EMA decay rates (larger alpha = faster response; default fastest ≈10-bin FIR memory).
-        :param chunk_size: Temporal block length for block-wise streaming integration.
-        :param kernel_size: Causal FIR length used by ``conv1d`` (EMA memory horizon).
+        :param chunk_size: Nominal raw window length (``det_spad`` slicing); integration tiles by ``kernel_size`` only.
+        :param kernel_size: FIR length; each non-overlapping segment must contain exactly this many bins.
         :param v_threshold: DoE magnitude threshold for motion gating.
         :param gating_sharpness: Sigmoid sharpness on motion score.
         :param subsampling: Output temporal subsampling (same role as PerPixelBayesian).
         :param hot_pixel_mask: Optional hot-pixel mask for inpainting.
         :param normalize: If True, normalize reconstruction by quantile.
         :param quantile: Upper quantile used when ``normalize`` is True.
-        :param gating_tau: RBF softmax temperature for scale routing.
-        :param spatial_batch_size: Pixels per ``conv1d`` batch in ``_forward_fused`` (lower uses less VRAM).
+        :param gating_tau: RBF temperature for per-scale routing; also softmax temperature across time blocks.
+        :param spatial_batch_size: Pixels per ``conv1d`` batch (lower uses less VRAM).
         """
         super().__init__()
 
         if alphas is None:
-            # Fastest α≈0.07 → ~10-bin half-mass memory at kernel_size=64 (was 0.5 ≈ 1 bin).
             alphas = [0.07, 0.05, 0.02, 0.01, 0.005]
 
         self.chunk_size = max(int(chunk_size), 1)
@@ -74,7 +74,6 @@ class GatedMultiScaleEMA(nn.Module):
 
         self.t_absolute = 0
         self._h, self._w, self._t = None, None, None
-        self._stream_padding: Tensor | None = None
 
     def __repr__(self) -> str:
         return (
@@ -127,62 +126,37 @@ class GatedMultiScaleEMA(nn.Module):
             max_value = torch_quantile(recons, self.quantile).clamp(min=1e-6)
         return (recons / max_value).clamp(0, 1)
 
-    @staticmethod
-    def _tail_padding(x: Tensor, x_padded: Tensor, *, pad_tail: int) -> Tensor:
-        """Return the last ``pad_tail`` raw samples for cross-block FIR continuity."""
-        if pad_tail <= 0:
-            return x.new_zeros(x.shape[0], 1, 0)
-        if x.shape[-1] >= pad_tail:
-            return x[:, :, -pad_tail:].contiguous()
-        if x.shape[-1] > 0:
-            return x_padded[:, :, -pad_tail:].contiguous()
-        return x.new_zeros(x.shape[0], 1, 0)
-
     @torch.no_grad()
-    def _forward_fused(
+    def _gate_conv_block(
         self,
-        photon_cube: Tensor,
-        last_chunk_padding: Tensor | None = None,
+        photon_block: Tensor,
         spatial_batch_size: int | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """Memory-efficient spatial-batched gated multi-scale EMA integration."""
-        h, w, t = map(int, photon_cube.shape)
+        """
+        Convolve one non-overlapping ``[H, W, kernel_size]`` segment (no padding).
+
+        :return: ``fused [H, W]``, ``motion_score [H, W]`` (block-level scalar per pixel).
+        """
+        h, w, t_seg = map(int, photon_block.shape)
+        if t_seg != self.kernel_size:
+            raise ValueError(
+                f"Expected segment length kernel_size={self.kernel_size}, got T={t_seg}"
+            )
+
         num_pixels = h * w
-        pad_left = self.kernel_size - 1
         batch_size = (
             self.spatial_batch_size
             if spatial_batch_size is None
             else max(int(spatial_batch_size), 1)
         )
-
-        out_fused_flat = torch.empty((num_pixels, t), device=photon_cube.device, dtype=torch.float32)
-        pad_len = pad_left if t > 0 else 0
-        next_padding_out = (
-            torch.empty((num_pixels, 1, pad_len), device=photon_cube.device, dtype=torch.float32)
-            if pad_len > 0
-            else None
-        )
-
-        x_flat = photon_cube.reshape(num_pixels, 1, t).float()
-        pad_flat = (
-            last_chunk_padding.view(num_pixels, 1, -1)
-            if last_chunk_padding is not None and last_chunk_padding.numel()
-            else None
-        )
+        fused_flat = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
+        motion_flat = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
+        x_flat = photon_block.reshape(num_pixels, 1, self.kernel_size).float()
 
         for i in range(0, num_pixels, batch_size):
             end_i = min(i + batch_size, num_pixels)
             x_batch = x_flat[i:end_i]
-            pad_batch = pad_flat[i:end_i] if pad_flat is not None else None
-
-            if pad_batch is not None:
-                x_padded = torch.cat([pad_batch, x_batch], dim=-1)
-            elif pad_left > 0:
-                x_padded = F.pad(x_batch, (pad_left, 0))
-            else:
-                x_padded = x_batch
-
-            y_all = F.conv1d(x_padded, self.ema_kernel)
+            y_all = F.conv1d(x_batch, self.ema_kernel)
 
             y_fast = y_all[:, 0:1, :]
             y_slow = y_all[:, -1:, :]
@@ -191,32 +165,41 @@ class GatedMultiScaleEMA(nn.Module):
             )
 
             distance_sq = torch.pow(motion_score - self.channel_centers, 2)
-            weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
-            out_fused_flat[i:end_i] = torch.sum(weights * y_all, dim=1)
+            scale_weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
+            fused_flat[i:end_i] = torch.sum(scale_weights * y_all, dim=1).squeeze(-1)
+            motion_flat[i:end_i] = motion_score.squeeze(-1).squeeze(-1)
 
-            if next_padding_out is not None:
-                next_padding_out[i:end_i] = self._tail_padding(x_batch, x_padded, pad_tail=pad_left)
+        return fused_flat.view(h, w), motion_flat.view(h, w)
 
-        return out_fused_flat.view(h, w, t), next_padding_out
+    @torch.no_grad()
+    def _integrate_blocks(self, photon_cube: Tensor) -> Tensor:
+        """
+        Tile ``[H, W, T]`` into non-overlapping ``kernel_size`` segments; aggregate block outputs.
 
-    def _integrate_timeline(self, photon_cube: Tensor, *, carry_stream: bool) -> Tensor:
-        """Integrate ``[H, W, T]`` in blocks of ``chunk_size``; carry ``kernel_size`` FIR padding."""
+        Each block: ``kernel_size``-bin conv → per-pixel gated ``fused_b`` and ``motion_score_b``.
+        Chunk output: per-pixel ``softmax(motion_score_b)`` weighted mean over blocks → ``[H, W, 1]``.
+        Remainder bins ``T % kernel_size`` are ignored (no padding).
+        """
         h, w, t = map(int, photon_cube.shape)
-        if t == 0:
-            return photon_cube.new_zeros(h, w, 0)
+        ks = self.kernel_size
+        n_blocks = t // ks
+        if n_blocks == 0:
+            # Fewer than ``kernel_size`` bins: no full segment (zeros, matching short-tail API shape).
+            return photon_cube.new_zeros(h, w, 1 if t > 0 else 0)
 
-        padding = self._stream_padding if carry_stream else None
-        parts: list[Tensor] = []
-        pos = 0
-        while pos < t:
-            end = min(pos + self.chunk_size, t)
-            fused, padding = self._forward_fused(photon_cube[:, :, pos:end], padding)
-            parts.append(fused)
-            pos = end
+        fused_stack = []
+        motion_stack = []
+        for b in range(n_blocks):
+            seg = photon_cube[:, :, b * ks : (b + 1) * ks]
+            fused_b, motion_b = self._gate_conv_block(seg)
+            fused_stack.append(fused_b)
+            motion_stack.append(motion_b)
 
-        if carry_stream:
-            self._stream_padding = padding
-        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+        fused_hwb = torch.stack(fused_stack, dim=-1)
+        motion_hwb = torch.stack(motion_stack, dim=-1)
+        block_weights = F.softmax(motion_hwb / self.gating_tau, dim=-1)
+        out = torch.sum(block_weights * fused_hwb, dim=-1, keepdim=True)
+        return out
 
     def _subsample_reconstruction(self, fused_hwt: Tensor) -> Tensor:
         """Apply PerPixelBayesian-style temporal subsampling to a dense timeline."""
@@ -228,7 +211,6 @@ class GatedMultiScaleEMA(nn.Module):
             out[..., 0] = fused_hwt[..., -1]
             return out
 
-        # Equivalent to (t_index + 1) % subsampling == 0 at t_index = subsampling-1, 2*subsampling-1, ...
         return fused_hwt[..., self.subsampling - 1 :: self.subsampling]
 
     @torch.no_grad()
@@ -250,14 +232,12 @@ class GatedMultiScaleEMA(nn.Module):
         """
         Integrate a photon cube and return subsampled reconstruction ``[H, W, T']``.
 
-        API and temporal subsampling match
-        :meth:`ultralytics.quanta_neural_networks.integrator.PerPixelBayesian.process_photon_cube`.
+        Each call is stateless across chunks (``clear_states`` only resets ``t_absolute``).
         """
         del kwargs  # BOCPD-only kwargs ignored for hybrid integrator
 
         if clear_states:
             self.t_absolute = 0
-            self._stream_padding = None
 
         self.update_hyperparams(
             subsampling=subsampling,
@@ -272,7 +252,7 @@ class GatedMultiScaleEMA(nn.Module):
         )
 
         self.set_cube(photon_cube)
-        fused = self._integrate_timeline(photon_cube, carry_stream=not clear_states)
+        fused = self._integrate_blocks(photon_cube)
         recons = self._subsample_reconstruction(fused)
 
         if self.hot_pixel_mask is not None:
@@ -282,12 +262,6 @@ class GatedMultiScaleEMA(nn.Module):
         self.t_absolute += self._t
         return recons
 
-    def forward(
-        self,
-        photon_cube: Tensor,
-        last_chunk_padding: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """
-        Low-level forward on one segment (dense ``[H, W, T]``). Prefer ``process_photon_cube`` for QNN training.
-        """
-        return self._forward_fused(photon_cube, last_chunk_padding)
+    def forward(self, photon_cube: Tensor) -> Tensor:
+        """Low-level forward: block-tiled integration → ``[H, W, 1]`` (or ``[H,W,0]``)."""
+        return self._integrate_blocks(photon_cube)
