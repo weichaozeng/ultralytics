@@ -148,7 +148,8 @@ class GatedMultiScaleEMA(nn.Module):
     def clamp_recons(self, recons: Tensor) -> Tensor:
         """Clamp and optionally normalize reconstruction."""
         if recons.numel() == 0:
-            return recons
+            return recons.float()
+        recons = recons.float()
         max_value = 1.0
         if self.normalize:
             max_value = torch_quantile(recons, self.quantile).clamp(min=1e-6)
@@ -263,7 +264,8 @@ class GatedMultiScaleEMA(nn.Module):
             "motion_blend": photon_cube.new_zeros(h, w),
         }
         if n_blocks == 0:
-            return photon_cube.new_zeros(h, w, 1 if t > 0 else 0), empty_debug
+            out_t = 1 if t > 0 else 0
+            return photon_cube.new_zeros(h, w, out_t, dtype=torch.float32), empty_debug
 
         fused_stack = []
         motion_stack = []
@@ -347,10 +349,10 @@ class GatedMultiScaleEMA(nn.Module):
         """Apply PerPixelBayesian-style temporal subsampling to a dense timeline."""
         h, w, t = map(int, fused_hwt.shape)
         if t <= 0:
-            return fused_hwt.new_zeros(h, w, 0)
+            return fused_hwt.new_zeros(h, w, 0, dtype=torch.float32)
         if t < self.subsampling:
-            out = fused_hwt.new_zeros(h, w, 1)
-            out[..., 0] = fused_hwt[..., -1]
+            out = fused_hwt.new_zeros(h, w, 1, dtype=torch.float32)
+            out[..., 0] = fused_hwt[..., -1].float()
             return out
 
         return fused_hwt[..., self.subsampling - 1 :: self.subsampling]
