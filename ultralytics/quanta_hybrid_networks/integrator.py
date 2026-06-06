@@ -205,7 +205,9 @@ class GatedMultiScaleEMA(nn.Module):
 
             y_fast = y_all[:, 0:1, :]
             y_slow = y_all[:, -1:, :]
-            doe_abs = torch.abs(y_fast - y_slow).squeeze(-1).squeeze(-1)
+            # doe_abs = torch.abs(y_fast - y_slow).squeeze(-1).squeeze(-1)
+            eps = 1e-4 
+            doe_abs = (torch.abs(y_fast - y_slow) / torch.sqrt(y_slow + eps)).squeeze(-1).squeeze(-1)
             motion_score = torch.sigmoid(
                 self.gating_sharpness * (doe_abs - self.v_threshold)
             )
