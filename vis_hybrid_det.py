@@ -179,11 +179,16 @@ def _value_to_heatmap(values: np.ndarray, cmap_id: int, *, vmax: float) -> np.nd
 def _resolve_vmax(values: np.ndarray, *, fixed_vmax: float, percentile: float) -> float:
     if fixed_vmax > 0.0:
         return float(fixed_vmax)
-    return float(np.percentile(values, percentile))
+    flat = np.asarray(values, dtype=np.float64).reshape(-1)
+    if flat.size == 0:
+        return 1.0
+    return float(np.percentile(flat, percentile))
 
 
 def _percentile_summary(values: np.ndarray, *, name: str, percentiles: tuple[float, ...]) -> list[str]:
     flat = np.asarray(values, dtype=np.float64).reshape(-1)
+    if flat.size == 0:
+        return [f"[{name}] n=0 (empty)"]
     lines = [f"[{name}] n={flat.size} min={flat.min():.6f} max={flat.max():.6f} mean={flat.mean():.6f}"]
     for p in percentiles:
         lines.append(f"  p{p:g} = {float(np.percentile(flat, p)):.6f}")
@@ -200,7 +205,10 @@ def _draw_hist_panel(
     panel_w: int,
     panel_h: int,
 ) -> np.ndarray:
-    hist, edges = np.histogram(np.asarray(values, dtype=np.float64).reshape(-1), bins=bins, range=(0.0, vmax))
+    flat = np.asarray(values, dtype=np.float64).reshape(-1)
+    if flat.size == 0:
+        flat = np.zeros(1, dtype=np.float64)
+    hist, edges = np.histogram(flat, bins=bins, range=(0.0, vmax))
     hist = hist.astype(np.float64)
     if hist.max() > 0:
         hist /= hist.max()
@@ -513,7 +521,18 @@ def main() -> None:
                 continue
 
             raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
+            chunk_t = int(raw.shape[-1])
+            if chunk_t < int(args.hyb_kernel_size):
+                tqdm.write(
+                    f"Skip cube {cube_idx} (T={chunk_t} < hyb_kernel_size={args.hyb_kernel_size}): "
+                    f"t{t0:06d}_{t1:06d}"
+                )
+                continue
+
             recons, motion_debug = hyb.process_photon_cube_with_motion(raw, clear_states=cube_idx == 0)
+            if int(motion_debug["motion_blocks"].shape[-1]) == 0:
+                tqdm.write(f"Skip cube {cube_idx} (no temporal blocks): t{t0:06d}_{t1:06d}")
+                continue
             frames = _raw_hwt_to_rgb_float(recons, packed_nch=source.packed_nch)
             frames_bgr = _rgb_tensor_to_bgr_u8(
                 frames,
@@ -539,6 +558,12 @@ def main() -> None:
                 blend_threshold=float(args.hyb_blend_threshold),
             )
             frame_idx += 1
+
+        if frame_idx == 0:
+            print(
+                f"Warning: no frames saved for {sample_name}/video{video_idx:05d} "
+                f"(n_bins={n_bins}; need chunk T >= hyb_kernel_size={args.hyb_kernel_size})"
+            )
 
     print(f"Saved hybrid motion visualizations under {save_root / sample_name}")
 
