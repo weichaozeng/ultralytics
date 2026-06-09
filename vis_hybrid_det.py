@@ -5,11 +5,11 @@ Writes per-chunk PNGs under ``{save_dir}/{sample}/videoXXXXX/``:
 
 - ``{stem}_hyb_recon.png`` — reconstruction (same tonemap as ``det_spad``)
 - ``{stem}_hyb_motion_peak.png`` — fast-channel weight peak (temporal max over blocks)
-- ``{stem}_hyb_kl_peak.png`` — slow-scale KL divergence peak (percentile-scaled)
+- ``{stem}_hyb_kl_peak.png`` — D_KL(boxcar‖gamma) peak (percentile-scaled)
 - ``{stem}_hyb_motion_blend.png`` — chunk blend weight toward last block (= motion_peak)
 - ``{stem}_hyb_motion_overlay.png`` — recon + ``motion_peak`` overlay
 - ``{stem}_hyb_motion_blocks.png`` — per-block fast-weight strip (if B > 1)
-- ``{stem}_hyb_kl_blocks.png`` — per-block slow-scale KL strip (if B > 1)
+- ``{stem}_hyb_kl_blocks.png`` — per-block D_KL(boxcar‖gamma) strip (if B > 1)
 - ``{stem}_hyb_motion_hist.png`` — KL peak vs motion_peak histograms
 - ``{stem}_hyb_motion_stats.txt`` — per-chunk percentile summary
 - ``{stem}_hyb_motion_mosaic.png`` — recon | kl_peak | motion_peak | motion_blend
@@ -261,7 +261,7 @@ def _save_distribution_hist(
         vmax=kl_vmax,
         bins=bins,
         color_bgr=(80, 200, 255),
-        label=f"kl_slow_peak (tau={gating_tau:g})",
+        label=f"kl_gamma_peak (tau={gating_tau:g})",
         panel_w=panel_w,
         panel_h=panel_h,
     )
@@ -384,7 +384,7 @@ def _save_motion_visuals(
 
     mosaic = _stitch_panels(
         [recon_bgr, kl_heat, peak_heat, blend_heat],
-        ["recon", "kl_slow_peak", "motion_peak", "motion_blend"],
+        ["recon", "kl_gamma_peak", "motion_peak", "motion_blend"],
     )
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_mosaic.png"), mosaic)
 
@@ -395,9 +395,9 @@ def _save_motion_visuals(
         f"kl_vmax={kl_scale:.6f} (fixed={kl_vmax:g}, percentile={kl_percentile:g})",
         "",
     ]
-    stats_lines.extend(_percentile_summary(kl_blocks, name="kl_slow_blocks", percentiles=percentiles))
+    stats_lines.extend(_percentile_summary(kl_blocks, name="kl_gamma_blocks", percentiles=percentiles))
     stats_lines.append("")
-    stats_lines.extend(_percentile_summary(kl_peak, name="kl_slow_peak", percentiles=percentiles))
+    stats_lines.extend(_percentile_summary(kl_peak, name="kl_gamma_peak", percentiles=percentiles))
     stats_lines.append("")
     stats_lines.extend(_percentile_summary(motion_blocks, name="motion_blocks", percentiles=percentiles))
     stats_lines.append("")
@@ -466,7 +466,7 @@ def main() -> None:
         "--hyb_max_filter_size",
         type=int,
         default=3,
-        help="Odd max-pool on per-block motion prob (1 = off); chunk blend has no spatial pool",
+        help="Odd max-pool on gamma routing score before softmax (1 = off)",
     )
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
     ap.add_argument("--vis_percentile", type=float, default=99.5)
@@ -483,7 +483,7 @@ def main() -> None:
         "--kl_percentile",
         type=float,
         default=99.5,
-        help="Percentile of kl_slow_peak used as heatmap vmax when --kl_vmax=0",
+        help="Percentile of kl_gamma_peak used as heatmap vmax when --kl_vmax=0",
     )
     ap.add_argument("--no_blocks", action="store_true", help="Skip per-block motion strip PNG")
     args = ap.parse_args()

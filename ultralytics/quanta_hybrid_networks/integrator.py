@@ -16,8 +16,8 @@ class GatedMultiScaleEMA(nn.Module):
     """
     White-box spatio-temporal integration for SPAD sensors.
 
-    Uses a heterogeneous 1D Filter Bank (Gamma, EMA, Boxcar) and Threshold-Free 
-    Bayesian Soft-Routing based on Bernoulli KL-Divergence to isolate motion.
+    Uses a heterogeneous 1D Filter Bank (Gamma, EMA, Boxcar) and threshold-free
+    Bayesian soft-routing: D_KL(boxcar || p_m) with boxcar as the stable reference.
     Exposes the same ``process_photon_cube`` contract as
     :class:`~ultralytics.quanta_neural_networks.integrator.PerPixelBayesian`.
     """
@@ -47,7 +47,7 @@ class GatedMultiScaleEMA(nn.Module):
         :param normalize: If True, normalize reconstruction by quantile.
         :param quantile: Upper quantile used when ``normalize`` is True.
         :param spatial_batch_size: Pixels per ``conv1d`` batch (lower uses less VRAM).
-        :param max_filter_size: Odd max-pool on per-block motion before temporal max / blend (1 = off).
+        :param max_filter_size: Odd max-pool on gamma routing score before softmax (1 = off).
         """
         super().__init__()
 
@@ -156,7 +156,7 @@ class GatedMultiScaleEMA(nn.Module):
 
     @staticmethod
     def max_pool2d(x: Tensor, kernel_size: int) -> Tensor:
-        """2D max-pool on ``[H, W]`` (neighborhood takes the highest motion score)."""
+        """2D max-pool on ``[H, W]`` (neighborhood takes the highest routing score)."""
         x_batched = x.unsqueeze(0).unsqueeze(0)
         padding = (kernel_size - 1) // 2
         pooled = F.max_pool2d(x_batched, kernel_size=kernel_size, stride=1, padding=padding)
@@ -170,7 +170,7 @@ class GatedMultiScaleEMA(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """
         Threshold-Free Bayesian Convolution Block.
-        :return: fused [H, W], motion_prob [H, W], max_kl_divergence [H, W] (debug)
+        :return: fused [H, W], motion_prob [H, W], kl_gamma [H, W] (debug)
         """
         h, w, t_seg = map(int, photon_block.shape)
         num_pixels = h * w
@@ -179,49 +179,49 @@ class GatedMultiScaleEMA(nn.Module):
             if spatial_batch_size is None
             else max(int(spatial_batch_size), 1)
         )
-        fused_flat = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
-        motion_raw = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
-        doe_raw = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
+        scores_all = torch.empty(
+            (num_pixels, self.num_scales), device=photon_block.device, dtype=torch.float32
+        )
+        y_all_flat = torch.empty(
+            (num_pixels, self.num_scales), device=photon_block.device, dtype=torch.float32
+        )
+        kl_gamma_raw = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
 
         x_flat = photon_block.reshape(num_pixels, 1, self.kernel_size).float()
-        eps = 1e-5 
+        eps = 1e-5
 
         for i in range(0, num_pixels, batch_size):
             end_i = min(i + batch_size, num_pixels)
             x_batch = x_flat[i:end_i]
-            
+
             # y_all: [batch, num_scales, 1]
             y_all = F.conv1d(x_batch, self.ema_kernel)
 
-            # q (Observation Proxy): Fastest Kernel (Gamma)
-            q = y_all[:, 0:1, :].clamp(eps, 1.0 - eps)
-            # p (Prediction Hypotheses): All Kernels
+            # q = Boxcar (stable reference); p_m = Gamma / EMA / Boxcar hypotheses
+            q = y_all[:, -1:, :].clamp(eps, 1.0 - eps)
             p = y_all.clamp(eps, 1.0 - eps)
 
-            # 1. Bernoulli KL Divergence D_KL(q || p)
+            # Bernoulli KL: D_KL(q || p_m); larger when p_m deviates from slow reference
             kl_div = q * torch.log(q / p) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - p))
 
-            # 2. Bayesian Scores = -Likelihood Penalty + Prior Reward
-            scores = -(kl_div / self.gating_tau) + (self.prior_strength * self.prior_logits)
+            # score_m = KL_m/τ + prior; motion raises gamma KL → higher gamma weight
+            scores = (kl_div / self.gating_tau).squeeze(-1) + (
+                self.prior_strength * self.prior_logits.squeeze(-1)
+            )
 
-            # 3. Soft-Routing
-            weights = F.softmax(scores, dim=1)
+            scores_all[i:end_i] = scores
+            y_all_flat[i:end_i] = y_all.squeeze(-1)
+            kl_gamma_raw[i:end_i] = kl_div[:, 0, :].squeeze(-1)
 
-            # KL soft-routing fusion (per-pixel; block fusion is not spatially pooled)
-            fused_flat[i:end_i] = torch.sum(weights * y_all, dim=1).squeeze(-1)
-            # Fast-channel weight = motion probability for downstream block blend
-            motion_raw[i:end_i] = weights[:, 0, :].squeeze(-1)
-            # Slowest-scale KL for debug heatmaps (replaces legacy DoE)
-            doe_raw[i:end_i] = kl_div[:, -1, :].squeeze(-1)
-
-        motion_map = motion_raw.view(h, w)
-        doe_map = doe_raw.view(h, w)
-
-        # Max-pool: if any neighbor is fast-changing, propagate that motion score
         if self.max_filter_size > 1:
-            motion_map = self.max_pool2d(motion_map, self.max_filter_size)
+            score_gamma = self.max_pool2d(scores_all[:, 0].view(h, w), self.max_filter_size)
+            scores_all[:, 0] = score_gamma.reshape(-1)
 
-        return fused_flat.view(h, w), motion_map, doe_map
+        weights = F.softmax(scores_all, dim=1)
+        fused_flat = (weights * y_all_flat).sum(dim=1)
+        motion_raw = weights[:, 0]
+
+        return fused_flat.view(h, w), motion_raw.view(h, w), kl_gamma_raw.view(h, w)
 
     @torch.no_grad()
     def _integrate_blocks_with_motion(
@@ -277,11 +277,9 @@ class GatedMultiScaleEMA(nn.Module):
 
         fused_mean = fused_hwb.mean(dim=-1, keepdim=True)
         fused_last = fused_hwb[..., -1:]
-        
+
         motion_peak_raw = motion_hwb.max(dim=-1).values
         motion_peak = motion_peak_raw
-
-        # Chunk blend: per-pixel temporal max only (no inter-block spatial pool)
         motion_blend = motion_peak.unsqueeze(-1)
         out = (1.0 - motion_blend) * fused_mean + motion_blend * fused_last
         

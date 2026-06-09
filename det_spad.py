@@ -320,7 +320,7 @@ def main():
         "--hyb_max_filter_size",
         type=int,
         default=3,
-        help="Odd max-pool on per-block motion prob (1 = off); chunk blend has no spatial pool",
+        help="Odd max-pool on gamma routing score before softmax (1 = off)",
     )
     # velintegrator
     ap.add_argument("--vel_max_shift", type=int, default=16)
