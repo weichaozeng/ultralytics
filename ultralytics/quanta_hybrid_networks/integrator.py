@@ -16,9 +16,8 @@ class GatedMultiScaleEMA(nn.Module):
     """
     White-box spatio-temporal integration for SPAD sensors.
 
-    Non-overlapping ``kernel_size`` bins are convolved (no cross-block padding) to one
-    gated value per block; static regions average all blocks for denoising, while
-    moving regions use the latest block only to avoid multi-block motion ghosts.
+    Uses a heterogeneous 1D Filter Bank (Gamma, EMA, Boxcar) and Threshold-Free 
+    Bayesian Soft-Routing based on Bernoulli KL-Divergence to isolate motion.
     Exposes the same ``process_photon_cube`` contract as
     :class:`~ultralytics.quanta_neural_networks.integrator.PerPixelBayesian`.
     """
@@ -28,33 +27,29 @@ class GatedMultiScaleEMA(nn.Module):
         alphas: list[float] | None = None,
         chunk_size: int = 320,
         kernel_size: int = 64,
-        v_threshold: float = 0.1,
-        blend_threshold: float = 0.5,
-        gating_sharpness: float = 20.0,
+        prior_strength: float = 1.0,
+        gating_tau: float = 0.05,
         subsampling: int = 1,
         hot_pixel_mask: np.ndarray | None = None,
         normalize: bool = False,
         quantile: float = 1.0,
-        gating_tau: float = 0.1,
         spatial_batch_size: int = 16384,
         min_filter_size: int = 7,
         peak_min_filter_size: int = 7,
     ):
         """
-        :param alphas: Per-scale EMA decay rates (larger alpha = faster response; default fastest ≈10-bin FIR memory).
-        :param chunk_size: Nominal raw window length (``det_spad`` slicing); integration tiles by ``kernel_size`` only.
-        :param kernel_size: FIR length; each non-overlapping segment must contain exactly this many bins.
-        :param v_threshold: DoE magnitude threshold for per-block motion score.
-        :param blend_threshold: ``motion_peak`` threshold for chunk mean/last blend (score in ``[0, 1]``).
-        :param gating_sharpness: Sigmoid sharpness on motion score and blend gate.
-        :param subsampling: Output temporal subsampling (same role as PerPixelBayesian).
+        :param alphas: Slowness proxies for scales. Used to define prior rewards.
+        :param chunk_size: Nominal raw window length (``det_spad`` slicing).
+        :param kernel_size: FIR length; non-overlapping segments contain this many bins.
+        :param prior_strength: Bayesian prior weight pushing toward slower (smoother) EMAs.
+        :param gating_tau: Softmax temperature for KL-divergence routing.
+        :param subsampling: Output temporal subsampling.
         :param hot_pixel_mask: Optional hot-pixel mask for inpainting.
         :param normalize: If True, normalize reconstruction by quantile.
         :param quantile: Upper quantile used when ``normalize`` is True.
-        :param gating_tau: RBF temperature for per-scale routing within each time block.
         :param spatial_batch_size: Pixels per ``conv1d`` batch (lower uses less VRAM).
-        :param min_filter_size: Odd min-pool on per-block ``motion_score`` before scale routing (1 = off).
-        :param peak_min_filter_size: Odd min-pool on chunk ``motion_peak`` before block mean/last blend (1 = off).
+        :param min_filter_size: Odd min-pool on per-block motion prior to scale routing.
+        :param peak_min_filter_size: Odd min-pool on chunk motion before block mean/last blend.
         """
         super().__init__()
 
@@ -70,14 +65,12 @@ class GatedMultiScaleEMA(nn.Module):
 
         self.chunk_size = max(int(chunk_size), 1)
         self.kernel_size = max(int(kernel_size), 1)
-        self.v_threshold = float(v_threshold)
-        self.blend_threshold = float(blend_threshold)
-        self.gating_sharpness = float(gating_sharpness)
+        self.prior_strength = float(prior_strength)
+        self.gating_tau = float(gating_tau)
         self.subsampling = max(int(subsampling), 1)
         self.hot_pixel_mask = hot_pixel_mask
         self.normalize = bool(normalize)
         self.quantile = float(quantile)
-        self.gating_tau = float(gating_tau)
         self.spatial_batch_size = max(int(spatial_batch_size), 1)
         self.min_filter_size = min_filter_size
         self.peak_min_filter_size = peak_min_filter_size
@@ -85,8 +78,11 @@ class GatedMultiScaleEMA(nn.Module):
         self.alphas = sorted(alphas, reverse=True)
         self.num_scales = len(self.alphas)
 
-        centers = torch.linspace(1.0, 0.0, self.num_scales).view(1, self.num_scales, 1)
-        self.register_buffer("channel_centers", centers)
+        # Use alphas to construct Bayesian Prior Logits (-log(alpha)): 
+        # Slower scales (smaller alpha) get higher prior reward
+        prior_tensor = -torch.log(torch.tensor(self.alphas, dtype=torch.float32).clamp(min=1e-5))
+        self.register_buffer("prior_logits", prior_tensor.view(1, self.num_scales, 1))
+
         self._rebuild_ema_kernel()
 
         self.t_absolute = 0
@@ -94,25 +90,37 @@ class GatedMultiScaleEMA(nn.Module):
 
     def __repr__(self) -> str:
         return (
-            f"{self.__class__.__name__}(chunk_size={self.chunk_size}, kernel_size={self.kernel_size}, "
-            f"subsampling={self.subsampling}, num_scales={self.num_scales}, "
-            f"v_threshold={self.v_threshold}, blend_threshold={self.blend_threshold})"
+            f"{self.__class__.__name__}(kernel_size={self.kernel_size}, "
+            f"prior_strength={self.prior_strength}, tau={self.gating_tau})"
         )
 
     def _rebuild_ema_kernel(self, device: torch.device | str | None = None) -> None:
-        """Rebuild causal FIR kernels after ``kernel_size`` changes.
-
-        Each scale uses ``alpha * (1-alpha)^lag`` (fast → recent-heavy, slow → flatter),
-        then normalizes so taps sum to 1 within ``kernel_size`` (unit DC gain for 0/1 input).
-        """
+        """Rebuild heterogeneous FIR kernels: Gamma (fast), EMA (mid), Boxcar (slow)."""
         kernel = torch.zeros(self.num_scales, 1, self.kernel_size, dtype=torch.float32)
+        
         for m, alpha in enumerate(self.alphas):
             lags = torch.arange(self.kernel_size - 1, -1, -1, dtype=torch.float32)
-            taps = alpha * torch.pow(1 - alpha, lags)
+            
+            if m == 0:
+                # 1. Fastest Scale: Gamma Kernel (Synaptic response)
+                # Resists single-photon dark counts by ramping up instead of instant spike
+                tau_gamma = 2.0
+                taps = lags * torch.exp(-lags / tau_gamma)
+            elif m == self.num_scales - 1:
+                # 2. Slowest Scale: Boxcar Kernel (Uniform average)
+                # True Maximum Likelihood Estimator for static Poisson background
+                taps = torch.ones_like(lags)
+            else:
+                # 3. Intermediate Scales: Standard EMA
+                taps = alpha * torch.pow(1 - alpha, lags)
+                
+            # Strictly non-negative & normalized to area 1
             kernel[m, 0, :] = taps / taps.sum().clamp(min=1e-12)
+
         if device is None and hasattr(self, "ema_kernel"):
             device = self.ema_kernel.device
         kernel = kernel.to(device or "cpu")
+        
         if hasattr(self, "ema_kernel"):
             del self.ema_kernel
         self.register_buffer("ema_kernel", kernel)
@@ -126,23 +134,9 @@ class GatedMultiScaleEMA(nn.Module):
         if int(self.kernel_size) != old_kernel_size:
             self.kernel_size = max(int(self.kernel_size), 1)
             self._rebuild_ema_kernel()
-        if "chunk_size" in kwargs and kwargs["chunk_size"] is not None:
-            self.chunk_size = max(int(self.chunk_size), 1)
-        if "spatial_batch_size" in kwargs and kwargs["spatial_batch_size"] is not None:
-            self.spatial_batch_size = max(int(self.spatial_batch_size), 1)
-        if "min_filter_size" in kwargs and kwargs["min_filter_size"] is not None:
-            mfs = max(int(self.min_filter_size), 1)
-            if mfs % 2 == 0:
-                raise ValueError("min_filter_size must be odd (or 1 to disable min-pool)")
-            self.min_filter_size = mfs
-        if "peak_min_filter_size" in kwargs and kwargs["peak_min_filter_size"] is not None:
-            pmfs = max(int(self.peak_min_filter_size), 1)
-            if pmfs % 2 == 0:
-                raise ValueError("peak_min_filter_size must be odd (or 1 to disable min-pool)")
-            self.peak_min_filter_size = pmfs
 
     def set_cube(self, photon_cube: Tensor) -> None:
-        """Record input cube shape (mirrors PerPixelBayesian)."""
+        """Record input cube shape."""
         self._h, self._w, self._t = map(int, photon_cube.shape)
 
     def clamp_recons(self, recons: Tensor) -> Tensor:
@@ -157,7 +151,7 @@ class GatedMultiScaleEMA(nn.Module):
 
     @staticmethod
     def min_pool2d(x: Tensor, kernel_size: int) -> Tensor:
-        """2D min-pool on ``[H, W]`` (same implementation as PerPixelBayesian)."""
+        """2D min-pool on ``[H, W]``."""
         x_batched = x.unsqueeze(0).unsqueeze(0)
         padding = (kernel_size - 1) // 2
         pooled = -F.max_pool2d(
@@ -172,17 +166,10 @@ class GatedMultiScaleEMA(nn.Module):
         spatial_batch_size: int | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """
-        Convolve one non-overlapping ``[H, W, kernel_size]`` segment (no padding).
-
-        :return: ``fused [H, W]``, ``motion_score [H, W]`` (spatially min-pooled when configured),
-            ``doe [H, W]`` raw ``|y_fast - y_slow|`` before sigmoid (no min-pool).
+        Threshold-Free Bayesian Convolution Block.
+        :return: fused [H, W], motion_prob [H, W], max_kl_divergence [H, W] (debug)
         """
         h, w, t_seg = map(int, photon_block.shape)
-        if t_seg != self.kernel_size:
-            raise ValueError(
-                f"Expected segment length kernel_size={self.kernel_size}, got T={t_seg}"
-            )
-
         num_pixels = h * w
         batch_size = (
             self.spatial_batch_size
@@ -192,45 +179,44 @@ class GatedMultiScaleEMA(nn.Module):
         fused_flat = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
         motion_raw = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
         doe_raw = torch.empty((num_pixels,), device=photon_block.device, dtype=torch.float32)
-        y_cache = torch.empty(
-            (num_pixels, self.num_scales),
-            device=photon_block.device,
-            dtype=torch.float32,
-        )
+
         x_flat = photon_block.reshape(num_pixels, 1, self.kernel_size).float()
+        eps = 1e-5 
 
         for i in range(0, num_pixels, batch_size):
             end_i = min(i + batch_size, num_pixels)
             x_batch = x_flat[i:end_i]
+            
+            # y_all: [batch, num_scales, 1]
             y_all = F.conv1d(x_batch, self.ema_kernel)
 
-            y_fast = y_all[:, 0:1, :]
-            y_slow = y_all[:, -1:, :]
-            # doe_abs = torch.abs(y_fast - y_slow).squeeze(-1).squeeze(-1)
-            eps = 1e-4 
-            doe_abs = (torch.abs(y_fast - y_slow) / torch.sqrt(y_slow + eps)).squeeze(-1).squeeze(-1)
-            motion_score = torch.sigmoid(
-                self.gating_sharpness * (doe_abs - self.v_threshold)
-            )
+            # q (Observation Proxy): Fastest Kernel (Gamma)
+            q = y_all[:, 0:1, :].clamp(eps, 1.0 - eps)
+            # p (Prediction Hypotheses): All Kernels
+            p = y_all.clamp(eps, 1.0 - eps)
 
-            y_cache[i:end_i] = y_all.squeeze(-1)
-            motion_raw[i:end_i] = motion_score.squeeze(-1).squeeze(-1)
-            doe_raw[i:end_i] = doe_abs
+            # 1. Bernoulli KL Divergence D_KL(q || p)
+            kl_div = q * torch.log(q / p) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - p))
+
+            # 2. Bayesian Scores = -Likelihood Penalty + Prior Reward
+            scores = -(kl_div / self.gating_tau) + (self.prior_strength * self.prior_logits)
+
+            # 3. Soft-Routing
+            weights = F.softmax(scores, dim=1)
+
+            # KL soft-routing fusion (per-pixel, before spatial min-pool on motion)
+            fused_flat[i:end_i] = torch.sum(weights * y_all, dim=1).squeeze(-1)
+            # Fast-channel weight = motion probability for downstream block blend
+            motion_raw[i:end_i] = weights[:, 0, :].squeeze(-1)
+            # Slowest-scale KL for debug heatmaps (replaces legacy DoE)
+            doe_raw[i:end_i] = kl_div[:, -1, :].squeeze(-1)
 
         motion_map = motion_raw.view(h, w)
         doe_map = doe_raw.view(h, w)
+
+        # Spatial min-pool on motion prob only affects chunk-level blend, not block fusion
         if self.min_filter_size > 1:
             motion_map = self.min_pool2d(motion_map, self.min_filter_size)
-        motion_flat = motion_map.reshape(num_pixels)
-
-        for i in range(0, num_pixels, batch_size):
-            end_i = min(i + batch_size, num_pixels)
-            motion_batch = motion_flat[i:end_i].view(-1, 1, 1)
-            y_batch = y_cache[i:end_i].unsqueeze(-1)
-
-            distance_sq = torch.pow(motion_batch - self.channel_centers, 2)
-            scale_weights = F.softmax(-distance_sq / self.gating_tau, dim=1)
-            fused_flat[i:end_i] = torch.sum(scale_weights * y_batch, dim=1).squeeze(-1)
 
         return fused_flat.view(h, w), motion_map, doe_map
 
@@ -240,16 +226,6 @@ class GatedMultiScaleEMA(nn.Module):
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """
         Integrate ``[H, W, T]`` and return fused output plus per-pixel motion debug maps.
-
-        Debug tensors (raw Bayer resolution ``[H, W]`` unless noted):
-
-        - ``motion_blocks``: block ``motion_score`` after scale min-pool, ``[H, W, B]``
-        - ``doe_blocks``: block raw ``|y_fast - y_slow|`` before sigmoid, ``[H, W, B]``
-        - ``motion_peak_raw``: ``max`` over blocks before peak min-pool
-        - ``motion_peak``: peak score after ``peak_min_filter_size`` min-pool
-        - ``doe_peak_raw``: ``max`` over ``doe_blocks`` before peak min-pool
-        - ``doe_peak``: raw DoE peak after ``peak_min_filter_size`` min-pool
-        - ``motion_blend``: chunk-level blend toward last block, ``[H, W]`` in ``[0, 1]``
         """
         h, w, t = map(int, photon_cube.shape)
         ks = self.kernel_size
@@ -267,9 +243,7 @@ class GatedMultiScaleEMA(nn.Module):
             out_t = 1 if t > 0 else 0
             return photon_cube.new_zeros(h, w, out_t, dtype=torch.float32), empty_debug
 
-        fused_stack = []
-        motion_stack = []
-        doe_stack = []
+        fused_stack, motion_stack, doe_stack = [], [], []
         for b in range(n_blocks):
             seg = photon_cube[:, :, b * ks : (b + 1) * ks]
             fused_b, motion_b, doe_b = self._gate_conv_block(seg)
@@ -291,62 +265,43 @@ class GatedMultiScaleEMA(nn.Module):
             motion_peak = motion_peak_raw
             if self.peak_min_filter_size > 1:
                 motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
-            motion_blend = torch.sigmoid(
-                self.gating_sharpness * (motion_peak - self.blend_threshold)
-            )
+            
+            # Direct soft-blend, no threshold
+            motion_blend = motion_peak
             debug = {
-                "motion_blocks": motion_hwb,
-                "doe_blocks": doe_hwb,
-                "motion_peak_raw": motion_peak_raw,
-                "motion_peak": motion_peak,
-                "doe_peak_raw": doe_peak_raw,
-                "doe_peak": doe_peak,
+                "motion_blocks": motion_hwb, "doe_blocks": doe_hwb,
+                "motion_peak_raw": motion_peak_raw, "motion_peak": motion_peak,
+                "doe_peak_raw": doe_peak_raw, "doe_peak": doe_peak,
                 "motion_blend": motion_blend,
             }
             return fused_hwb[..., -1:], debug
 
         fused_mean = fused_hwb.mean(dim=-1, keepdim=True)
         fused_last = fused_hwb[..., -1:]
+        
         motion_peak_raw = motion_hwb.max(dim=-1).values
         motion_peak = motion_peak_raw
         if self.peak_min_filter_size > 1:
             motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
-        motion_blend = torch.sigmoid(
-            self.gating_sharpness * (motion_peak.unsqueeze(-1) - self.blend_threshold)
-        ).squeeze(-1)
-        out = (1.0 - motion_blend.unsqueeze(-1)) * fused_mean + motion_blend.unsqueeze(-1) * fused_last
+            
+        # The blend coefficient is naturally derived from the Bayesian weight
+        motion_blend = motion_peak.unsqueeze(-1)
+        out = (1.0 - motion_blend) * fused_mean + motion_blend * fused_last
+        
         debug = {
-            "motion_blocks": motion_hwb,
-            "doe_blocks": doe_hwb,
-            "motion_peak_raw": motion_peak_raw,
-            "motion_peak": motion_peak,
-            "doe_peak_raw": doe_peak_raw,
-            "doe_peak": doe_peak,
-            "motion_blend": motion_blend,
+            "motion_blocks": motion_hwb, "doe_blocks": doe_hwb,
+            "motion_peak_raw": motion_peak_raw, "motion_peak": motion_peak,
+            "doe_peak_raw": doe_peak_raw, "doe_peak": doe_peak,
+            "motion_blend": motion_blend.squeeze(-1),
         }
         return out, debug
 
     @torch.no_grad()
     def _integrate_blocks(self, photon_cube: Tensor) -> Tensor:
-        """
-        Tile ``[H, W, T]`` into non-overlapping ``kernel_size`` segments; aggregate block outputs.
-
-        Each block: ``kernel_size``-bin conv → per-pixel gated ``fused_b`` and ``motion_score_b``.
-        Chunk output blends block means vs. the latest block (per pixel):
-
-        - low peak ``motion_score`` across blocks → ``mean(fused_b)`` (denoise, all windows contribute)
-        - high peak motion → ``fused_{B-1}`` only (avoid ghosting from misaligned block snapshots)
-
-        ``motion_peak`` is min-pooled spatially (``peak_min_filter_size``) before the blend, analogous to PPB
-        runlength pooling: static neighbours pull pixels toward block averaging.
-
-        Remainder bins ``T % kernel_size`` are ignored (no padding).
-        """
         fused, _ = self._integrate_blocks_with_motion(photon_cube)
         return fused
 
     def _subsample_reconstruction(self, fused_hwt: Tensor) -> Tensor:
-        """Apply PerPixelBayesian-style temporal subsampling to a dense timeline."""
         h, w, t = map(int, fused_hwt.shape)
         if t <= 0:
             return fused_hwt.new_zeros(h, w, 0, dtype=torch.float32)
@@ -354,7 +309,6 @@ class GatedMultiScaleEMA(nn.Module):
             out = fused_hwt.new_zeros(h, w, 1, dtype=torch.float32)
             out[..., 0] = fused_hwt[..., -1].float()
             return out
-
         return fused_hwt[..., self.subsampling - 1 :: self.subsampling]
 
     @torch.no_grad()
@@ -368,37 +322,23 @@ class GatedMultiScaleEMA(nn.Module):
         clear_states: bool = True,
         chunk_size: int | None = None,
         kernel_size: int | None = None,
-        v_threshold: float | None = None,
-        blend_threshold: float | None = None,
-        gating_sharpness: float | None = None,
+        prior_strength: float | None = None,
         gating_tau: float | None = None,
         min_filter_size: int | None = None,
         peak_min_filter_size: int | None = None,
         **kwargs,
     ) -> Tensor:
-        """
-        Integrate a photon cube and return subsampled reconstruction ``[H, W, T']``.
-
-        Each call is stateless across chunks (``clear_states`` only resets ``t_absolute``).
-        """
-        del kwargs  # BOCPD-only kwargs ignored for hybrid integrator
+        del kwargs
 
         if clear_states:
             self.t_absolute = 0
 
         self.update_hyperparams(
-            subsampling=subsampling,
-            hot_pixel_mask=hot_pixel_mask,
-            normalize=normalize,
-            quantile=quantile,
-            chunk_size=chunk_size,
-            kernel_size=kernel_size,
-            v_threshold=v_threshold,
-            blend_threshold=blend_threshold,
-            gating_sharpness=gating_sharpness,
-            gating_tau=gating_tau,
-            min_filter_size=min_filter_size,
-            peak_min_filter_size=peak_min_filter_size,
+            subsampling=subsampling, hot_pixel_mask=hot_pixel_mask,
+            normalize=normalize, quantile=quantile,
+            chunk_size=chunk_size, kernel_size=kernel_size,
+            prior_strength=prior_strength, gating_tau=gating_tau,
+            min_filter_size=min_filter_size, peak_min_filter_size=peak_min_filter_size,
         )
 
         self.set_cube(photon_cube)
@@ -423,37 +363,23 @@ class GatedMultiScaleEMA(nn.Module):
         clear_states: bool = True,
         chunk_size: int | None = None,
         kernel_size: int | None = None,
-        v_threshold: float | None = None,
-        blend_threshold: float | None = None,
-        gating_sharpness: float | None = None,
+        prior_strength: float | None = None,
         gating_tau: float | None = None,
         min_filter_size: int | None = None,
         peak_min_filter_size: int | None = None,
         **kwargs,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        """
-        Like :meth:`process_photon_cube`, also returning motion debug maps at raw resolution.
-
-        See :meth:`_integrate_blocks_with_motion` for debug tensor keys.
-        """
         del kwargs
 
         if clear_states:
             self.t_absolute = 0
 
         self.update_hyperparams(
-            subsampling=subsampling,
-            hot_pixel_mask=hot_pixel_mask,
-            normalize=normalize,
-            quantile=quantile,
-            chunk_size=chunk_size,
-            kernel_size=kernel_size,
-            v_threshold=v_threshold,
-            blend_threshold=blend_threshold,
-            gating_sharpness=gating_sharpness,
-            gating_tau=gating_tau,
-            min_filter_size=min_filter_size,
-            peak_min_filter_size=peak_min_filter_size,
+            subsampling=subsampling, hot_pixel_mask=hot_pixel_mask,
+            normalize=normalize, quantile=quantile,
+            chunk_size=chunk_size, kernel_size=kernel_size,
+            prior_strength=prior_strength, gating_tau=gating_tau,
+            min_filter_size=min_filter_size, peak_min_filter_size=peak_min_filter_size,
         )
 
         self.set_cube(photon_cube)
@@ -468,5 +394,4 @@ class GatedMultiScaleEMA(nn.Module):
         return recons, motion_debug
 
     def forward(self, photon_cube: Tensor) -> Tensor:
-        """Low-level forward: block-tiled integration → ``[H, W, 1]`` (or ``[H,W,0]``)."""
         return self._integrate_blocks(photon_cube)

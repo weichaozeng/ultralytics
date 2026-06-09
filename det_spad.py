@@ -7,7 +7,7 @@ frames with one of:
 - ppb: PerPixelBayesian reconstruction
 - vel: detection-guided velocity-compensated integration
 
-- hyb: GatedMultiScaleEMA (parallel multi-scale FIR + soft routing)
+- hyb: GatedMultiScaleEMA (heterogeneous FIR bank + KL soft-routing, threshold-free)
 
 The resulting frames are passed to an unmodified pretrained YOLO pose model.
 """
@@ -302,22 +302,25 @@ def main():
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
     # gated multi-scale EMA (hybrid)
     ap.add_argument("--hyb_kernel_size", type=int, default=64, help="FIR kernel length for hyb integrator")
-    ap.add_argument("--hyb_v_threshold", type=float, default=0.1)
     ap.add_argument(
-        "--hyb_blend_threshold",
+        "--hyb_prior_strength",
         type=float,
-        default=0.5,
-        help="motion_peak threshold for chunk mean/last blend (score in [0, 1])",
+        default=1.0,
+        help="Bayesian prior weight favoring slower scales in KL routing",
     )
-    ap.add_argument("--hyb_gating_sharpness", type=float, default=20.0)
-    ap.add_argument("--hyb_gating_tau", type=float, default=0.1)
+    ap.add_argument(
+        "--hyb_gating_tau",
+        type=float,
+        default=0.05,
+        help="Softmax temperature for Bernoulli KL scale routing",
+    )
     ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hyb_quantile", type=float, default=1.0)
     ap.add_argument(
         "--hyb_min_filter_size",
         type=int,
         default=7,
-        help="Odd min-pool on per-block motion_score before scale routing (1 = off; smaller = sharper edges)",
+        help="Odd min-pool on per-block motion prob before chunk blend (1 = off)",
     )
     ap.add_argument(
         "--hyb_peak_min_filter_size",
@@ -387,9 +390,7 @@ def main():
             chunk_size=int(args.chunk_size),
             kernel_size=int(args.hyb_kernel_size),
             subsampling=int(args.chunk_size),
-            v_threshold=float(args.hyb_v_threshold),
-            blend_threshold=float(args.hyb_blend_threshold),
-            gating_sharpness=float(args.hyb_gating_sharpness),
+            prior_strength=float(args.hyb_prior_strength),
             gating_tau=float(args.hyb_gating_tau),
             normalize=bool(args.hyb_normalize),
             quantile=float(args.hyb_quantile),

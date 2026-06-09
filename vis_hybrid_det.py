@@ -4,15 +4,15 @@
 Writes per-chunk PNGs under ``{save_dir}/{sample}/videoXXXXX/``:
 
 - ``{stem}_hyb_recon.png`` — reconstruction (same tonemap as ``det_spad``)
-- ``{stem}_hyb_motion_peak.png`` — ``motion_peak`` heatmap (post peak min-pool)
-- ``{stem}_hyb_doe_peak.png`` — raw DoE peak ``max_b |y_fast-y_slow|`` (percentile-scaled)
-- ``{stem}_hyb_motion_blend.png`` — chunk blend weight toward last block
+- ``{stem}_hyb_motion_peak.png`` — fast-channel weight peak (post peak min-pool)
+- ``{stem}_hyb_kl_peak.png`` — slow-scale KL divergence peak (percentile-scaled)
+- ``{stem}_hyb_motion_blend.png`` — chunk blend weight toward last block (= motion_peak)
 - ``{stem}_hyb_motion_overlay.png`` — recon + ``motion_peak`` overlay
-- ``{stem}_hyb_motion_blocks.png`` — per-block ``motion_score`` strip (if B > 1)
-- ``{stem}_hyb_doe_blocks.png`` — per-block raw DoE strip (if B > 1)
-- ``{stem}_hyb_motion_hist.png`` — DoE peak vs motion_peak histograms
+- ``{stem}_hyb_motion_blocks.png`` — per-block fast-weight strip (if B > 1)
+- ``{stem}_hyb_kl_blocks.png`` — per-block slow-scale KL strip (if B > 1)
+- ``{stem}_hyb_motion_hist.png`` — KL peak vs motion_peak histograms
 - ``{stem}_hyb_motion_stats.txt`` — per-chunk percentile summary
-- ``{stem}_hyb_motion_mosaic.png`` — recon | doe_peak | motion_peak | motion_blend
+- ``{stem}_hyb_motion_mosaic.png`` — recon | kl_peak | motion_peak | motion_blend
 
 Example
 -------
@@ -249,19 +249,19 @@ def _draw_hist_panel(
 def _save_distribution_hist(
     *,
     out_path: Path,
-    doe_peak: np.ndarray,
+    kl_peak: np.ndarray,
     motion_peak: np.ndarray,
-    doe_vmax: float,
-    v_threshold: float,
-    blend_threshold: float,
+    kl_vmax: float,
+    prior_strength: float,
+    gating_tau: float,
 ) -> None:
     panel_h, panel_w, bins = 180, 360, 48
     top = _draw_hist_panel(
-        values=doe_peak,
-        vmax=doe_vmax,
+        values=kl_peak,
+        vmax=kl_vmax,
         bins=bins,
         color_bgr=(80, 200, 255),
-        label=f"doe_peak (v_thr={v_threshold:g})",
+        label=f"kl_slow_peak (tau={gating_tau:g})",
         panel_w=panel_w,
         panel_h=panel_h,
     )
@@ -270,7 +270,7 @@ def _save_distribution_hist(
         vmax=1.0,
         bins=bins,
         color_bgr=(120, 220, 120),
-        label=f"motion_peak (blend_thr={blend_threshold:g})",
+        label=f"motion_peak (prior={prior_strength:g})",
         panel_w=panel_w,
         panel_h=panel_h,
     )
@@ -349,10 +349,10 @@ def _save_motion_visuals(
     cmap_id: int,
     overlay_alpha: float,
     save_blocks: bool,
-    doe_vmax: float,
-    doe_percentile: float,
-    v_threshold: float,
-    blend_threshold: float,
+    kl_vmax: float,
+    kl_percentile: float,
+    prior_strength: float,
+    gating_tau: float,
 ) -> None:
     display_hw = recon_bgr.shape[:2]
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
@@ -363,41 +363,41 @@ def _save_motion_visuals(
     motion_peak = _tensor_hw(motion_debug["motion_peak"])
     motion_blend = _tensor_hw(motion_debug["motion_blend"])
     motion_blocks = _tensor_hw(motion_debug["motion_blocks"])
-    doe_peak = _tensor_hw(motion_debug["doe_peak"])
-    doe_blocks = _tensor_hw(motion_debug["doe_blocks"])
+    kl_peak = _tensor_hw(motion_debug["doe_peak"])
+    kl_blocks = _tensor_hw(motion_debug["doe_blocks"])
 
-    doe_scale = _resolve_vmax(doe_peak, fixed_vmax=doe_vmax, percentile=doe_percentile)
+    kl_scale = _resolve_vmax(kl_peak, fixed_vmax=kl_vmax, percentile=kl_percentile)
 
     peak_disp = _resize_map_to_display(motion_peak, display_hw)
-    doe_disp = _resize_map_to_display(doe_peak, display_hw)
+    kl_disp = _resize_map_to_display(kl_peak, display_hw)
     blend_disp = _resize_map_to_display(motion_blend, display_hw)
     peak_heat = _score_to_heatmap(peak_disp, cmap_id)
-    doe_heat = _value_to_heatmap(doe_disp, cmap_id, vmax=doe_scale)
+    kl_heat = _value_to_heatmap(kl_disp, cmap_id, vmax=kl_scale)
     blend_heat = _score_to_heatmap(blend_disp, cmap_id)
     overlay = _overlay_heatmap(recon_bgr, peak_heat, overlay_alpha)
 
     cv2.imwrite(str(out_dir / f"{stem}_hyb_recon.png"), recon_bgr)
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_peak.png"), peak_heat)
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_doe_peak.png"), doe_heat)
+    cv2.imwrite(str(out_dir / f"{stem}_hyb_kl_peak.png"), kl_heat)
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_blend.png"), blend_heat)
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_overlay.png"), overlay)
 
     mosaic = _stitch_panels(
-        [recon_bgr, doe_heat, peak_heat, blend_heat],
-        ["recon", "doe_peak", "motion_peak", "motion_blend"],
+        [recon_bgr, kl_heat, peak_heat, blend_heat],
+        ["recon", "kl_slow_peak", "motion_peak", "motion_blend"],
     )
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_mosaic.png"), mosaic)
 
     stats_lines = [
         f"stem={stem}",
-        f"v_threshold={v_threshold}",
-        f"blend_threshold={blend_threshold}",
-        f"doe_vmax={doe_scale:.6f} (fixed={doe_vmax:g}, percentile={doe_percentile:g})",
+        f"prior_strength={prior_strength}",
+        f"gating_tau={gating_tau}",
+        f"kl_vmax={kl_scale:.6f} (fixed={kl_vmax:g}, percentile={kl_percentile:g})",
         "",
     ]
-    stats_lines.extend(_percentile_summary(doe_blocks, name="doe_blocks", percentiles=percentiles))
+    stats_lines.extend(_percentile_summary(kl_blocks, name="kl_slow_blocks", percentiles=percentiles))
     stats_lines.append("")
-    stats_lines.extend(_percentile_summary(doe_peak, name="doe_peak", percentiles=percentiles))
+    stats_lines.extend(_percentile_summary(kl_peak, name="kl_slow_peak", percentiles=percentiles))
     stats_lines.append("")
     stats_lines.extend(_percentile_summary(motion_blocks, name="motion_blocks", percentiles=percentiles))
     stats_lines.append("")
@@ -409,11 +409,11 @@ def _save_motion_visuals(
 
     _save_distribution_hist(
         out_path=out_dir / f"{stem}_hyb_motion_hist.png",
-        doe_peak=doe_peak,
+        kl_peak=kl_peak,
         motion_peak=motion_peak,
-        doe_vmax=doe_scale,
-        v_threshold=v_threshold,
-        blend_threshold=blend_threshold,
+        kl_vmax=kl_scale,
+        prior_strength=prior_strength,
+        gating_tau=gating_tau,
     )
 
     if save_blocks:
@@ -423,24 +423,24 @@ def _save_motion_visuals(
             cmap_id,
             score01=True,
             vmax=1.0,
-            label_prefix="score_b",
+            label_prefix="mot_b",
         )
         if motion_strip is not None:
             cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_blocks.png"), motion_strip)
-        doe_strip = _block_strip(
-            doe_blocks,
+        kl_strip = _block_strip(
+            kl_blocks,
             display_hw,
             cmap_id,
             score01=False,
-            vmax=doe_scale,
-            label_prefix="doe_b",
+            vmax=kl_scale,
+            label_prefix="kl_b",
         )
-        if doe_strip is not None:
-            cv2.imwrite(str(out_dir / f"{stem}_hyb_doe_blocks.png"), doe_strip)
+        if kl_strip is not None:
+            cv2.imwrite(str(out_dir / f"{stem}_hyb_kl_blocks.png"), kl_strip)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Visualize hybrid integrator motion_score maps")
+    ap = argparse.ArgumentParser(description="Visualize hybrid integrator KL routing and blend maps")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory or .npy path")
     ap.add_argument("--save_dir", type=str, required=True, help="Output root directory")
     ap.add_argument("--chunk_size", type=int, default=320)
@@ -448,15 +448,18 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument("--hyb_kernel_size", type=int, default=64)
-    ap.add_argument("--hyb_v_threshold", type=float, default=0.1)
     ap.add_argument(
-        "--hyb_blend_threshold",
+        "--hyb_prior_strength",
         type=float,
-        default=0.5,
-        help="motion_peak threshold for chunk mean/last blend (score in [0, 1])",
+        default=1.0,
+        help="Bayesian prior weight favoring slower scales in KL routing",
     )
-    ap.add_argument("--hyb_gating_sharpness", type=float, default=20.0)
-    ap.add_argument("--hyb_gating_tau", type=float, default=0.1)
+    ap.add_argument(
+        "--hyb_gating_tau",
+        type=float,
+        default=0.05,
+        help="Softmax temperature for Bernoulli KL scale routing",
+    )
     ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hyb_quantile", type=float, default=1.0)
     ap.add_argument("--hyb_min_filter_size", type=int, default=7)
@@ -467,16 +470,16 @@ def main() -> None:
     ap.add_argument("--colormap", type=str, default="turbo", choices=sorted(COLORMAPS))
     ap.add_argument("--overlay_alpha", type=float, default=0.45, help="Heatmap alpha on recon overlay")
     ap.add_argument(
-        "--doe_vmax",
+        "--kl_vmax",
         type=float,
         default=0.0,
-        help="Fixed max for DoE heatmaps/histogram (0 = use --doe_percentile on doe_peak)",
+        help="Fixed max for KL heatmaps/histogram (0 = use --kl_percentile on kl_peak)",
     )
     ap.add_argument(
-        "--doe_percentile",
+        "--kl_percentile",
         type=float,
         default=99.5,
-        help="Percentile of doe_peak used as heatmap vmax when --doe_vmax=0",
+        help="Percentile of kl_slow_peak used as heatmap vmax when --kl_vmax=0",
     )
     ap.add_argument("--no_blocks", action="store_true", help="Skip per-block motion strip PNG")
     args = ap.parse_args()
@@ -494,9 +497,7 @@ def main() -> None:
         chunk_size=int(args.chunk_size),
         kernel_size=int(args.hyb_kernel_size),
         subsampling=int(args.chunk_size),
-        v_threshold=float(args.hyb_v_threshold),
-        blend_threshold=float(args.hyb_blend_threshold),
-        gating_sharpness=float(args.hyb_gating_sharpness),
+        prior_strength=float(args.hyb_prior_strength),
         gating_tau=float(args.hyb_gating_tau),
         normalize=bool(args.hyb_normalize),
         quantile=float(args.hyb_quantile),
@@ -552,10 +553,10 @@ def main() -> None:
                 cmap_id=cmap_id,
                 overlay_alpha=float(args.overlay_alpha),
                 save_blocks=not args.no_blocks,
-                doe_vmax=float(args.doe_vmax),
-                doe_percentile=float(args.doe_percentile),
-                v_threshold=float(args.hyb_v_threshold),
-                blend_threshold=float(args.hyb_blend_threshold),
+                kl_vmax=float(args.kl_vmax),
+                kl_percentile=float(args.kl_percentile),
+                prior_strength=float(args.hyb_prior_strength),
+                gating_tau=float(args.hyb_gating_tau),
             )
             frame_idx += 1
 
