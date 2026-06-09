@@ -1,24 +1,11 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Visualize GatedMultiScaleEMA motion maps alongside hybrid reconstructions.
+"""Visualize GatedMultiScaleEMA routing scores and reconstructions.
 
-Writes per-chunk PNGs under ``{save_dir}/{sample}/videoXXXXX/``:
+Writes per-chunk outputs under ``{save_dir}/{sample}/videoXXXXX/``:
 
-- ``{stem}_hyb_recon.png`` — reconstruction (same tonemap as ``det_spad``)
-- ``{stem}_hyb_motion_peak.png`` — fast-channel weight peak (temporal max over blocks)
-- ``{stem}_hyb_kl_peak.png`` — D_KL(boxcar‖gamma) peak (percentile-scaled)
-- ``{stem}_hyb_motion_blend.png`` — chunk blend weight toward last block (= motion_peak)
-- ``{stem}_hyb_motion_overlay.png`` — recon + ``motion_peak`` overlay
-- ``{stem}_hyb_motion_blocks.png`` — per-block fast-weight strip (if B > 1)
-- ``{stem}_hyb_kl_blocks.png`` — per-block D_KL(boxcar‖gamma) strip (if B > 1)
-- ``{stem}_hyb_motion_hist.png`` — KL peak vs motion_peak histograms
-- ``{stem}_hyb_motion_stats.txt`` — per-chunk percentile summary
-- ``{stem}_hyb_motion_mosaic.png`` — recon | kl_peak | motion_peak | motion_blend
-- ``{stem}_hyb_diag_mosaic.png`` — recon | fused_mean | fused_last | |last-mean|
-- ``{stem}_hyb_scale_mosaic.png`` — y_gamma | y_boxcar | weight_raw(last) | routing_gap
-- ``{stem}_hyb_weight_delta.png`` — motion_peak - weight_gamma_raw(last)
-- ``{stem}_hyb_recon_prenorm.png`` — reconstruction before quantile normalize
-- ``{stem}_hyb_compare_sum.png`` — side-by-side sum vs hyb (with ``--compare_sum``)
-- ``{stem}_hyb_diag.npz`` — raw float maps for offline analysis (with ``--save_npz``)
+- ``{stem}_hyb_stats.txt`` — percentile summary of pre-softmax routing scores
+- ``{stem}_hyb_compare.png`` — sum vs hyb reconstruction (side-by-side)
+- ``{stem}_hyb_scores.png`` — heatmaps of score_m for all filter scales (gamma / EMA / boxcar)
 
 Example
 -------
@@ -48,7 +35,6 @@ COLORMAPS = {
     "inferno": cv2.COLORMAP_INFERNO,
     "hot": cv2.COLORMAP_HOT,
 }
-
 
 @dataclass(frozen=True)
 class SpadSource:
@@ -133,28 +119,6 @@ def _raw_hwt_to_rgb_float(raw_hwt: torch.Tensor, *, packed_nch: int) -> torch.Te
     return torch.stack(frames, dim=0).to(raw_hwt.device)
 
 
-def _hw_map_to_bgr_u8(
-    hw_map: np.ndarray,
-    *,
-    vis_mode: str,
-    percentile: float,
-    gamma: float,
-    display_hw: tuple[int, int] | None = None,
-) -> np.ndarray:
-    """Tonemap a single Bayer-grid ``[H, W]`` map to BGR uint8 (demosaic for display)."""
-    hw_t = torch.from_numpy(hw_map.astype(np.float32)).unsqueeze(-1)
-    frames = _raw_hwt_to_rgb_float(hw_t, packed_nch=3)
-    bgr = _rgb_tensor_to_bgr_u8(
-        frames,
-        vis_mode=vis_mode,
-        percentile=percentile,
-        gamma=gamma,
-    )[0]
-    if display_hw is not None and bgr.shape[:2] != display_hw:
-        bgr = cv2.resize(bgr, (display_hw[1], display_hw[0]), interpolation=cv2.INTER_AREA)
-    return bgr
-
-
 def _rgb_tensor_to_bgr_u8(
     frames_tchw: torch.Tensor, *, vis_mode: str, percentile: float, gamma: float
 ) -> list[np.ndarray]:
@@ -193,11 +157,6 @@ def _resize_map_to_display(score_hw: np.ndarray, display_hw: tuple[int, int]) ->
     return cv2.resize(score_hw.astype(np.float32), (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
 
-def _score_to_heatmap(score01: np.ndarray, cmap_id: int) -> np.ndarray:
-    u8 = (np.clip(score01, 0.0, 1.0) * 255.0).round().astype(np.uint8)
-    return cv2.applyColorMap(u8, cmap_id)
-
-
 def _value_to_heatmap(values: np.ndarray, cmap_id: int, *, vmax: float) -> np.ndarray:
     vmax = max(float(vmax), 1e-8)
     u8 = (np.clip(values / vmax, 0.0, 1.0) * 255.0).round().astype(np.uint8)
@@ -213,24 +172,6 @@ def _resolve_vmax(values: np.ndarray, *, fixed_vmax: float, percentile: float) -
     return float(np.percentile(flat, percentile))
 
 
-def _masked_summary(
-    values: np.ndarray,
-    mask: np.ndarray,
-    *,
-    name: str,
-    percentiles: tuple[float, ...],
-) -> list[str]:
-    flat = np.asarray(values, dtype=np.float64).reshape(-1)
-    m = np.asarray(mask, dtype=bool).reshape(-1)
-    if flat.size == 0 or m.size != flat.size or not m.any():
-        return [f"[{name}] n=0 (empty mask)"]
-    sel = flat[m]
-    lines = [f"[{name}] n={sel.size} min={sel.min():.6f} max={sel.max():.6f} mean={sel.mean():.6f}"]
-    for p in percentiles:
-        lines.append(f"  p{p:g} = {float(np.percentile(sel, p)):.6f}")
-    return lines
-
-
 def _percentile_summary(values: np.ndarray, *, name: str, percentiles: tuple[float, ...]) -> list[str]:
     flat = np.asarray(values, dtype=np.float64).reshape(-1)
     if flat.size == 0:
@@ -241,86 +182,12 @@ def _percentile_summary(values: np.ndarray, *, name: str, percentiles: tuple[flo
     return lines
 
 
-def _draw_hist_panel(
-    *,
-    values: np.ndarray,
-    vmax: float,
-    bins: int,
-    color_bgr: tuple[int, int, int],
-    label: str,
-    panel_w: int,
-    panel_h: int,
-) -> np.ndarray:
-    flat = np.asarray(values, dtype=np.float64).reshape(-1)
-    if flat.size == 0:
-        flat = np.zeros(1, dtype=np.float64)
-    hist, edges = np.histogram(flat, bins=bins, range=(0.0, vmax))
-    hist = hist.astype(np.float64)
-    if hist.max() > 0:
-        hist /= hist.max()
-
-    margin_l, margin_b, margin_t = 48, 28, 22
-    plot_w = panel_w - margin_l - 8
-    plot_h = panel_h - margin_b - margin_t
-    panel = np.full((panel_h, panel_w, 3), 24, dtype=np.uint8)
-
-    x0, y0 = margin_l, margin_t
-    x1, y1 = margin_l + plot_w, margin_t + plot_h
-    cv2.rectangle(panel, (x0, y0), (x1, y1), (48, 48, 48), 1)
-
-    bar_w = max(plot_w // bins, 1)
-    for i, h_norm in enumerate(hist):
-        bar_h = int(round(h_norm * (plot_h - 2)))
-        bx0 = x0 + i * bar_w
-        bx1 = min(bx0 + bar_w - 1, x1 - 1)
-        by1 = y1 - 1
-        by0 = max(by1 - bar_h, y0 + 1)
-        cv2.rectangle(panel, (bx0, by0), (bx1, by1), color_bgr, -1)
-
-    cv2.putText(panel, label, (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
-    cv2.putText(panel, "0", (x0, y1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
-    cv2.putText(
-        panel,
-        f"{vmax:.3g}",
-        (x1 - 36, y1 + 18),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (180, 180, 180),
-        1,
-        cv2.LINE_AA,
-    )
-    return panel
-
-
-def _save_distribution_hist(
-    *,
-    out_path: Path,
-    kl_peak: np.ndarray,
-    motion_peak: np.ndarray,
-    kl_vmax: float,
-    prior_strength: float,
-    gating_tau: float,
-) -> None:
-    panel_h, panel_w, bins = 180, 360, 48
-    top = _draw_hist_panel(
-        values=kl_peak,
-        vmax=kl_vmax,
-        bins=bins,
-        color_bgr=(80, 200, 255),
-        label=f"kl_gamma_peak (tau={gating_tau:g})",
-        panel_w=panel_w,
-        panel_h=panel_h,
-    )
-    bottom = _draw_hist_panel(
-        values=motion_peak,
-        vmax=1.0,
-        bins=bins,
-        color_bgr=(120, 220, 120),
-        label=f"motion_peak (prior={prior_strength:g})",
-        panel_w=panel_w,
-        panel_h=panel_h,
-    )
-    cv2.imwrite(str(out_path), np.vstack([top, bottom]))
+def _scale_label(m: int, n_scales: int) -> str:
+    if m == 0:
+        return "gamma"
+    if m == n_scales - 1:
+        return "boxcar"
+    return f"ema{m}"
 
 
 def _label_panel(img_bgr: np.ndarray, text: str, label_h: int = 26) -> np.ndarray:
@@ -339,12 +206,6 @@ def _label_panel(img_bgr: np.ndarray, text: str, label_h: int = 26) -> np.ndarra
     return np.vstack([header, img_bgr])
 
 
-def _overlay_heatmap(base_bgr: np.ndarray, heat_bgr: np.ndarray, alpha: float) -> np.ndarray:
-    if base_bgr.shape[:2] != heat_bgr.shape[:2]:
-        heat_bgr = cv2.resize(heat_bgr, (base_bgr.shape[1], base_bgr.shape[0]), interpolation=cv2.INTER_AREA)
-    return cv2.addWeighted(base_bgr, 1.0 - alpha, heat_bgr, alpha, 0.0)
-
-
 def _stitch_panels(panels: list[np.ndarray], labels: list[str], gap: int = 6) -> np.ndarray:
     target_h = max(p.shape[0] for p in panels)
     resized = []
@@ -361,242 +222,67 @@ def _stitch_panels(panels: list[np.ndarray], labels: list[str], gap: int = 6) ->
     return out
 
 
-def _block_strip(
-    blocks_hwb: np.ndarray,
-    display_hw: tuple[int, int],
-    cmap_id: int,
-    *,
-    score01: bool,
-    vmax: float,
-    label_prefix: str,
-) -> np.ndarray | None:
-    """``blocks_hwb`` shape ``[H, W, B]`` → labelled horizontal strip."""
-    if blocks_hwb.ndim != 3 or blocks_hwb.shape[2] <= 1:
-        return None
-    panels = []
-    labels = []
-    for b in range(blocks_hwb.shape[2]):
-        disp = _resize_map_to_display(blocks_hwb[:, :, b], display_hw)
-        if score01:
-            heat = _score_to_heatmap(disp, cmap_id)
-        else:
-            heat = _value_to_heatmap(disp, cmap_id, vmax=vmax)
-        panels.append(heat)
-        labels.append(f"{label_prefix}{b}")
-    return _stitch_panels(panels, labels)
-
-
-def _save_motion_visuals(
+def _save_visuals(
     *,
     out_dir: Path,
     stem: str,
     recon_bgr: np.ndarray,
+    sum_bgr: np.ndarray,
     motion_debug: dict[str, torch.Tensor],
     cmap_id: int,
-    overlay_alpha: float,
-    save_blocks: bool,
-    kl_vmax: float,
-    kl_percentile: float,
+    score_vmax: float,
+    score_percentile: float,
     prior_strength: float,
     gating_tau: float,
-    vis_mode: str,
-    vis_percentile: float,
-    vis_gamma: float,
-    save_npz: bool,
-    compare_sum_bgr: np.ndarray | None,
     n_blocks: int,
     hyb_kernel_size: int,
     hyb_max_filter_size: int,
 ) -> None:
-    display_hw = recon_bgr.shape[:2]
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
-
-    def _tensor_hw(t: torch.Tensor) -> np.ndarray:
-        return t.detach().float().cpu().numpy()
-
-    motion_peak = _tensor_hw(motion_debug["motion_peak"])
-    motion_blend = _tensor_hw(motion_debug["motion_blend"])
-    motion_blocks = _tensor_hw(motion_debug["motion_blocks"])
-    kl_peak = _tensor_hw(motion_debug["doe_peak"])
-    kl_blocks = _tensor_hw(motion_debug["doe_blocks"])
-    fused_mean = _tensor_hw(motion_debug["fused_mean"])
-    fused_last = _tensor_hw(motion_debug["fused_last"])
-    weight_blocks = _tensor_hw(motion_debug["weight_gamma_blocks"])
-    y_scales_last = _tensor_hw(motion_debug["y_scales_last"])
-    recons_prenorm = _tensor_hw(motion_debug["recons_prenorm"])
-    if recons_prenorm.ndim == 3:
-        recons_prenorm = recons_prenorm[..., 0]
-
-    weight_raw_last = weight_blocks[..., -1] if weight_blocks.ndim == 3 else motion_peak
-    y_gamma = y_scales_last[..., 0]
-    y_boxcar = y_scales_last[..., -1]
-    fused_safe = np.maximum(recons_prenorm, 1e-6)
-    routing_gap = (weight_raw_last * y_gamma) / fused_safe
-    weight_delta = motion_peak - weight_raw_last
-    blend_delta = np.abs(fused_last - fused_mean)
-
-    kl_scale = _resolve_vmax(kl_peak, fixed_vmax=kl_vmax, percentile=kl_percentile)
-    gap_scale = _resolve_vmax(routing_gap, fixed_vmax=0.0, percentile=99.0)
-    delta_scale = _resolve_vmax(blend_delta, fixed_vmax=0.0, percentile=99.5)
-
-    peak_disp = _resize_map_to_display(motion_peak, display_hw)
-    kl_disp = _resize_map_to_display(kl_peak, display_hw)
-    blend_disp = _resize_map_to_display(motion_blend, display_hw)
-    peak_heat = _score_to_heatmap(peak_disp, cmap_id)
-    kl_heat = _value_to_heatmap(kl_disp, cmap_id, vmax=kl_scale)
-    blend_heat = _score_to_heatmap(blend_disp, cmap_id)
-    overlay = _overlay_heatmap(recon_bgr, peak_heat, overlay_alpha)
-
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_recon.png"), recon_bgr)
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_peak.png"), peak_heat)
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_kl_peak.png"), kl_heat)
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_blend.png"), blend_heat)
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_overlay.png"), overlay)
-
-    mosaic = _stitch_panels(
-        [recon_bgr, kl_heat, peak_heat, blend_heat],
-        ["recon", "kl_gamma_peak", "motion_peak", "motion_blend"],
-    )
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_mosaic.png"), mosaic)
-
     display_hw = recon_bgr.shape[:2]
-    fused_mean_bgr = _hw_map_to_bgr_u8(
-        fused_mean, vis_mode=vis_mode, percentile=vis_percentile, gamma=vis_gamma, display_hw=display_hw
-    )
-    fused_last_bgr = _hw_map_to_bgr_u8(
-        fused_last, vis_mode=vis_mode, percentile=vis_percentile, gamma=vis_gamma, display_hw=display_hw
-    )
-    prenorm_bgr = _hw_map_to_bgr_u8(
-        recons_prenorm, vis_mode=vis_mode, percentile=vis_percentile, gamma=vis_gamma, display_hw=display_hw
-    )
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_recon_prenorm.png"), prenorm_bgr)
 
-    diag_mosaic = _stitch_panels(
-        [recon_bgr, fused_mean_bgr, fused_last_bgr, _value_to_heatmap(_resize_map_to_display(blend_delta, display_hw), cmap_id, vmax=delta_scale)],
-        ["recon", "fused_mean", "fused_last", "|last-mean|"],
-    )
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_diag_mosaic.png"), diag_mosaic)
+    scores_last = motion_debug["scores_last"].detach().float().cpu().numpy()
+    n_scales = int(scores_last.shape[-1])
+    score_margin = scores_last[..., 0] - scores_last[..., -1]
 
-    weight_raw_disp = _resize_map_to_display(weight_raw_last, display_hw)
-    gap_disp = _resize_map_to_display(routing_gap, display_hw)
-    scale_mosaic = _stitch_panels(
-        [
-            _value_to_heatmap(_resize_map_to_display(y_gamma, display_hw), cmap_id, vmax=_resolve_vmax(y_gamma, fixed_vmax=0.0, percentile=99.5)),
-            _value_to_heatmap(_resize_map_to_display(y_boxcar, display_hw), cmap_id, vmax=_resolve_vmax(y_boxcar, fixed_vmax=0.0, percentile=99.5)),
-            _score_to_heatmap(weight_raw_disp, cmap_id),
-            _value_to_heatmap(gap_disp, cmap_id, vmax=gap_scale),
-        ],
-        ["y_gamma(last)", "y_boxcar(last)", "weight_raw(last)", "w*y_gamma/fused"],
-    )
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_scale_mosaic.png"), scale_mosaic)
-    delta_vmax = _resolve_vmax(np.abs(weight_delta), fixed_vmax=0.0, percentile=99.5)
+    score_vmax_scale = _resolve_vmax(scores_last, fixed_vmax=score_vmax, percentile=score_percentile)
+
+    score_panels = []
+    score_labels = []
+    for m in range(n_scales):
+        score_map = scores_last[..., m]
+        disp = _resize_map_to_display(score_map, display_hw)
+        heat = _value_to_heatmap(disp, cmap_id, vmax=score_vmax_scale)
+        score_panels.append(heat)
+        score_labels.append(f"score_{_scale_label(m, n_scales)}")
+    cv2.imwrite(str(out_dir / f"{stem}_hyb_scores.png"), _stitch_panels(score_panels, score_labels))
+
     cv2.imwrite(
-        str(out_dir / f"{stem}_hyb_weight_delta.png"),
-        _value_to_heatmap(_resize_map_to_display(np.abs(weight_delta), display_hw), cmap_id, vmax=delta_vmax),
+        str(out_dir / f"{stem}_hyb_compare.png"),
+        _stitch_panels([sum_bgr, recon_bgr], ["sum", "hyb"]),
     )
-
-    if compare_sum_bgr is not None:
-        compare = _stitch_panels([compare_sum_bgr, recon_bgr], ["sum", "hyb"])
-        cv2.imwrite(str(out_dir / f"{stem}_hyb_compare_sum.png"), compare)
 
     stats_lines = [
         f"stem={stem}",
         f"n_blocks={n_blocks} kernel_size={hyb_kernel_size} max_filter_size={hyb_max_filter_size}",
-        f"prior_strength={prior_strength}",
-        f"gating_tau={gating_tau}",
-        f"kl_vmax={kl_scale:.6f} (fixed={kl_vmax:g}, percentile={kl_percentile:g})",
-        f"routing_gap_vmax={gap_scale:.6f} blend_delta_vmax={delta_scale:.6f}",
+        f"prior_strength={prior_strength} gating_tau={gating_tau}",
+        f"score_vmax={score_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
+        "score_m = KL_m/tau + prior_strength * prior_logit_m  (pre-softmax)",
         "",
     ]
-    stats_lines.extend(_percentile_summary(kl_blocks, name="kl_gamma_blocks", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(kl_peak, name="kl_gamma_peak", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(motion_blocks, name="motion_blocks", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(motion_peak, name="motion_peak", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(motion_blend, name="motion_blend", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(weight_raw_last, name="weight_gamma_raw_last", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(weight_delta, name="weight_delta(motion-weight_raw)", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(y_gamma, name="y_gamma_last", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(y_boxcar, name="y_boxcar_last", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(routing_gap, name="routing_gap", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(blend_delta, name="blend_delta|last-mean|", percentiles=percentiles))
-    stats_lines.append("")
-    stats_lines.extend(_percentile_summary(recons_prenorm, name="recons_prenorm", percentiles=percentiles))
-
-    motion_hi = motion_peak >= float(np.percentile(motion_peak, 90.0))
-    motion_lo = motion_peak <= float(np.percentile(motion_peak, 10.0))
-    stats_lines.append("")
-    stats_lines.append("[motion stratified] high=motion_peak>=p90, low=motion_peak<=p10")
-    stats_lines.extend(_masked_summary(recons_prenorm, motion_hi, name="recons_prenorm@motion_hi", percentiles=percentiles))
-    stats_lines.extend(_masked_summary(recons_prenorm, motion_lo, name="recons_prenorm@motion_lo", percentiles=percentiles))
-    stats_lines.extend(_masked_summary(y_gamma, motion_hi, name="y_gamma@motion_hi", percentiles=percentiles))
-    stats_lines.extend(_masked_summary(y_gamma, motion_lo, name="y_gamma@motion_lo", percentiles=percentiles))
-    stats_lines.extend(_masked_summary(routing_gap, motion_hi, name="routing_gap@motion_hi", percentiles=percentiles))
-    stats_lines.extend(_masked_summary(routing_gap, motion_lo, name="routing_gap@motion_lo", percentiles=percentiles))
-
-    stats_path = out_dir / f"{stem}_hyb_motion_stats.txt"
-    stats_path.write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
-
-    _save_distribution_hist(
-        out_path=out_dir / f"{stem}_hyb_motion_hist.png",
-        kl_peak=kl_peak,
-        motion_peak=motion_peak,
-        kl_vmax=kl_scale,
-        prior_strength=prior_strength,
-        gating_tau=gating_tau,
+    for m in range(n_scales):
+        stats_lines.extend(
+            _percentile_summary(scores_last[..., m], name=f"score_{_scale_label(m, n_scales)}", percentiles=percentiles)
+        )
+        stats_lines.append("")
+    stats_lines.extend(
+        _percentile_summary(score_margin, name="score_margin(gamma-boxcar)", percentiles=percentiles)
     )
-
-    if save_blocks:
-        motion_strip = _block_strip(
-            motion_blocks,
-            display_hw,
-            cmap_id,
-            score01=True,
-            vmax=1.0,
-            label_prefix="mot_b",
-        )
-        if motion_strip is not None:
-            cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_blocks.png"), motion_strip)
-        kl_strip = _block_strip(
-            kl_blocks,
-            display_hw,
-            cmap_id,
-            score01=False,
-            vmax=kl_scale,
-            label_prefix="kl_b",
-        )
-        if kl_strip is not None:
-            cv2.imwrite(str(out_dir / f"{stem}_hyb_kl_blocks.png"), kl_strip)
-
-    if save_npz:
-        np.savez_compressed(
-            out_dir / f"{stem}_hyb_diag.npz",
-            recon_prenorm=recons_prenorm.astype(np.float32),
-            fused_mean=fused_mean.astype(np.float32),
-            fused_last=fused_last.astype(np.float32),
-            motion_peak=motion_peak.astype(np.float32),
-            motion_blend=motion_blend.astype(np.float32),
-            weight_gamma_raw_last=weight_raw_last.astype(np.float32),
-            weight_delta=weight_delta.astype(np.float32),
-            kl_gamma_peak=kl_peak.astype(np.float32),
-            y_gamma_last=y_gamma.astype(np.float32),
-            y_boxcar_last=y_boxcar.astype(np.float32),
-            routing_gap=routing_gap.astype(np.float32),
-            blend_delta=blend_delta.astype(np.float32),
-        )
+    (out_dir / f"{stem}_hyb_stats.txt").write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Visualize hybrid integrator KL routing and blend maps")
+    ap = argparse.ArgumentParser(description="Visualize hybrid integrator scores and reconstructions")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory or .npy path")
     ap.add_argument("--save_dir", type=str, required=True, help="Output root directory")
     ap.add_argument("--chunk_size", type=int, default=320)
@@ -604,46 +290,27 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument("--hyb_kernel_size", type=int, default=64)
-    ap.add_argument(
-        "--hyb_prior_strength",
-        type=float,
-        default=1.0,
-        help="Bayesian prior weight favoring slower scales in KL routing",
-    )
-    ap.add_argument(
-        "--hyb_gating_tau",
-        type=float,
-        default=0.1,
-        help="Softmax temperature for Bernoulli KL scale routing (higher = smoother routing)",
-    )
+    ap.add_argument("--hyb_prior_strength", type=float, default=1.0)
+    ap.add_argument("--hyb_gating_tau", type=float, default=0.1)
     ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hyb_quantile", type=float, default=1.0)
-    ap.add_argument(
-        "--hyb_max_filter_size",
-        type=int,
-        default=3,
-        help="Odd max-pool on gamma weight for motion/blend only (1 = off)",
-    )
+    ap.add_argument("--hyb_max_filter_size", type=int, default=3)
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
     ap.add_argument("--vis_percentile", type=float, default=99.5)
     ap.add_argument("--vis_gamma", type=float, default=2.2)
     ap.add_argument("--colormap", type=str, default="turbo", choices=sorted(COLORMAPS))
-    ap.add_argument("--overlay_alpha", type=float, default=0.45, help="Heatmap alpha on recon overlay")
     ap.add_argument(
-        "--kl_vmax",
+        "--score_vmax",
         type=float,
         default=0.0,
-        help="Fixed max for KL heatmaps/histogram (0 = use --kl_percentile on kl_peak)",
+        help="Fixed max for score heatmaps (0 = use --score_percentile on all scales)",
     )
     ap.add_argument(
-        "--kl_percentile",
+        "--score_percentile",
         type=float,
         default=99.5,
-        help="Percentile of kl_gamma_peak used as heatmap vmax when --kl_vmax=0",
+        help="Percentile vmax for score heatmaps when --score_vmax=0",
     )
-    ap.add_argument("--no_blocks", action="store_true", help="Skip per-block motion strip PNG")
-    ap.add_argument("--save_npz", action="store_true", help="Save float diagnostic maps as NPZ")
-    ap.add_argument("--compare_sum", action="store_true", help="Save sum-vs-hyb comparison PNG")
     args = ap.parse_args()
 
     in_path = Path(args.in_path)
@@ -670,7 +337,7 @@ def main() -> None:
     stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else int(args.chunk_size)
     sources = list(_iter_sources(in_path))
 
-    for video_idx, source in enumerate(tqdm(sources, desc=f"hyb motion vis [{sample_name}]")):
+    for video_idx, source in enumerate(tqdm(sources, desc=f"hyb vis [{sample_name}]")):
         n_bins = _num_bins(source)
         out_dir = _output_dir(save_root, sample_name, video_idx)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -692,50 +359,36 @@ def main() -> None:
                 continue
 
             recons, motion_debug = hyb.process_photon_cube_with_motion(raw, clear_states=cube_idx == 0)
-            if int(motion_debug["motion_blocks"].shape[-1]) == 0:
+            if int(motion_debug["scores_last"].shape[-1]) == 0:
                 tqdm.write(f"Skip cube {cube_idx} (no temporal blocks): t{t0:06d}_{t1:06d}")
                 continue
-            frames = _raw_hwt_to_rgb_float(recons, packed_nch=source.packed_nch)
-            frames_bgr = _rgb_tensor_to_bgr_u8(
-                frames,
+
+            vis_kw = dict(
                 vis_mode=args.vis_mode,
                 percentile=float(args.vis_percentile),
                 gamma=float(args.vis_gamma),
             )
-            if not frames_bgr:
-                continue
-
-            compare_sum_bgr = None
-            if args.compare_sum:
-                raw_sum = raw.float().mean(dim=-1, keepdim=True)
-                sum_frames = _raw_hwt_to_rgb_float(raw_sum, packed_nch=source.packed_nch)
-                compare_sum_bgr = _rgb_tensor_to_bgr_u8(
-                    sum_frames,
-                    vis_mode=args.vis_mode,
-                    percentile=float(args.vis_percentile),
-                    gamma=float(args.vis_gamma),
-                )[0]
+            recon_bgr = _rgb_tensor_to_bgr_u8(
+                _raw_hwt_to_rgb_float(recons, packed_nch=source.packed_nch), **vis_kw
+            )[0]
+            sum_bgr = _rgb_tensor_to_bgr_u8(
+                _raw_hwt_to_rgb_float(raw.float().mean(dim=-1, keepdim=True), packed_nch=source.packed_nch),
+                **vis_kw,
+            )[0]
 
             stem = f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{frame_idx:07d}"
-            n_blocks = int(motion_debug["fused_blocks"].shape[-1])
-            _save_motion_visuals(
+            _save_visuals(
                 out_dir=out_dir,
                 stem=stem,
-                recon_bgr=frames_bgr[0],
+                recon_bgr=recon_bgr,
+                sum_bgr=sum_bgr,
                 motion_debug=motion_debug,
                 cmap_id=cmap_id,
-                overlay_alpha=float(args.overlay_alpha),
-                save_blocks=not args.no_blocks,
-                kl_vmax=float(args.kl_vmax),
-                kl_percentile=float(args.kl_percentile),
+                score_vmax=float(args.score_vmax),
+                score_percentile=float(args.score_percentile),
                 prior_strength=float(args.hyb_prior_strength),
                 gating_tau=float(args.hyb_gating_tau),
-                vis_mode=args.vis_mode,
-                vis_percentile=float(args.vis_percentile),
-                vis_gamma=float(args.vis_gamma),
-                save_npz=bool(args.save_npz),
-                compare_sum_bgr=compare_sum_bgr,
-                n_blocks=n_blocks,
+                n_blocks=int(motion_debug["fused_blocks"].shape[-1]),
                 hyb_kernel_size=int(args.hyb_kernel_size),
                 hyb_max_filter_size=int(args.hyb_max_filter_size),
             )
@@ -747,7 +400,7 @@ def main() -> None:
                 f"(n_bins={n_bins}; need chunk T >= hyb_kernel_size={args.hyb_kernel_size})"
             )
 
-    print(f"Saved hybrid motion visualizations under {save_root / sample_name}")
+    print(f"Saved hybrid visualizations under {save_root / sample_name}")
 
 
 if __name__ == "__main__":

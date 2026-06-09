@@ -170,10 +170,10 @@ class GatedMultiScaleEMA(nn.Module):
         self,
         photon_block: Tensor,
         spatial_batch_size: int | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Threshold-Free Bayesian Convolution Block.
-        :return: fused, motion_prob (pooled), kl_gamma, weight_gamma_raw, y_scales [H, W, M]
+        :return: fused, motion_prob (pooled), kl_gamma, weight_gamma_raw, y_scales, scores [H, W, M]
         """
         h, w, t_seg = map(int, photon_block.shape)
         num_pixels = h * w
@@ -231,6 +231,7 @@ class GatedMultiScaleEMA(nn.Module):
             kl_gamma_raw.view(h, w),
             weight_gamma_raw,
             y_all_flat.view(h, w, self.num_scales),
+            scores_all.view(h, w, self.num_scales),
         )
 
     @torch.no_grad()
@@ -251,6 +252,7 @@ class GatedMultiScaleEMA(nn.Module):
             "fused_mean": photon_cube.new_zeros(h, w),
             "fused_last": photon_cube.new_zeros(h, w),
             "y_scales_last": photon_cube.new_zeros(h, w, self.num_scales),
+            "scores_last": photon_cube.new_zeros(h, w, self.num_scales),
             "motion_peak_raw": photon_cube.new_zeros(h, w),
             "motion_peak": photon_cube.new_zeros(h, w),
             "doe_peak_raw": photon_cube.new_zeros(h, w),
@@ -262,15 +264,16 @@ class GatedMultiScaleEMA(nn.Module):
             out_t = 1 if t > 0 else 0
             return photon_cube.new_zeros(h, w, out_t, dtype=torch.float32), empty_debug
 
-        fused_stack, motion_stack, doe_stack, weight_stack, y_scales_last = [], [], [], [], None
+        fused_stack, motion_stack, doe_stack, weight_stack, y_scales_last, scores_last = [], [], [], [], None, None
         for b in range(n_blocks):
             seg = photon_cube[:, :, b * ks : (b + 1) * ks]
-            fused_b, motion_b, doe_b, weight_b, y_scales_b = self._gate_conv_block(seg)
+            fused_b, motion_b, doe_b, weight_b, y_scales_b, scores_b = self._gate_conv_block(seg)
             fused_stack.append(fused_b)
             motion_stack.append(motion_b)
             doe_stack.append(doe_b)
             weight_stack.append(weight_b)
             y_scales_last = y_scales_b
+            scores_last = scores_b
 
         fused_hwb = torch.stack(fused_stack, dim=-1)
         motion_hwb = torch.stack(motion_stack, dim=-1)
@@ -296,6 +299,7 @@ class GatedMultiScaleEMA(nn.Module):
                 "fused_mean": fused_mean_hw,
                 "fused_last": fused_last_hw,
                 "y_scales_last": y_scales_last,
+                "scores_last": scores_last,
                 "motion_peak_raw": motion_peak_raw,
                 "motion_peak": motion_peak,
                 "doe_peak_raw": doe_peak_raw,
@@ -321,6 +325,7 @@ class GatedMultiScaleEMA(nn.Module):
             "fused_mean": fused_mean_hw,
             "fused_last": fused_last_hw,
             "y_scales_last": y_scales_last,
+            "scores_last": scores_last,
             "motion_peak_raw": motion_peak_raw,
             "motion_peak": motion_peak,
             "doe_peak_raw": doe_peak_raw,
