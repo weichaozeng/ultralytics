@@ -72,10 +72,11 @@ class GatedMultiScaleEMA(nn.Module):
         self.alphas = sorted(alphas, reverse=True)
         self.num_scales = len(self.alphas)
 
-        # Use alphas to construct Bayesian Prior Logits (-log(alpha)): 
-        # Slower scales (smaller alpha) get higher prior reward
+        # Prior logits (-log alpha): slower scales get higher prior reward.
+        # Centered on boxcar in routing so q=boxcar is the score origin.
         prior_tensor = -torch.log(torch.tensor(self.alphas, dtype=torch.float32).clamp(min=1e-5))
-        self.register_buffer("prior_logits", prior_tensor.view(1, self.num_scales, 1))
+        prior_centered = prior_tensor - prior_tensor[-1]
+        self.register_buffer("prior_logits", prior_centered.view(1, self.num_scales, 1))
 
         self._rebuild_ema_kernel()
 
@@ -88,28 +89,30 @@ class GatedMultiScaleEMA(nn.Module):
             f"prior_strength={self.prior_strength}, tau={self.gating_tau})"
         )
 
+    @staticmethod
+    def _mean_rate_kernel(taps: Tensor) -> Tensor:
+        """L1-normalize taps to unit sum (same per-bin rate scale as boxcar mean)."""
+        return taps / taps.sum().clamp(min=1e-12)
+
     def _rebuild_ema_kernel(self, device: torch.device | str | None = None) -> None:
         """Rebuild heterogeneous FIR kernels: Gamma (fast), EMA (mid), Boxcar (slow)."""
         kernel = torch.zeros(self.num_scales, 1, self.kernel_size, dtype=torch.float32)
-        
+
         for m, alpha in enumerate(self.alphas):
+            # lags=0 on the newest bin, lags=K-1 on the oldest (causal conv indexing)
             lags = torch.arange(self.kernel_size - 1, -1, -1, dtype=torch.float32)
-            
+
             if m == 0:
-                # 1. Fastest Scale: Gamma Kernel (Synaptic response)
-                # Resists single-photon dark counts by ramping up instead of instant spike
+                # Causal exponential; newest bin must be non-zero for fair rate comparison
                 tau_gamma = 2.0
-                taps = lags * torch.exp(-lags / tau_gamma)
+                taps = torch.exp(-lags / tau_gamma)
             elif m == self.num_scales - 1:
-                # 2. Slowest Scale: Boxcar Kernel (Uniform average)
-                # True Maximum Likelihood Estimator for static Poisson background
                 taps = torch.ones_like(lags)
             else:
-                # 3. Intermediate Scales: Standard EMA
+                # Finite-window causal EMA: sum = 1 - (1-alpha)^K before L1 norm
                 taps = alpha * torch.pow(1 - alpha, lags)
-                
-            # Strictly non-negative & normalized to area 1
-            kernel[m, 0, :] = taps / taps.sum().clamp(min=1e-12)
+
+            kernel[m, 0, :] = self._mean_rate_kernel(taps)
 
         if device is None and hasattr(self, "ema_kernel"):
             device = self.ema_kernel.device
@@ -207,7 +210,7 @@ class GatedMultiScaleEMA(nn.Module):
             # Bernoulli KL: D_KL(q || p_m); larger when p_m deviates from slow reference
             kl_div = q * torch.log(q / p) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - p))
 
-            # score_m = KL_m/τ + prior; motion raises gamma KL → higher gamma weight
+            # score_m = KL_m/τ + prior (relative to boxcar); static → all KL≈0, slow scales win
             scores = (kl_div / self.gating_tau).squeeze(-1) + (
                 self.prior_strength * self.prior_logits.squeeze(-1)
             )

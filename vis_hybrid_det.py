@@ -267,7 +267,7 @@ def _save_visuals(
         f"n_blocks={n_blocks} kernel_size={hyb_kernel_size} max_filter_size={hyb_max_filter_size}",
         f"prior_strength={prior_strength} gating_tau={gating_tau}",
         f"score_vmax={score_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
-        "score_m = KL_m/tau + prior_strength * prior_logit_m  (pre-softmax)",
+        "score_m = KL_m/tau + prior_strength * (prior_logit_m - prior_logit_boxcar)",
         "",
     ]
     for m in range(n_scales):
