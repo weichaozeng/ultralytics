@@ -56,7 +56,7 @@ class GatedMultiScaleEMA(nn.Module):
             raise ValueError("max_filter_size must be odd (or 1 to disable max-pool)")
 
         if alphas is None:
-            alphas = [-1, 0.02, 0.005, 0.001, -1]
+            alphas = [1, 0.02, 0.005, 0.001, 0]
 
         self.chunk_size = max(int(chunk_size), 1)
         self.kernel_size = max(int(kernel_size), 1)
