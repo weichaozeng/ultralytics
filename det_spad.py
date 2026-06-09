@@ -311,22 +311,16 @@ def main():
     ap.add_argument(
         "--hyb_gating_tau",
         type=float,
-        default=0.05,
-        help="Softmax temperature for Bernoulli KL scale routing",
+        default=0.1,
+        help="Softmax temperature for Bernoulli KL scale routing (higher = smoother routing)",
     )
     ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hyb_quantile", type=float, default=1.0)
     ap.add_argument(
-        "--hyb_min_filter_size",
+        "--hyb_max_filter_size",
         type=int,
-        default=7,
-        help="Odd min-pool on per-block motion prob before chunk blend (1 = off)",
-    )
-    ap.add_argument(
-        "--hyb_peak_min_filter_size",
-        type=int,
-        default=7,
-        help="Odd min-pool on chunk motion_peak before block mean/last blend (1 = off)",
+        default=3,
+        help="Odd max-pool on per-block motion prob (1 = off); chunk blend has no spatial pool",
     )
     # velintegrator
     ap.add_argument("--vel_max_shift", type=int, default=16)
@@ -394,8 +388,7 @@ def main():
             gating_tau=float(args.hyb_gating_tau),
             normalize=bool(args.hyb_normalize),
             quantile=float(args.hyb_quantile),
-            min_filter_size=int(args.hyb_min_filter_size),
-            peak_min_filter_size=int(args.hyb_peak_min_filter_size),
+            max_filter_size=int(args.hyb_max_filter_size),
         ).to(device)
         if "hyb" in preprocessors
         else None

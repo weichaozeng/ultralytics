@@ -4,7 +4,7 @@
 Writes per-chunk PNGs under ``{save_dir}/{sample}/videoXXXXX/``:
 
 - ``{stem}_hyb_recon.png`` — reconstruction (same tonemap as ``det_spad``)
-- ``{stem}_hyb_motion_peak.png`` — fast-channel weight peak (post peak min-pool)
+- ``{stem}_hyb_motion_peak.png`` — fast-channel weight peak (temporal max over blocks)
 - ``{stem}_hyb_kl_peak.png`` — slow-scale KL divergence peak (percentile-scaled)
 - ``{stem}_hyb_motion_blend.png`` — chunk blend weight toward last block (= motion_peak)
 - ``{stem}_hyb_motion_overlay.png`` — recon + ``motion_peak`` overlay
@@ -457,13 +457,17 @@ def main() -> None:
     ap.add_argument(
         "--hyb_gating_tau",
         type=float,
-        default=0.05,
-        help="Softmax temperature for Bernoulli KL scale routing",
+        default=0.1,
+        help="Softmax temperature for Bernoulli KL scale routing (higher = smoother routing)",
     )
     ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hyb_quantile", type=float, default=1.0)
-    ap.add_argument("--hyb_min_filter_size", type=int, default=7)
-    ap.add_argument("--hyb_peak_min_filter_size", type=int, default=7)
+    ap.add_argument(
+        "--hyb_max_filter_size",
+        type=int,
+        default=3,
+        help="Odd max-pool on per-block motion prob (1 = off); chunk blend has no spatial pool",
+    )
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
     ap.add_argument("--vis_percentile", type=float, default=99.5)
     ap.add_argument("--vis_gamma", type=float, default=2.2)
@@ -501,8 +505,7 @@ def main() -> None:
         gating_tau=float(args.hyb_gating_tau),
         normalize=bool(args.hyb_normalize),
         quantile=float(args.hyb_quantile),
-        min_filter_size=int(args.hyb_min_filter_size),
-        peak_min_filter_size=int(args.hyb_peak_min_filter_size),
+        max_filter_size=int(args.hyb_max_filter_size),
     ).to(device)
 
     sample_name = in_path.name if in_path.is_dir() else in_path.stem

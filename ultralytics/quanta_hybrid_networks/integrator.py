@@ -28,14 +28,13 @@ class GatedMultiScaleEMA(nn.Module):
         chunk_size: int = 320,
         kernel_size: int = 64,
         prior_strength: float = 1.0,
-        gating_tau: float = 0.05,
+        gating_tau: float = 0.1,
         subsampling: int = 1,
         hot_pixel_mask: np.ndarray | None = None,
         normalize: bool = False,
         quantile: float = 1.0,
         spatial_batch_size: int = 16384,
-        min_filter_size: int = 7,
-        peak_min_filter_size: int = 7,
+        max_filter_size: int = 3,
     ):
         """
         :param alphas: Slowness proxies for scales. Used to define prior rewards.
@@ -48,17 +47,13 @@ class GatedMultiScaleEMA(nn.Module):
         :param normalize: If True, normalize reconstruction by quantile.
         :param quantile: Upper quantile used when ``normalize`` is True.
         :param spatial_batch_size: Pixels per ``conv1d`` batch (lower uses less VRAM).
-        :param min_filter_size: Odd min-pool on per-block motion prior to scale routing.
-        :param peak_min_filter_size: Odd min-pool on chunk motion before block mean/last blend.
+        :param max_filter_size: Odd max-pool on per-block motion before temporal max / blend (1 = off).
         """
         super().__init__()
 
-        min_filter_size = max(int(min_filter_size), 1)
-        peak_min_filter_size = max(int(peak_min_filter_size), 1)
-        if min_filter_size % 2 == 0 or peak_min_filter_size % 2 == 0:
-            raise ValueError(
-                "min_filter_size and peak_min_filter_size must be odd (or 1 to disable min-pool)"
-            )
+        max_filter_size = max(int(max_filter_size), 1)
+        if max_filter_size % 2 == 0:
+            raise ValueError("max_filter_size must be odd (or 1 to disable max-pool)")
 
         if alphas is None:
             alphas = [0.07, 0.05, 0.02, 0.01, 0.005]
@@ -72,8 +67,7 @@ class GatedMultiScaleEMA(nn.Module):
         self.normalize = bool(normalize)
         self.quantile = float(quantile)
         self.spatial_batch_size = max(int(spatial_batch_size), 1)
-        self.min_filter_size = min_filter_size
-        self.peak_min_filter_size = peak_min_filter_size
+        self.max_filter_size = max_filter_size
 
         self.alphas = sorted(alphas, reverse=True)
         self.num_scales = len(self.alphas)
@@ -127,6 +121,12 @@ class GatedMultiScaleEMA(nn.Module):
 
     def update_hyperparams(self, **kwargs) -> None:
         """Dynamically update attributes; rebuild FIR kernels when ``kernel_size`` changes."""
+        # Legacy aliases from pre-KL min-pool API
+        if kwargs.get("min_filter_size") is not None and kwargs.get("max_filter_size") is None:
+            kwargs["max_filter_size"] = kwargs.pop("min_filter_size")
+        kwargs.pop("peak_min_filter_size", None)
+        kwargs.pop("peak_max_filter_size", None)
+
         old_kernel_size = int(self.kernel_size)
         for name, value in kwargs.items():
             if hasattr(self, name) and value is not None:
@@ -134,6 +134,11 @@ class GatedMultiScaleEMA(nn.Module):
         if int(self.kernel_size) != old_kernel_size:
             self.kernel_size = max(int(self.kernel_size), 1)
             self._rebuild_ema_kernel()
+        if kwargs.get("max_filter_size") is not None:
+            val = max(int(self.max_filter_size), 1)
+            if val % 2 == 0:
+                raise ValueError("max_filter_size must be odd (or 1 to disable max-pool)")
+            self.max_filter_size = val
 
     def set_cube(self, photon_cube: Tensor) -> None:
         """Record input cube shape."""
@@ -150,13 +155,11 @@ class GatedMultiScaleEMA(nn.Module):
         return (recons / max_value).clamp(0, 1)
 
     @staticmethod
-    def min_pool2d(x: Tensor, kernel_size: int) -> Tensor:
-        """2D min-pool on ``[H, W]``."""
+    def max_pool2d(x: Tensor, kernel_size: int) -> Tensor:
+        """2D max-pool on ``[H, W]`` (neighborhood takes the highest motion score)."""
         x_batched = x.unsqueeze(0).unsqueeze(0)
         padding = (kernel_size - 1) // 2
-        pooled = -F.max_pool2d(
-            -x_batched, kernel_size=kernel_size, stride=1, padding=padding
-        )
+        pooled = F.max_pool2d(x_batched, kernel_size=kernel_size, stride=1, padding=padding)
         return pooled.squeeze(0).squeeze(0)
 
     @torch.no_grad()
@@ -204,7 +207,7 @@ class GatedMultiScaleEMA(nn.Module):
             # 3. Soft-Routing
             weights = F.softmax(scores, dim=1)
 
-            # KL soft-routing fusion (per-pixel, before spatial min-pool on motion)
+            # KL soft-routing fusion (per-pixel; block fusion is not spatially pooled)
             fused_flat[i:end_i] = torch.sum(weights * y_all, dim=1).squeeze(-1)
             # Fast-channel weight = motion probability for downstream block blend
             motion_raw[i:end_i] = weights[:, 0, :].squeeze(-1)
@@ -214,9 +217,9 @@ class GatedMultiScaleEMA(nn.Module):
         motion_map = motion_raw.view(h, w)
         doe_map = doe_raw.view(h, w)
 
-        # Spatial min-pool on motion prob only affects chunk-level blend, not block fusion
-        if self.min_filter_size > 1:
-            motion_map = self.min_pool2d(motion_map, self.min_filter_size)
+        # Max-pool: if any neighbor is fast-changing, propagate that motion score
+        if self.max_filter_size > 1:
+            motion_map = self.max_pool2d(motion_map, self.max_filter_size)
 
         return fused_flat.view(h, w), motion_map, doe_map
 
@@ -257,15 +260,11 @@ class GatedMultiScaleEMA(nn.Module):
 
         doe_peak_raw = doe_hwb.max(dim=-1).values
         doe_peak = doe_peak_raw
-        if self.peak_min_filter_size > 1:
-            doe_peak = self.min_pool2d(doe_peak, self.peak_min_filter_size)
 
         if n_blocks == 1:
             motion_peak_raw = motion_hwb[..., 0]
             motion_peak = motion_peak_raw
-            if self.peak_min_filter_size > 1:
-                motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
-            
+
             # Direct soft-blend, no threshold
             motion_blend = motion_peak
             debug = {
@@ -281,10 +280,8 @@ class GatedMultiScaleEMA(nn.Module):
         
         motion_peak_raw = motion_hwb.max(dim=-1).values
         motion_peak = motion_peak_raw
-        if self.peak_min_filter_size > 1:
-            motion_peak = self.min_pool2d(motion_peak, self.peak_min_filter_size)
-            
-        # The blend coefficient is naturally derived from the Bayesian weight
+
+        # Chunk blend: per-pixel temporal max only (no inter-block spatial pool)
         motion_blend = motion_peak.unsqueeze(-1)
         out = (1.0 - motion_blend) * fused_mean + motion_blend * fused_last
         
@@ -324,12 +321,9 @@ class GatedMultiScaleEMA(nn.Module):
         kernel_size: int | None = None,
         prior_strength: float | None = None,
         gating_tau: float | None = None,
-        min_filter_size: int | None = None,
-        peak_min_filter_size: int | None = None,
+        max_filter_size: int | None = None,
         **kwargs,
     ) -> Tensor:
-        del kwargs
-
         if clear_states:
             self.t_absolute = 0
 
@@ -338,7 +332,8 @@ class GatedMultiScaleEMA(nn.Module):
             normalize=normalize, quantile=quantile,
             chunk_size=chunk_size, kernel_size=kernel_size,
             prior_strength=prior_strength, gating_tau=gating_tau,
-            min_filter_size=min_filter_size, peak_min_filter_size=peak_min_filter_size,
+            max_filter_size=max_filter_size,
+            **kwargs,
         )
 
         self.set_cube(photon_cube)
@@ -365,12 +360,9 @@ class GatedMultiScaleEMA(nn.Module):
         kernel_size: int | None = None,
         prior_strength: float | None = None,
         gating_tau: float | None = None,
-        min_filter_size: int | None = None,
-        peak_min_filter_size: int | None = None,
+        max_filter_size: int | None = None,
         **kwargs,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        del kwargs
-
         if clear_states:
             self.t_absolute = 0
 
@@ -379,7 +371,8 @@ class GatedMultiScaleEMA(nn.Module):
             normalize=normalize, quantile=quantile,
             chunk_size=chunk_size, kernel_size=kernel_size,
             prior_strength=prior_strength, gating_tau=gating_tau,
-            min_filter_size=min_filter_size, peak_min_filter_size=peak_min_filter_size,
+            max_filter_size=max_filter_size,
+            **kwargs,
         )
 
         self.set_cube(photon_cube)
