@@ -13,6 +13,12 @@ Writes per-chunk PNGs under ``{save_dir}/{sample}/videoXXXXX/``:
 - ``{stem}_hyb_motion_hist.png`` — KL peak vs motion_peak histograms
 - ``{stem}_hyb_motion_stats.txt`` — per-chunk percentile summary
 - ``{stem}_hyb_motion_mosaic.png`` — recon | kl_peak | motion_peak | motion_blend
+- ``{stem}_hyb_diag_mosaic.png`` — recon | fused_mean | fused_last | |last-mean|
+- ``{stem}_hyb_scale_mosaic.png`` — y_gamma | y_boxcar | weight_raw(last) | routing_gap
+- ``{stem}_hyb_weight_delta.png`` — motion_peak - weight_gamma_raw(last)
+- ``{stem}_hyb_recon_prenorm.png`` — reconstruction before quantile normalize
+- ``{stem}_hyb_compare_sum.png`` — side-by-side sum vs hyb (with ``--compare_sum``)
+- ``{stem}_hyb_diag.npz`` — raw float maps for offline analysis (with ``--save_npz``)
 
 Example
 -------
@@ -127,6 +133,28 @@ def _raw_hwt_to_rgb_float(raw_hwt: torch.Tensor, *, packed_nch: int) -> torch.Te
     return torch.stack(frames, dim=0).to(raw_hwt.device)
 
 
+def _hw_map_to_bgr_u8(
+    hw_map: np.ndarray,
+    *,
+    vis_mode: str,
+    percentile: float,
+    gamma: float,
+    display_hw: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Tonemap a single Bayer-grid ``[H, W]`` map to BGR uint8 (demosaic for display)."""
+    hw_t = torch.from_numpy(hw_map.astype(np.float32)).unsqueeze(-1)
+    frames = _raw_hwt_to_rgb_float(hw_t, packed_nch=3)
+    bgr = _rgb_tensor_to_bgr_u8(
+        frames,
+        vis_mode=vis_mode,
+        percentile=percentile,
+        gamma=gamma,
+    )[0]
+    if display_hw is not None and bgr.shape[:2] != display_hw:
+        bgr = cv2.resize(bgr, (display_hw[1], display_hw[0]), interpolation=cv2.INTER_AREA)
+    return bgr
+
+
 def _rgb_tensor_to_bgr_u8(
     frames_tchw: torch.Tensor, *, vis_mode: str, percentile: float, gamma: float
 ) -> list[np.ndarray]:
@@ -183,6 +211,24 @@ def _resolve_vmax(values: np.ndarray, *, fixed_vmax: float, percentile: float) -
     if flat.size == 0:
         return 1.0
     return float(np.percentile(flat, percentile))
+
+
+def _masked_summary(
+    values: np.ndarray,
+    mask: np.ndarray,
+    *,
+    name: str,
+    percentiles: tuple[float, ...],
+) -> list[str]:
+    flat = np.asarray(values, dtype=np.float64).reshape(-1)
+    m = np.asarray(mask, dtype=bool).reshape(-1)
+    if flat.size == 0 or m.size != flat.size or not m.any():
+        return [f"[{name}] n=0 (empty mask)"]
+    sel = flat[m]
+    lines = [f"[{name}] n={sel.size} min={sel.min():.6f} max={sel.max():.6f} mean={sel.mean():.6f}"]
+    for p in percentiles:
+        lines.append(f"  p{p:g} = {float(np.percentile(sel, p)):.6f}")
+    return lines
 
 
 def _percentile_summary(values: np.ndarray, *, name: str, percentiles: tuple[float, ...]) -> list[str]:
@@ -353,6 +399,14 @@ def _save_motion_visuals(
     kl_percentile: float,
     prior_strength: float,
     gating_tau: float,
+    vis_mode: str,
+    vis_percentile: float,
+    vis_gamma: float,
+    save_npz: bool,
+    compare_sum_bgr: np.ndarray | None,
+    n_blocks: int,
+    hyb_kernel_size: int,
+    hyb_max_filter_size: int,
 ) -> None:
     display_hw = recon_bgr.shape[:2]
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
@@ -365,8 +419,25 @@ def _save_motion_visuals(
     motion_blocks = _tensor_hw(motion_debug["motion_blocks"])
     kl_peak = _tensor_hw(motion_debug["doe_peak"])
     kl_blocks = _tensor_hw(motion_debug["doe_blocks"])
+    fused_mean = _tensor_hw(motion_debug["fused_mean"])
+    fused_last = _tensor_hw(motion_debug["fused_last"])
+    weight_blocks = _tensor_hw(motion_debug["weight_gamma_blocks"])
+    y_scales_last = _tensor_hw(motion_debug["y_scales_last"])
+    recons_prenorm = _tensor_hw(motion_debug["recons_prenorm"])
+    if recons_prenorm.ndim == 3:
+        recons_prenorm = recons_prenorm[..., 0]
+
+    weight_raw_last = weight_blocks[..., -1] if weight_blocks.ndim == 3 else motion_peak
+    y_gamma = y_scales_last[..., 0]
+    y_boxcar = y_scales_last[..., -1]
+    fused_safe = np.maximum(recons_prenorm, 1e-6)
+    routing_gap = (weight_raw_last * y_gamma) / fused_safe
+    weight_delta = motion_peak - weight_raw_last
+    blend_delta = np.abs(fused_last - fused_mean)
 
     kl_scale = _resolve_vmax(kl_peak, fixed_vmax=kl_vmax, percentile=kl_percentile)
+    gap_scale = _resolve_vmax(routing_gap, fixed_vmax=0.0, percentile=99.0)
+    delta_scale = _resolve_vmax(blend_delta, fixed_vmax=0.0, percentile=99.5)
 
     peak_disp = _resize_map_to_display(motion_peak, display_hw)
     kl_disp = _resize_map_to_display(kl_peak, display_hw)
@@ -388,11 +459,53 @@ def _save_motion_visuals(
     )
     cv2.imwrite(str(out_dir / f"{stem}_hyb_motion_mosaic.png"), mosaic)
 
+    display_hw = recon_bgr.shape[:2]
+    fused_mean_bgr = _hw_map_to_bgr_u8(
+        fused_mean, vis_mode=vis_mode, percentile=vis_percentile, gamma=vis_gamma, display_hw=display_hw
+    )
+    fused_last_bgr = _hw_map_to_bgr_u8(
+        fused_last, vis_mode=vis_mode, percentile=vis_percentile, gamma=vis_gamma, display_hw=display_hw
+    )
+    prenorm_bgr = _hw_map_to_bgr_u8(
+        recons_prenorm, vis_mode=vis_mode, percentile=vis_percentile, gamma=vis_gamma, display_hw=display_hw
+    )
+    cv2.imwrite(str(out_dir / f"{stem}_hyb_recon_prenorm.png"), prenorm_bgr)
+
+    diag_mosaic = _stitch_panels(
+        [recon_bgr, fused_mean_bgr, fused_last_bgr, _value_to_heatmap(_resize_map_to_display(blend_delta, display_hw), cmap_id, vmax=delta_scale)],
+        ["recon", "fused_mean", "fused_last", "|last-mean|"],
+    )
+    cv2.imwrite(str(out_dir / f"{stem}_hyb_diag_mosaic.png"), diag_mosaic)
+
+    weight_raw_disp = _resize_map_to_display(weight_raw_last, display_hw)
+    gap_disp = _resize_map_to_display(routing_gap, display_hw)
+    scale_mosaic = _stitch_panels(
+        [
+            _value_to_heatmap(_resize_map_to_display(y_gamma, display_hw), cmap_id, vmax=_resolve_vmax(y_gamma, fixed_vmax=0.0, percentile=99.5)),
+            _value_to_heatmap(_resize_map_to_display(y_boxcar, display_hw), cmap_id, vmax=_resolve_vmax(y_boxcar, fixed_vmax=0.0, percentile=99.5)),
+            _score_to_heatmap(weight_raw_disp, cmap_id),
+            _value_to_heatmap(gap_disp, cmap_id, vmax=gap_scale),
+        ],
+        ["y_gamma(last)", "y_boxcar(last)", "weight_raw(last)", "w*y_gamma/fused"],
+    )
+    cv2.imwrite(str(out_dir / f"{stem}_hyb_scale_mosaic.png"), scale_mosaic)
+    delta_vmax = _resolve_vmax(np.abs(weight_delta), fixed_vmax=0.0, percentile=99.5)
+    cv2.imwrite(
+        str(out_dir / f"{stem}_hyb_weight_delta.png"),
+        _value_to_heatmap(_resize_map_to_display(np.abs(weight_delta), display_hw), cmap_id, vmax=delta_vmax),
+    )
+
+    if compare_sum_bgr is not None:
+        compare = _stitch_panels([compare_sum_bgr, recon_bgr], ["sum", "hyb"])
+        cv2.imwrite(str(out_dir / f"{stem}_hyb_compare_sum.png"), compare)
+
     stats_lines = [
         f"stem={stem}",
+        f"n_blocks={n_blocks} kernel_size={hyb_kernel_size} max_filter_size={hyb_max_filter_size}",
         f"prior_strength={prior_strength}",
         f"gating_tau={gating_tau}",
         f"kl_vmax={kl_scale:.6f} (fixed={kl_vmax:g}, percentile={kl_percentile:g})",
+        f"routing_gap_vmax={gap_scale:.6f} blend_delta_vmax={delta_scale:.6f}",
         "",
     ]
     stats_lines.extend(_percentile_summary(kl_blocks, name="kl_gamma_blocks", percentiles=percentiles))
@@ -404,6 +517,32 @@ def _save_motion_visuals(
     stats_lines.extend(_percentile_summary(motion_peak, name="motion_peak", percentiles=percentiles))
     stats_lines.append("")
     stats_lines.extend(_percentile_summary(motion_blend, name="motion_blend", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(weight_raw_last, name="weight_gamma_raw_last", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(weight_delta, name="weight_delta(motion-weight_raw)", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(y_gamma, name="y_gamma_last", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(y_boxcar, name="y_boxcar_last", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(routing_gap, name="routing_gap", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(blend_delta, name="blend_delta|last-mean|", percentiles=percentiles))
+    stats_lines.append("")
+    stats_lines.extend(_percentile_summary(recons_prenorm, name="recons_prenorm", percentiles=percentiles))
+
+    motion_hi = motion_peak >= float(np.percentile(motion_peak, 90.0))
+    motion_lo = motion_peak <= float(np.percentile(motion_peak, 10.0))
+    stats_lines.append("")
+    stats_lines.append("[motion stratified] high=motion_peak>=p90, low=motion_peak<=p10")
+    stats_lines.extend(_masked_summary(recons_prenorm, motion_hi, name="recons_prenorm@motion_hi", percentiles=percentiles))
+    stats_lines.extend(_masked_summary(recons_prenorm, motion_lo, name="recons_prenorm@motion_lo", percentiles=percentiles))
+    stats_lines.extend(_masked_summary(y_gamma, motion_hi, name="y_gamma@motion_hi", percentiles=percentiles))
+    stats_lines.extend(_masked_summary(y_gamma, motion_lo, name="y_gamma@motion_lo", percentiles=percentiles))
+    stats_lines.extend(_masked_summary(routing_gap, motion_hi, name="routing_gap@motion_hi", percentiles=percentiles))
+    stats_lines.extend(_masked_summary(routing_gap, motion_lo, name="routing_gap@motion_lo", percentiles=percentiles))
+
     stats_path = out_dir / f"{stem}_hyb_motion_stats.txt"
     stats_path.write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
 
@@ -438,6 +577,23 @@ def _save_motion_visuals(
         if kl_strip is not None:
             cv2.imwrite(str(out_dir / f"{stem}_hyb_kl_blocks.png"), kl_strip)
 
+    if save_npz:
+        np.savez_compressed(
+            out_dir / f"{stem}_hyb_diag.npz",
+            recon_prenorm=recons_prenorm.astype(np.float32),
+            fused_mean=fused_mean.astype(np.float32),
+            fused_last=fused_last.astype(np.float32),
+            motion_peak=motion_peak.astype(np.float32),
+            motion_blend=motion_blend.astype(np.float32),
+            weight_gamma_raw_last=weight_raw_last.astype(np.float32),
+            weight_delta=weight_delta.astype(np.float32),
+            kl_gamma_peak=kl_peak.astype(np.float32),
+            y_gamma_last=y_gamma.astype(np.float32),
+            y_boxcar_last=y_boxcar.astype(np.float32),
+            routing_gap=routing_gap.astype(np.float32),
+            blend_delta=blend_delta.astype(np.float32),
+        )
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Visualize hybrid integrator KL routing and blend maps")
@@ -466,7 +622,7 @@ def main() -> None:
         "--hyb_max_filter_size",
         type=int,
         default=3,
-        help="Odd max-pool on gamma routing score before softmax (1 = off)",
+        help="Odd max-pool on gamma weight for motion/blend only (1 = off)",
     )
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
     ap.add_argument("--vis_percentile", type=float, default=99.5)
@@ -486,6 +642,8 @@ def main() -> None:
         help="Percentile of kl_gamma_peak used as heatmap vmax when --kl_vmax=0",
     )
     ap.add_argument("--no_blocks", action="store_true", help="Skip per-block motion strip PNG")
+    ap.add_argument("--save_npz", action="store_true", help="Save float diagnostic maps as NPZ")
+    ap.add_argument("--compare_sum", action="store_true", help="Save sum-vs-hyb comparison PNG")
     args = ap.parse_args()
 
     in_path = Path(args.in_path)
@@ -547,7 +705,19 @@ def main() -> None:
             if not frames_bgr:
                 continue
 
+            compare_sum_bgr = None
+            if args.compare_sum:
+                raw_sum = raw.float().mean(dim=-1, keepdim=True)
+                sum_frames = _raw_hwt_to_rgb_float(raw_sum, packed_nch=source.packed_nch)
+                compare_sum_bgr = _rgb_tensor_to_bgr_u8(
+                    sum_frames,
+                    vis_mode=args.vis_mode,
+                    percentile=float(args.vis_percentile),
+                    gamma=float(args.vis_gamma),
+                )[0]
+
             stem = f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{frame_idx:07d}"
+            n_blocks = int(motion_debug["fused_blocks"].shape[-1])
             _save_motion_visuals(
                 out_dir=out_dir,
                 stem=stem,
@@ -560,6 +730,14 @@ def main() -> None:
                 kl_percentile=float(args.kl_percentile),
                 prior_strength=float(args.hyb_prior_strength),
                 gating_tau=float(args.hyb_gating_tau),
+                vis_mode=args.vis_mode,
+                vis_percentile=float(args.vis_percentile),
+                vis_gamma=float(args.vis_gamma),
+                save_npz=bool(args.save_npz),
+                compare_sum_bgr=compare_sum_bgr,
+                n_blocks=n_blocks,
+                hyb_kernel_size=int(args.hyb_kernel_size),
+                hyb_max_filter_size=int(args.hyb_max_filter_size),
             )
             frame_idx += 1
 

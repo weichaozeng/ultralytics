@@ -47,7 +47,7 @@ class GatedMultiScaleEMA(nn.Module):
         :param normalize: If True, normalize reconstruction by quantile.
         :param quantile: Upper quantile used when ``normalize`` is True.
         :param spatial_batch_size: Pixels per ``conv1d`` batch (lower uses less VRAM).
-        :param max_filter_size: Odd max-pool on gamma routing score before softmax (1 = off).
+        :param max_filter_size: Odd max-pool on gamma weight for motion/blend only (1 = off).
         """
         super().__init__()
 
@@ -156,10 +156,13 @@ class GatedMultiScaleEMA(nn.Module):
 
     @staticmethod
     def max_pool2d(x: Tensor, kernel_size: int) -> Tensor:
-        """2D max-pool on ``[H, W]`` (neighborhood takes the highest routing score)."""
+        """2D max-pool on ``[H, W]`` with replicate padding (dilate motion scores)."""
+        if kernel_size <= 1:
+            return x
         x_batched = x.unsqueeze(0).unsqueeze(0)
         padding = (kernel_size - 1) // 2
-        pooled = F.max_pool2d(x_batched, kernel_size=kernel_size, stride=1, padding=padding)
+        x_batched = F.pad(x_batched, (padding, padding, padding, padding), mode="replicate")
+        pooled = F.max_pool2d(x_batched, kernel_size=kernel_size, stride=1, padding=0)
         return pooled.squeeze(0).squeeze(0)
 
     @torch.no_grad()
@@ -167,10 +170,10 @@ class GatedMultiScaleEMA(nn.Module):
         self,
         photon_block: Tensor,
         spatial_batch_size: int | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Threshold-Free Bayesian Convolution Block.
-        :return: fused [H, W], motion_prob [H, W], kl_gamma [H, W] (debug)
+        :return: fused, motion_prob (pooled), kl_gamma, weight_gamma_raw, y_scales [H, W, M]
         """
         h, w, t_seg = map(int, photon_block.shape)
         num_pixels = h * w
@@ -213,15 +216,22 @@ class GatedMultiScaleEMA(nn.Module):
             y_all_flat[i:end_i] = y_all.squeeze(-1)
             kl_gamma_raw[i:end_i] = kl_div[:, 0, :].squeeze(-1)
 
-        if self.max_filter_size > 1:
-            score_gamma = self.max_pool2d(scores_all[:, 0].view(h, w), self.max_filter_size)
-            scores_all[:, 0] = score_gamma.reshape(-1)
-
         weights = F.softmax(scores_all, dim=1)
         fused_flat = (weights * y_all_flat).sum(dim=1)
-        motion_raw = weights[:, 0]
+        weight_gamma_raw = weights[:, 0].view(h, w)
+        motion_map = weight_gamma_raw
+        # Pool motion only: inflating gamma *scores* before fusion pulls hand-edge
+        # pixels toward low local y_gamma and causes a dark silhouette ring.
+        if self.max_filter_size > 1:
+            motion_map = self.max_pool2d(motion_map, self.max_filter_size)
 
-        return fused_flat.view(h, w), motion_raw.view(h, w), kl_gamma_raw.view(h, w)
+        return (
+            fused_flat.view(h, w),
+            motion_map,
+            kl_gamma_raw.view(h, w),
+            weight_gamma_raw,
+            y_all_flat.view(h, w, self.num_scales),
+        )
 
     @torch.no_grad()
     def _integrate_blocks_with_motion(
@@ -236,27 +246,38 @@ class GatedMultiScaleEMA(nn.Module):
         empty_debug = {
             "motion_blocks": photon_cube.new_zeros(h, w, 0),
             "doe_blocks": photon_cube.new_zeros(h, w, 0),
+            "weight_gamma_blocks": photon_cube.new_zeros(h, w, 0),
+            "fused_blocks": photon_cube.new_zeros(h, w, 0),
+            "fused_mean": photon_cube.new_zeros(h, w),
+            "fused_last": photon_cube.new_zeros(h, w),
+            "y_scales_last": photon_cube.new_zeros(h, w, self.num_scales),
             "motion_peak_raw": photon_cube.new_zeros(h, w),
             "motion_peak": photon_cube.new_zeros(h, w),
             "doe_peak_raw": photon_cube.new_zeros(h, w),
             "doe_peak": photon_cube.new_zeros(h, w),
             "motion_blend": photon_cube.new_zeros(h, w),
+            "recons_prenorm": photon_cube.new_zeros(h, w, 0),
         }
         if n_blocks == 0:
             out_t = 1 if t > 0 else 0
             return photon_cube.new_zeros(h, w, out_t, dtype=torch.float32), empty_debug
 
-        fused_stack, motion_stack, doe_stack = [], [], []
+        fused_stack, motion_stack, doe_stack, weight_stack, y_scales_last = [], [], [], [], None
         for b in range(n_blocks):
             seg = photon_cube[:, :, b * ks : (b + 1) * ks]
-            fused_b, motion_b, doe_b = self._gate_conv_block(seg)
+            fused_b, motion_b, doe_b, weight_b, y_scales_b = self._gate_conv_block(seg)
             fused_stack.append(fused_b)
             motion_stack.append(motion_b)
             doe_stack.append(doe_b)
+            weight_stack.append(weight_b)
+            y_scales_last = y_scales_b
 
         fused_hwb = torch.stack(fused_stack, dim=-1)
         motion_hwb = torch.stack(motion_stack, dim=-1)
         doe_hwb = torch.stack(doe_stack, dim=-1)
+        weight_hwb = torch.stack(weight_stack, dim=-1)
+        fused_mean_hw = fused_hwb.mean(dim=-1)
+        fused_last_hw = fused_hwb[..., -1]
 
         doe_peak_raw = doe_hwb.max(dim=-1).values
         doe_peak = doe_peak_raw
@@ -268,26 +289,44 @@ class GatedMultiScaleEMA(nn.Module):
             # Direct soft-blend, no threshold
             motion_blend = motion_peak
             debug = {
-                "motion_blocks": motion_hwb, "doe_blocks": doe_hwb,
-                "motion_peak_raw": motion_peak_raw, "motion_peak": motion_peak,
-                "doe_peak_raw": doe_peak_raw, "doe_peak": doe_peak,
+                "motion_blocks": motion_hwb,
+                "doe_blocks": doe_hwb,
+                "weight_gamma_blocks": weight_hwb,
+                "fused_blocks": fused_hwb,
+                "fused_mean": fused_mean_hw,
+                "fused_last": fused_last_hw,
+                "y_scales_last": y_scales_last,
+                "motion_peak_raw": motion_peak_raw,
+                "motion_peak": motion_peak,
+                "doe_peak_raw": doe_peak_raw,
+                "doe_peak": doe_peak,
                 "motion_blend": motion_blend,
+                "recons_prenorm": fused_hwb[..., -1:],
             }
             return fused_hwb[..., -1:], debug
 
-        fused_mean = fused_hwb.mean(dim=-1, keepdim=True)
-        fused_last = fused_hwb[..., -1:]
+        fused_mean = fused_mean_hw.unsqueeze(-1)
+        fused_last = fused_last_hw.unsqueeze(-1)
 
         motion_peak_raw = motion_hwb.max(dim=-1).values
         motion_peak = motion_peak_raw
         motion_blend = motion_peak.unsqueeze(-1)
         out = (1.0 - motion_blend) * fused_mean + motion_blend * fused_last
-        
+
         debug = {
-            "motion_blocks": motion_hwb, "doe_blocks": doe_hwb,
-            "motion_peak_raw": motion_peak_raw, "motion_peak": motion_peak,
-            "doe_peak_raw": doe_peak_raw, "doe_peak": doe_peak,
+            "motion_blocks": motion_hwb,
+            "doe_blocks": doe_hwb,
+            "weight_gamma_blocks": weight_hwb,
+            "fused_blocks": fused_hwb,
+            "fused_mean": fused_mean_hw,
+            "fused_last": fused_last_hw,
+            "y_scales_last": y_scales_last,
+            "motion_peak_raw": motion_peak_raw,
+            "motion_peak": motion_peak,
+            "doe_peak_raw": doe_peak_raw,
+            "doe_peak": doe_peak,
             "motion_blend": motion_blend.squeeze(-1),
+            "recons_prenorm": out,
         }
         return out, debug
 
@@ -376,6 +415,7 @@ class GatedMultiScaleEMA(nn.Module):
         self.set_cube(photon_cube)
         fused, motion_debug = self._integrate_blocks_with_motion(photon_cube)
         recons = self._subsample_reconstruction(fused)
+        motion_debug["recons_prenorm"] = self._subsample_reconstruction(motion_debug["recons_prenorm"])
 
         if self.hot_pixel_mask is not None:
             recons = nearest_neighbor_inpaint(recons, self.hot_pixel_mask)
