@@ -12,6 +12,337 @@ from ultralytics.quanta_neural_networks.ops.array_ops import torch_quantile
 from ultralytics.quanta_neural_networks.ops.image import nearest_neighbor_inpaint
 
 
+class SpatioTemporalEvidenceAccumulation(nn.Module):
+    """
+    Spatio-temporal evidence accumulation (STEA) for SPAD photon cubes.
+
+    The tensor path is fully convolutional along time: causal 1D temporal
+    bases, pointwise Bernoulli KL, causal 3D evidence smoothing, then sigmoid
+    soft routing between slow and fast rates.
+    """
+
+    def __init__(
+        self,
+        fast_window: int = 16,
+        slow_window: int = 128,
+        temporal_window: int = 5,
+        fast_tau: float | None = None,
+        sharpness: float = 8.0,
+        bias: float = 0.02,
+        eps: float = 1e-5,
+        chunk_size: int = 320,
+        subsampling: int = 1,
+        hot_pixel_mask: np.ndarray | None = None,
+        normalize: bool = False,
+        quantile: float = 1.0,
+    ):
+        super().__init__()
+        self.fast_window = max(int(fast_window), 1)
+        self.slow_window = max(int(slow_window), 1)
+        self.temporal_window = max(int(temporal_window), 1)
+        self.fast_tau = float(fast_tau) if fast_tau is not None else max(self.fast_window / 4.0, 1.0)
+        self.sharpness = float(sharpness)
+        self.bias = float(bias)
+        self.eps = float(eps)
+        self.chunk_size = max(int(chunk_size), 1)
+        self.subsampling = max(int(subsampling), 1)
+        self.hot_pixel_mask = hot_pixel_mask
+        self.normalize = bool(normalize)
+        self.quantile = float(quantile)
+
+        self.t_absolute = 0
+        self._h, self._w, self._t = None, None, None
+        self.register_buffer("photon_history", None)
+        self.register_buffer("kl_history", None)
+        self._rebuild_kernels()
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(fast_window={self.fast_window}, "
+            f"slow_window={self.slow_window}, temporal_window={self.temporal_window}, "
+            f"sharpness={self.sharpness}, bias={self.bias})"
+        )
+
+    @staticmethod
+    def _normalize_kernel(taps: Tensor) -> Tensor:
+        return taps / taps.sum().clamp(min=1e-12)
+
+    def _rebuild_kernels(self, device: torch.device | str | None = None) -> None:
+        """Build causal 1D temporal bases and the 3D evidence smoother."""
+        if device is None and hasattr(self, "fast_kernel"):
+            device = self.fast_kernel.device
+        device = device or "cpu"
+
+        # F.conv1d is cross-correlation. With left padding, kernel[-1] touches
+        # the current bin, so taps are stored oldest -> newest.
+        gamma_age = torch.arange(self.fast_window, 0, -1, dtype=torch.float32)
+        fast = gamma_age * torch.exp(-gamma_age / max(self.fast_tau, 1e-6))
+        slow = torch.ones(self.slow_window, dtype=torch.float32)
+        stea = torch.ones(
+            (1, 1, self.temporal_window, 3, 3),
+            dtype=torch.float32,
+        )
+
+        self.register_buffer("fast_kernel", self._normalize_kernel(fast).view(1, 1, -1).to(device))
+        self.register_buffer("slow_kernel", self._normalize_kernel(slow).view(1, 1, -1).to(device))
+        self.register_buffer("stea_kernel", self._normalize_kernel(stea).to(device))
+
+    def update_hyperparams(self, **kwargs) -> None:
+        """Update STEA attributes; rebuild convolution kernels when needed."""
+        rebuild_keys = {"fast_window", "slow_window", "temporal_window", "fast_tau"}
+        # Compatibility with the previous hybrid CLI/API naming.
+        if kwargs.get("kernel_size") is not None and kwargs.get("slow_window") is None:
+            kwargs["slow_window"] = kwargs.pop("kernel_size")
+        kwargs.pop("prior_strength", None)
+        kwargs.pop("gating_tau", None)
+        kwargs.pop("max_filter_size", None)
+        kwargs.pop("min_filter_size", None)
+
+        needs_rebuild = False
+        for name, value in kwargs.items():
+            if hasattr(self, name) and value is not None:
+                if name in {"fast_window", "slow_window", "temporal_window", "chunk_size", "subsampling"}:
+                    value = max(int(value), 1)
+                elif name in {"fast_tau", "sharpness", "bias", "eps", "quantile"}:
+                    value = float(value)
+                elif name == "normalize":
+                    value = bool(value)
+                setattr(self, name, value)
+                needs_rebuild = needs_rebuild or name in rebuild_keys
+        if needs_rebuild:
+            self._rebuild_kernels(device=self.fast_kernel.device)
+            self._clear_histories()
+
+    def _clear_histories(self) -> None:
+        self.photon_history = None
+        self.kl_history = None
+
+    def set_cube(self, photon_cube: Tensor) -> None:
+        self._h, self._w, self._t = map(int, photon_cube.shape)
+
+    def clamp_recons(self, recons: Tensor) -> Tensor:
+        if recons.numel() == 0:
+            return recons.float()
+        recons = recons.float()
+        max_value = 1.0
+        if self.normalize:
+            max_value = torch_quantile(recons, self.quantile).clamp(min=1e-6)
+        return (recons / max_value).clamp(0, 1)
+
+    def _history_or_zeros(self, history: Tensor | None, h: int, w: int, length: int, x: Tensor) -> Tensor:
+        if length <= 0:
+            return x.new_zeros(h, w, 0)
+        if history is None or tuple(history.shape[:2]) != (h, w):
+            return x.new_zeros(h, w, length)
+        if int(history.shape[-1]) >= length:
+            return history[..., -length:].to(device=x.device, dtype=x.dtype)
+        pad = x.new_zeros(h, w, length - int(history.shape[-1]))
+        return torch.cat([pad, history.to(device=x.device, dtype=x.dtype)], dim=-1)
+
+    def _causal_conv1d(self, x_flat: Tensor, kernel: Tensor, history_hwt: Tensor) -> Tensor:
+        hlen = int(kernel.shape[-1]) - 1
+        hist_flat = history_hwt.reshape(-1, 1, hlen)
+        return F.conv1d(torch.cat([hist_flat, x_flat], dim=-1), kernel)
+
+    def _temporal_basis(self, photon_cube: Tensor) -> tuple[Tensor, Tensor]:
+        h, w, t = map(int, photon_cube.shape)
+        x = photon_cube.float()
+        x_flat = x.reshape(h * w, 1, t)
+
+        fast_hist = self._history_or_zeros(self.photon_history, h, w, self.fast_window - 1, x)
+        slow_hist = self._history_or_zeros(self.photon_history, h, w, self.slow_window - 1, x)
+        y_fast = self._causal_conv1d(x_flat, self.fast_kernel, fast_hist)
+        y_slow = self._causal_conv1d(x_flat, self.slow_kernel, slow_hist)
+        return y_fast.clamp(self.eps, 1.0 - self.eps), y_slow.clamp(self.eps, 1.0 - self.eps)
+
+    def _smooth_kl(self, k_raw_hwt: Tensor) -> Tensor:
+        h, w, _ = map(int, k_raw_hwt.shape)
+        hist = self._history_or_zeros(self.kl_history, h, w, self.temporal_window - 1, k_raw_hwt)
+        k_dhw = torch.cat([hist, k_raw_hwt], dim=-1).permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+        k_dhw = F.pad(k_dhw, (1, 1, 1, 1, 0, 0))
+        return F.conv3d(k_dhw, self.stea_kernel)
+
+    @torch.no_grad()
+    def _integrate_full_with_debug(self, photon_cube: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
+        h, w, t = map(int, photon_cube.shape)
+        if t == 0:
+            empty = photon_cube.new_zeros(h, w, 0, dtype=torch.float32)
+            debug = {
+                "y_fast": empty,
+                "y_slow": empty,
+                "k_raw": empty,
+                "k_smoothed": empty,
+                "route_weight": empty,
+                "fused": empty,
+                "fused_blocks": empty,
+                "motion_blocks": empty,
+                "doe_blocks": empty,
+                "weight_gamma_blocks": empty,
+                "fused_mean": photon_cube.new_zeros(h, w, dtype=torch.float32),
+                "fused_last": photon_cube.new_zeros(h, w, dtype=torch.float32),
+                "motion_peak": photon_cube.new_zeros(h, w, dtype=torch.float32),
+                "motion_blend": photon_cube.new_zeros(h, w, dtype=torch.float32),
+                "y_scales_last": photon_cube.new_zeros(h, w, 2, dtype=torch.float32),
+                "scores_last": photon_cube.new_zeros(h, w, 2, dtype=torch.float32),
+                "k_smoothed_last": photon_cube.new_zeros(h, w, dtype=torch.float32),
+                "route_weight_last": photon_cube.new_zeros(h, w, dtype=torch.float32),
+                "recons_prenorm": empty,
+            }
+            return empty, debug
+
+        y_fast, y_slow = self._temporal_basis(photon_cube)
+        k_raw_flat = y_fast * torch.log(y_fast / y_slow) + (1.0 - y_fast) * torch.log(
+            (1.0 - y_fast) / (1.0 - y_slow)
+        )
+        k_raw_hwt = k_raw_flat.reshape(h, w, t)
+        k_smoothed = self._smooth_kl(k_raw_hwt)
+        k_s_flat = k_smoothed.squeeze(0).squeeze(0).permute(1, 2, 0).reshape(h * w, 1, t)
+        weights = torch.sigmoid(self.sharpness * (k_s_flat - self.bias))
+        fused_flat = (1.0 - weights) * y_slow + weights * y_fast
+        fused = fused_flat.reshape(h, w, t)
+
+        max_photon_hist = max(self.fast_window, self.slow_window) - 1
+        max_kl_hist = self.temporal_window - 1
+        self.photon_history = photon_cube.float()[..., -max_photon_hist:].detach() if max_photon_hist > 0 else None
+        self.kl_history = k_raw_hwt[..., -max_kl_hist:].detach() if max_kl_hist > 0 else None
+
+        y_fast_hwt = y_fast.reshape(h, w, t)
+        y_slow_hwt = y_slow.reshape(h, w, t)
+        weight_hwt = weights.reshape(h, w, t)
+        k_s_hwt = k_smoothed.squeeze(0).squeeze(0).permute(1, 2, 0)
+        debug = {
+            "y_fast": y_fast_hwt,
+            "y_slow": y_slow_hwt,
+            "k_raw": k_raw_hwt,
+            "k_smoothed": k_s_hwt,
+            "route_weight": weight_hwt,
+            "fused": fused,
+            # Compatibility field names used by existing visualization code.
+            "fused_blocks": fused,
+            "motion_blocks": weight_hwt,
+            "doe_blocks": k_s_hwt,
+            "weight_gamma_blocks": weight_hwt,
+            "fused_mean": fused.mean(dim=-1),
+            "fused_last": fused[..., -1],
+            "motion_peak": weight_hwt.max(dim=-1).values,
+            "motion_blend": weight_hwt[..., -1],
+            "y_scales_last": torch.stack([y_fast_hwt[..., -1], y_slow_hwt[..., -1]], dim=-1),
+            "scores_last": torch.stack([k_s_hwt[..., -1], weight_hwt[..., -1]], dim=-1),
+            "k_smoothed_last": k_s_hwt[..., -1],
+            "route_weight_last": weight_hwt[..., -1],
+            "recons_prenorm": fused,
+        }
+        return fused, debug
+
+    def _subsample_reconstruction(self, fused_hwt: Tensor) -> Tensor:
+        h, w, t = map(int, fused_hwt.shape)
+        if t <= 0:
+            return fused_hwt.new_zeros(h, w, 0, dtype=torch.float32)
+        if t < self.subsampling:
+            return fused_hwt[..., -1:].float()
+        return fused_hwt[..., self.subsampling - 1 :: self.subsampling].float()
+
+    @torch.no_grad()
+    def process_photon_cube(
+        self,
+        photon_cube: Tensor,
+        subsampling: int | None = None,
+        hot_pixel_mask: np.ndarray | None = None,
+        quantile: float | None = None,
+        normalize: bool | None = None,
+        clear_states: bool = True,
+        chunk_size: int | None = None,
+        fast_window: int | None = None,
+        slow_window: int | None = None,
+        temporal_window: int | None = None,
+        fast_tau: float | None = None,
+        sharpness: float | None = None,
+        bias: float | None = None,
+        eps: float | None = None,
+        **kwargs,
+    ) -> Tensor:
+        if clear_states:
+            self.t_absolute = 0
+            self._clear_histories()
+
+        self.update_hyperparams(
+            subsampling=subsampling,
+            hot_pixel_mask=hot_pixel_mask,
+            normalize=normalize,
+            quantile=quantile,
+            chunk_size=chunk_size,
+            fast_window=fast_window,
+            slow_window=slow_window,
+            temporal_window=temporal_window,
+            fast_tau=fast_tau,
+            sharpness=sharpness,
+            bias=bias,
+            eps=eps,
+            **kwargs,
+        )
+
+        self.set_cube(photon_cube)
+        fused, _ = self._integrate_full_with_debug(photon_cube)
+        recons = self._subsample_reconstruction(fused)
+        if self.hot_pixel_mask is not None:
+            recons = nearest_neighbor_inpaint(recons, self.hot_pixel_mask)
+        recons = self.clamp_recons(recons)
+        self.t_absolute += self._t
+        return recons
+
+    @torch.no_grad()
+    def process_photon_cube_with_motion(
+        self,
+        photon_cube: Tensor,
+        subsampling: int | None = None,
+        hot_pixel_mask: np.ndarray | None = None,
+        quantile: float | None = None,
+        normalize: bool | None = None,
+        clear_states: bool = True,
+        chunk_size: int | None = None,
+        fast_window: int | None = None,
+        slow_window: int | None = None,
+        temporal_window: int | None = None,
+        fast_tau: float | None = None,
+        sharpness: float | None = None,
+        bias: float | None = None,
+        eps: float | None = None,
+        **kwargs,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if clear_states:
+            self.t_absolute = 0
+            self._clear_histories()
+
+        self.update_hyperparams(
+            subsampling=subsampling,
+            hot_pixel_mask=hot_pixel_mask,
+            normalize=normalize,
+            quantile=quantile,
+            chunk_size=chunk_size,
+            fast_window=fast_window,
+            slow_window=slow_window,
+            temporal_window=temporal_window,
+            fast_tau=fast_tau,
+            sharpness=sharpness,
+            bias=bias,
+            eps=eps,
+            **kwargs,
+        )
+
+        self.set_cube(photon_cube)
+        fused, motion_debug = self._integrate_full_with_debug(photon_cube)
+        recons = self._subsample_reconstruction(fused)
+        motion_debug["recons_prenorm"] = self._subsample_reconstruction(motion_debug["recons_prenorm"])
+        if self.hot_pixel_mask is not None:
+            recons = nearest_neighbor_inpaint(recons, self.hot_pixel_mask)
+        recons = self.clamp_recons(recons)
+        self.t_absolute += self._t
+        return recons, motion_debug
+
+    def forward(self, photon_cube: Tensor) -> Tensor:
+        return self._integrate_full_with_debug(photon_cube)[0]
+
+
 class GatedMultiScaleEMA(nn.Module):
     """
     White-box spatio-temporal integration for SPAD sensors.

@@ -1,11 +1,11 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Visualize GatedMultiScaleEMA routing scores and reconstructions.
+"""Visualize STEA routing evidence and reconstructions.
 
 Writes per-chunk outputs under ``{save_dir}/{sample}/videoXXXXX/``:
 
-- ``{stem}_hyb_stats.txt`` — percentile summary of pre-softmax routing scores
+- ``{stem}_hyb_stats.txt`` — percentile summary of STEA evidence tensors
 - ``{stem}_hyb_compare.png`` — sum vs hyb reconstruction (side-by-side)
-- ``{stem}_hyb_scores.png`` — heatmaps of score_m for all filter scales (gamma / EMA / boxcar)
+- ``{stem}_hyb_scores.png`` — heatmaps of KL evidence, routing weights, and temporal bases
 
 Example
 -------
@@ -27,7 +27,7 @@ import torch
 from tqdm import tqdm
 
 from ultralytics.data.spad_packed import infer_packed_nch, is_packed_spad, packed_frames_to_raw_bayer
-from ultralytics.quanta_hybrid_networks.integrator import GatedMultiScaleEMA
+from ultralytics.quanta_hybrid_networks.integrator import SpatioTemporalEvidenceAccumulation
 
 COLORMAPS = {
     "turbo": cv2.COLORMAP_TURBO,
@@ -182,14 +182,6 @@ def _percentile_summary(values: np.ndarray, *, name: str, percentiles: tuple[flo
     return lines
 
 
-def _scale_label(m: int, n_scales: int) -> str:
-    if m == 0:
-        return "gamma"
-    if m == n_scales - 1:
-        return "boxcar"
-    return f"ema{m}"
-
-
 def _label_panel(img_bgr: np.ndarray, text: str, label_h: int = 26) -> np.ndarray:
     h, w = img_bgr.shape[:2]
     header = np.zeros((label_h, w, 3), dtype=np.uint8)
@@ -232,29 +224,34 @@ def _save_visuals(
     cmap_id: int,
     score_vmax: float,
     score_percentile: float,
-    prior_strength: float,
-    gating_tau: float,
-    n_blocks: int,
-    hyb_kernel_size: int,
-    hyb_max_filter_size: int,
+    fast_window: int,
+    slow_window: int,
+    temporal_window: int,
+    fast_tau: float,
+    sharpness: float,
+    bias: float,
 ) -> None:
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
     display_hw = recon_bgr.shape[:2]
 
-    scores_last = motion_debug["scores_last"].detach().float().cpu().numpy()
-    n_scales = int(scores_last.shape[-1])
-    score_margin = scores_last[..., 0] - scores_last[..., -1]
-
-    score_vmax_scale = _resolve_vmax(scores_last, fixed_vmax=score_vmax, percentile=score_percentile)
+    maps = {
+        "k_smoothed": motion_debug["k_smoothed_last"].detach().float().cpu().numpy(),
+        "route_weight": motion_debug["route_weight_last"].detach().float().cpu().numpy(),
+        "y_fast": motion_debug["y_scales_last"][..., 0].detach().float().cpu().numpy(),
+        "y_slow": motion_debug["y_scales_last"][..., 1].detach().float().cpu().numpy(),
+        "fused": motion_debug["fused_last"].detach().float().cpu().numpy(),
+    }
+    evidence_stack = np.stack([maps["k_smoothed"], maps["route_weight"]], axis=0)
+    score_vmax_scale = _resolve_vmax(evidence_stack, fixed_vmax=score_vmax, percentile=score_percentile)
 
     score_panels = []
     score_labels = []
-    for m in range(n_scales):
-        score_map = scores_last[..., m]
+    for label, score_map in maps.items():
         disp = _resize_map_to_display(score_map, display_hw)
-        heat = _value_to_heatmap(disp, cmap_id, vmax=score_vmax_scale)
+        vmax = score_vmax_scale if label in {"k_smoothed", "route_weight"} else 1.0
+        heat = _value_to_heatmap(disp, cmap_id, vmax=vmax)
         score_panels.append(heat)
-        score_labels.append(f"score_{_scale_label(m, n_scales)}")
+        score_labels.append(label)
     cv2.imwrite(str(out_dir / f"{stem}_hyb_scores.png"), _stitch_panels(score_panels, score_labels))
 
     cv2.imwrite(
@@ -264,20 +261,15 @@ def _save_visuals(
 
     stats_lines = [
         f"stem={stem}",
-        f"n_blocks={n_blocks} kernel_size={hyb_kernel_size} max_filter_size={hyb_max_filter_size}",
-        f"prior_strength={prior_strength} gating_tau={gating_tau}",
-        f"score_vmax={score_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
-        "score_m = KL_m/tau + prior_strength * (prior_logit_m - prior_logit_boxcar)",
+        f"fast_window={fast_window} slow_window={slow_window} temporal_window={temporal_window}",
+        f"fast_tau={fast_tau} sharpness={sharpness} bias={bias}",
+        f"evidence_vmax={score_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
+        "route_weight = sigmoid(sharpness * (k_smoothed - bias))",
         "",
     ]
-    for m in range(n_scales):
-        stats_lines.extend(
-            _percentile_summary(scores_last[..., m], name=f"score_{_scale_label(m, n_scales)}", percentiles=percentiles)
-        )
+    for label, values in maps.items():
+        stats_lines.extend(_percentile_summary(values, name=label, percentiles=percentiles))
         stats_lines.append("")
-    stats_lines.extend(
-        _percentile_summary(score_margin, name="score_margin(gamma-boxcar)", percentiles=percentiles)
-    )
     (out_dir / f"{stem}_hyb_stats.txt").write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
 
 
@@ -289,12 +281,19 @@ def main() -> None:
     ap.add_argument("--chunk_stride", type=int, default=0)
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
-    ap.add_argument("--hyb_kernel_size", type=int, default=64)
-    ap.add_argument("--hyb_prior_strength", type=float, default=1.0)
-    ap.add_argument("--hyb_gating_tau", type=float, default=0.1)
+    ap.add_argument("--hyb_fast_window", type=int, default=16)
+    ap.add_argument("--hyb_slow_window", type=int, default=128)
+    ap.add_argument("--hyb_temporal_window", type=int, default=5)
+    ap.add_argument("--hyb_fast_tau", type=float, default=4.0)
+    ap.add_argument("--hyb_sharpness", type=float, default=8.0)
+    ap.add_argument("--hyb_bias", type=float, default=0.02)
+    ap.add_argument("--hyb_eps", type=float, default=1e-5)
+    ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
+    ap.add_argument("--hyb_prior_strength", type=float, default=1.0, help="Deprecated; ignored by STEA")
+    ap.add_argument("--hyb_gating_tau", type=float, default=0.1, help="Deprecated; ignored by STEA")
     ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hyb_quantile", type=float, default=1.0)
-    ap.add_argument("--hyb_max_filter_size", type=int, default=3)
+    ap.add_argument("--hyb_max_filter_size", type=int, default=3, help="Deprecated; ignored by STEA")
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
     ap.add_argument("--vis_percentile", type=float, default=99.5)
     ap.add_argument("--vis_gamma", type=float, default=2.2)
@@ -322,15 +321,18 @@ def main() -> None:
     device = _resolve_device(args.device)
     cmap_id = COLORMAPS[args.colormap]
 
-    hyb = GatedMultiScaleEMA(
+    hyb = SpatioTemporalEvidenceAccumulation(
         chunk_size=int(args.chunk_size),
-        kernel_size=int(args.hyb_kernel_size),
+        fast_window=int(args.hyb_fast_window),
+        slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
+        temporal_window=int(args.hyb_temporal_window),
+        fast_tau=float(args.hyb_fast_tau),
+        sharpness=float(args.hyb_sharpness),
+        bias=float(args.hyb_bias),
+        eps=float(args.hyb_eps),
         subsampling=int(args.chunk_size),
-        prior_strength=float(args.hyb_prior_strength),
-        gating_tau=float(args.hyb_gating_tau),
         normalize=bool(args.hyb_normalize),
         quantile=float(args.hyb_quantile),
-        max_filter_size=int(args.hyb_max_filter_size),
     ).to(device)
 
     sample_name = in_path.name if in_path.is_dir() else in_path.stem
@@ -351,15 +353,8 @@ def main() -> None:
 
             raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
             chunk_t = int(raw.shape[-1])
-            if chunk_t < int(args.hyb_kernel_size):
-                tqdm.write(
-                    f"Skip cube {cube_idx} (T={chunk_t} < hyb_kernel_size={args.hyb_kernel_size}): "
-                    f"t{t0:06d}_{t1:06d}"
-                )
-                continue
-
             recons, motion_debug = hyb.process_photon_cube_with_motion(raw, clear_states=cube_idx == 0)
-            if int(motion_debug["scores_last"].shape[-1]) == 0:
+            if int(recons.shape[-1]) == 0:
                 tqdm.write(f"Skip cube {cube_idx} (no temporal blocks): t{t0:06d}_{t1:06d}")
                 continue
 
@@ -386,18 +381,19 @@ def main() -> None:
                 cmap_id=cmap_id,
                 score_vmax=float(args.score_vmax),
                 score_percentile=float(args.score_percentile),
-                prior_strength=float(args.hyb_prior_strength),
-                gating_tau=float(args.hyb_gating_tau),
-                n_blocks=int(motion_debug["fused_blocks"].shape[-1]),
-                hyb_kernel_size=int(args.hyb_kernel_size),
-                hyb_max_filter_size=int(args.hyb_max_filter_size),
+                fast_window=int(args.hyb_fast_window),
+                slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
+                temporal_window=int(args.hyb_temporal_window),
+                fast_tau=float(args.hyb_fast_tau),
+                sharpness=float(args.hyb_sharpness),
+                bias=float(args.hyb_bias),
             )
             frame_idx += 1
 
         if frame_idx == 0:
             print(
                 f"Warning: no frames saved for {sample_name}/video{video_idx:05d} "
-                f"(n_bins={n_bins}; need chunk T >= hyb_kernel_size={args.hyb_kernel_size})"
+                f"(n_bins={n_bins}; check chunk_size={args.chunk_size})"
             )
 
     print(f"Saved hybrid visualizations under {save_root / sample_name}")

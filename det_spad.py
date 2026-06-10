@@ -7,7 +7,7 @@ frames with one of:
 - ppb: PerPixelBayesian reconstruction
 - vel: detection-guided velocity-compensated integration
 
-- hyb: GatedMultiScaleEMA (heterogeneous FIR bank + KL soft-routing, threshold-free)
+- hyb: STEA (causal temporal bases + KL spatio-temporal soft routing)
 
 The resulting frames are passed to an unmodified pretrained YOLO pose model.
 """
@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from ultralytics import YOLO
 from ultralytics.data.spad_packed import infer_packed_nch, is_packed_spad, packed_frames_to_raw_bayer
-from ultralytics.quanta_hybrid_networks.integrator import GatedMultiScaleEMA
+from ultralytics.quanta_hybrid_networks.integrator import SpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_motion_networks.integrator import VelIntegrator
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
 
@@ -203,7 +203,7 @@ def _preprocess_hyb(
     *,
     packed_nch: int,
     device: torch.device,
-    integrator: GatedMultiScaleEMA,
+    integrator: SpatioTemporalEvidenceAccumulation,
     clear_states: bool,
     **kwargs,
 ) -> torch.Tensor:
@@ -300,19 +300,26 @@ def main():
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
-    # gated multi-scale EMA (hybrid)
-    ap.add_argument("--hyb_kernel_size", type=int, default=64, help="FIR kernel length for hyb integrator")
+    # STEA hybrid preprocessor
+    ap.add_argument("--hyb_fast_window", type=int, default=16, help="Fast Gamma temporal basis length for STEA")
+    ap.add_argument("--hyb_slow_window", type=int, default=128, help="Slow boxcar temporal basis length for STEA")
+    ap.add_argument("--hyb_temporal_window", type=int, default=5, help="Causal KL smoothing depth for STEA conv3d")
+    ap.add_argument("--hyb_fast_tau", type=float, default=4.0, help="Gamma kernel tau for the fast STEA basis")
+    ap.add_argument("--hyb_sharpness", type=float, default=8.0, help="Sigmoid sharpness for KL soft routing")
+    ap.add_argument("--hyb_bias", type=float, default=0.02, help="KL bias for sigmoid soft routing")
+    ap.add_argument("--hyb_eps", type=float, default=1e-5, help="Clamp epsilon for Bernoulli rates")
+    ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
     ap.add_argument(
         "--hyb_prior_strength",
         type=float,
         default=1.0,
-        help="Bayesian prior weight favoring slower scales in KL routing",
+        help="Deprecated; ignored by STEA",
     )
     ap.add_argument(
         "--hyb_gating_tau",
         type=float,
         default=0.1,
-        help="Softmax temperature for Bernoulli KL scale routing (higher = smoother routing)",
+        help="Deprecated; ignored by STEA",
     )
     ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hyb_quantile", type=float, default=1.0)
@@ -320,7 +327,7 @@ def main():
         "--hyb_max_filter_size",
         type=int,
         default=3,
-        help="Odd max-pool on gamma weight for motion/blend only (1 = off)",
+        help="Deprecated; ignored by STEA",
     )
     # velintegrator
     ap.add_argument("--vel_max_shift", type=int, default=16)
@@ -380,15 +387,18 @@ def main():
         else None
     )
     hyb = (
-        GatedMultiScaleEMA(
+        SpatioTemporalEvidenceAccumulation(
             chunk_size=int(args.chunk_size),
-            kernel_size=int(args.hyb_kernel_size),
+            fast_window=int(args.hyb_fast_window),
+            slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
+            temporal_window=int(args.hyb_temporal_window),
+            fast_tau=float(args.hyb_fast_tau),
+            sharpness=float(args.hyb_sharpness),
+            bias=float(args.hyb_bias),
+            eps=float(args.hyb_eps),
             subsampling=int(args.chunk_size),
-            prior_strength=float(args.hyb_prior_strength),
-            gating_tau=float(args.hyb_gating_tau),
             normalize=bool(args.hyb_normalize),
             quantile=float(args.hyb_quantile),
-            max_filter_size=int(args.hyb_max_filter_size),
         ).to(device)
         if "hyb" in preprocessors
         else None
