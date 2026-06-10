@@ -17,8 +17,8 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
     Spatio-temporal evidence accumulation (STEA) for SPAD photon cubes.
 
     The tensor path is fully convolutional along time: causal 1D temporal
-    bases, pointwise Bernoulli KL, causal 3D evidence smoothing, then sigmoid
-    soft routing between slow and fast rates.
+    bases, Bernoulli variance-normalized evidence, causal 3D evidence smoothing,
+    then sigmoid soft routing between slow and fast rates.
     """
 
     def __init__(
@@ -27,8 +27,8 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         slow_window: int = 128,
         temporal_window: int = 5,
         fast_tau: float | None = None,
-        sharpness: float = 8.0,
-        bias: float = 0.02,
+        sharpness: float = 1.0,
+        bias: float = 3.0,
         eps: float = 1e-5,
         chunk_size: int = 320,
         subsampling: int = 1,
@@ -86,6 +86,8 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         self.register_buffer("fast_kernel", self._normalize_kernel(fast).view(1, 1, -1).to(device))
         self.register_buffer("slow_kernel", self._normalize_kernel(slow).view(1, 1, -1).to(device))
         self.register_buffer("stea_kernel", self._normalize_kernel(stea).to(device))
+        self.register_buffer("fast_noise_gain", self.fast_kernel.square().sum().view(1, 1, 1))
+        self.register_buffer("slow_noise_gain", self.slow_kernel.square().sum().view(1, 1, 1))
 
     def update_hyperparams(self, **kwargs) -> None:
         """Update STEA attributes; rebuild convolution kernels when needed."""
@@ -191,9 +193,13 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             return empty, debug
 
         y_fast, y_slow = self._temporal_basis(photon_cube)
-        k_raw_flat = y_fast * torch.log(y_fast / y_slow) + (1.0 - y_fast) * torch.log(
-            (1.0 - y_fast) / (1.0 - y_slow)
-        )
+        # Bernoulli variance-normalized fast/slow disagreement. This keeps
+        # bright static regions from looking dynamic only because their absolute
+        # photon variance is larger.
+        delta = y_fast - y_slow
+        p_ref = y_slow.clamp(self.eps, 1.0 - self.eps)
+        var_delta = p_ref * (1.0 - p_ref) * (self.fast_noise_gain + self.slow_noise_gain)
+        k_raw_flat = delta.square() / var_delta.clamp(min=self.eps)
         k_raw_hwt = k_raw_flat.reshape(h, w, t)
         k_smoothed = self._smooth_kl(k_raw_hwt)
         k_s_flat = k_smoothed.squeeze(0).squeeze(0).permute(1, 2, 0).reshape(h * w, 1, t)

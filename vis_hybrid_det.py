@@ -274,6 +274,7 @@ def _save_visuals(
         f"fast_window={fast_window} slow_window={slow_window} temporal_window={temporal_window}",
         f"fast_tau={fast_tau} sharpness={sharpness} bias={bias}",
         f"k_smoothed_vmax={k_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
+        "k_smoothed is causal-smoothed Bernoulli variance-normalized evidence, not raw KL.",
         "route_weight visualization is fixed grayscale [0, 1] so brightness is monotonic.",
         "route_weight = sigmoid(sharpness * (k_smoothed - bias))",
         f"route_from_k_abs_err_max={float(route_abs_err.max()):.8f} mean={float(route_abs_err.mean()):.8f}",
@@ -297,8 +298,8 @@ def main() -> None:
     ap.add_argument("--hyb_slow_window", type=int, default=128)
     ap.add_argument("--hyb_temporal_window", type=int, default=5)
     ap.add_argument("--hyb_fast_tau", type=float, default=4.0)
-    ap.add_argument("--hyb_sharpness", type=float, default=8.0)
-    ap.add_argument("--hyb_bias", type=float, default=0.02)
+    ap.add_argument("--hyb_sharpness", type=float, default=1.0)
+    ap.add_argument("--hyb_bias", type=float, default=3.0)
     ap.add_argument("--hyb_eps", type=float, default=1e-5)
     ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
     ap.add_argument("--hyb_prior_strength", type=float, default=1.0, help="Deprecated; ignored by STEA")

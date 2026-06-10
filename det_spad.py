@@ -305,8 +305,8 @@ def main():
     ap.add_argument("--hyb_slow_window", type=int, default=128, help="Slow boxcar temporal basis length for STEA")
     ap.add_argument("--hyb_temporal_window", type=int, default=5, help="Causal KL smoothing depth for STEA conv3d")
     ap.add_argument("--hyb_fast_tau", type=float, default=4.0, help="Gamma kernel tau for the fast STEA basis")
-    ap.add_argument("--hyb_sharpness", type=float, default=8.0, help="Sigmoid sharpness for KL soft routing")
-    ap.add_argument("--hyb_bias", type=float, default=0.02, help="KL bias for sigmoid soft routing")
+    ap.add_argument("--hyb_sharpness", type=float, default=1.0, help="Sigmoid sharpness for z-score evidence routing")
+    ap.add_argument("--hyb_bias", type=float, default=3.0, help="Variance-normalized evidence bias for sigmoid routing")
     ap.add_argument("--hyb_eps", type=float, default=1e-5, help="Clamp epsilon for Bernoulli rates")
     ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
     ap.add_argument(
