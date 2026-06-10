@@ -5,7 +5,7 @@ Writes per-chunk outputs under ``{save_dir}/{sample}/videoXXXXX/``:
 
 - ``{stem}_hyb_stats.txt`` — percentile summary of STEA evidence tensors
 - ``{stem}_hyb_compare.png`` — sum vs hyb reconstruction (side-by-side)
-- ``{stem}_hyb_scores.png`` — heatmaps of KL evidence, routing weights, and temporal bases
+- ``{stem}_hyb_scores.png`` — heatmaps of KL evidence, routing weights, temporal peaks, and temporal bases
 
 Example
 -------
@@ -221,6 +221,25 @@ def _stitch_panels(panels: list[np.ndarray], labels: list[str], gap: int = 6) ->
     return out
 
 
+def _process_chunk_with_full_debug(
+    hyb: SpatioTemporalEvidenceAccumulation,
+    raw: torch.Tensor,
+    *,
+    clear_states: bool,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Run full temporal STEA integration so per-chunk route_weight peaks are available."""
+    if clear_states:
+        hyb.t_absolute = 0
+        hyb._clear_histories()
+    hyb.set_cube(raw)
+    fused, motion_debug = hyb._integrate_full_with_debug(raw)
+    recons = hyb._subsample_reconstruction(fused)
+    motion_debug["recons_prenorm"] = hyb._subsample_reconstruction(motion_debug["recons_prenorm"])
+    recons = hyb.clamp_recons(recons)
+    hyb.t_absolute += int(raw.shape[-1])
+    return recons, motion_debug
+
+
 def _save_visuals(
     *,
     out_dir: Path,
@@ -243,10 +262,14 @@ def _save_visuals(
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
     display_hw = recon_bgr.shape[:2]
 
+    route_weight_hwt = motion_debug["route_weight"].detach().float().cpu().numpy()
+    k_smoothed_hwt = motion_debug["k_smoothed"].detach().float().cpu().numpy()
     maps = {
         "k_smoothed": motion_debug["k_smoothed_last"].detach().float().cpu().numpy(),
+        "k_smoothed_peak": k_smoothed_hwt.max(axis=-1),
         "route_weight_raw": motion_debug["route_weight_raw_last"].detach().float().cpu().numpy(),
         "route_weight": motion_debug["route_weight_last"].detach().float().cpu().numpy(),
+        "route_weight_peak": route_weight_hwt.max(axis=-1),
         "y_fast": motion_debug["y_scales_last"][..., 0].detach().float().cpu().numpy(),
         "y_slow": motion_debug["y_scales_last"][..., 1].detach().float().cpu().numpy(),
         "fused": motion_debug["fused_last"].detach().float().cpu().numpy(),
@@ -257,7 +280,7 @@ def _save_visuals(
     score_labels = []
     for label, score_map in maps.items():
         disp = _resize_map_to_display(score_map, display_hw)
-        if label == "k_smoothed":
+        if label in {"k_smoothed", "k_smoothed_peak"}:
             panel = _value_to_heatmap(disp, cmap_id, vmax=k_vmax_scale)
         else:
             panel = _value_to_gray_bgr(disp, vmin=0.0, vmax=1.0)
@@ -282,6 +305,8 @@ def _save_visuals(
         "route_weight visualization is fixed grayscale [0, 1] so brightness is monotonic.",
         "route_weight_raw = sigmoid(sharpness * (k_smoothed - bias))",
         "route_weight = spatial morphology(route_weight_raw) when route_pool_size > 1",
+        "route_weight_peak = max(route_weight) over all frames in the chunk",
+        "k_smoothed_peak = max(k_smoothed) over all frames in the chunk",
         f"route_raw_from_k_abs_err_max={float(route_abs_err.max()):.8f} mean={float(route_abs_err.mean()):.8f}",
         "",
     ]
@@ -380,7 +405,9 @@ def main() -> None:
 
             raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
             chunk_t = int(raw.shape[-1])
-            recons, motion_debug = hyb.process_photon_cube_with_motion(raw, clear_states=cube_idx == 0)
+            recons, motion_debug = _process_chunk_with_full_debug(
+                hyb, raw, clear_states=cube_idx == 0
+            )
             if int(recons.shape[-1]) == 0:
                 tqdm.write(f"Skip cube {cube_idx} (no temporal blocks): t{t0:06d}_{t1:06d}")
                 continue
