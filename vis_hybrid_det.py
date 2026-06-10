@@ -237,12 +237,14 @@ def _save_visuals(
     fast_tau: float,
     sharpness: float,
     bias: float,
+    route_pool_size: int,
 ) -> None:
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
     display_hw = recon_bgr.shape[:2]
 
     maps = {
         "k_smoothed": motion_debug["k_smoothed_last"].detach().float().cpu().numpy(),
+        "route_weight_raw": motion_debug["route_weight_raw_last"].detach().float().cpu().numpy(),
         "route_weight": motion_debug["route_weight_last"].detach().float().cpu().numpy(),
         "y_fast": motion_debug["y_scales_last"][..., 0].detach().float().cpu().numpy(),
         "y_slow": motion_debug["y_scales_last"][..., 1].detach().float().cpu().numpy(),
@@ -268,16 +270,17 @@ def _save_visuals(
     )
 
     route_from_k = 1.0 / (1.0 + np.exp(-float(sharpness) * (maps["k_smoothed"] - float(bias))))
-    route_abs_err = np.abs(route_from_k - maps["route_weight"])
+    route_abs_err = np.abs(route_from_k - maps["route_weight_raw"])
     stats_lines = [
         f"stem={stem}",
         f"fast_window={fast_window} slow_window={slow_window} temporal_window={temporal_window}",
-        f"fast_tau={fast_tau} sharpness={sharpness} bias={bias}",
+        f"fast_tau={fast_tau} sharpness={sharpness} bias={bias} route_pool_size={route_pool_size}",
         f"k_smoothed_vmax={k_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
         "k_smoothed is causal-smoothed Bernoulli variance-normalized evidence, not raw KL.",
         "route_weight visualization is fixed grayscale [0, 1] so brightness is monotonic.",
-        "route_weight = sigmoid(sharpness * (k_smoothed - bias))",
-        f"route_from_k_abs_err_max={float(route_abs_err.max()):.8f} mean={float(route_abs_err.mean()):.8f}",
+        "route_weight_raw = sigmoid(sharpness * (k_smoothed - bias))",
+        "route_weight = spatial max_pool(route_weight_raw) when route_pool_size > 1",
+        f"route_raw_from_k_abs_err_max={float(route_abs_err.max()):.8f} mean={float(route_abs_err.mean()):.8f}",
         "",
     ]
     for label, values in maps.items():
@@ -301,6 +304,7 @@ def main() -> None:
     ap.add_argument("--hyb_sharpness", type=float, default=1.0)
     ap.add_argument("--hyb_bias", type=float, default=3.0)
     ap.add_argument("--hyb_eps", type=float, default=1e-5)
+    ap.add_argument("--hyb_route_pool_size", type=int, default=1)
     ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
     ap.add_argument("--hyb_prior_strength", type=float, default=1.0, help="Deprecated; ignored by STEA")
     ap.add_argument("--hyb_gating_tau", type=float, default=0.1, help="Deprecated; ignored by STEA")
@@ -343,6 +347,7 @@ def main() -> None:
         sharpness=float(args.hyb_sharpness),
         bias=float(args.hyb_bias),
         eps=float(args.hyb_eps),
+        route_pool_size=int(args.hyb_route_pool_size),
         subsampling=int(args.chunk_size),
         normalize=bool(args.hyb_normalize),
         quantile=float(args.hyb_quantile),
@@ -400,6 +405,7 @@ def main() -> None:
                 fast_tau=float(args.hyb_fast_tau),
                 sharpness=float(args.hyb_sharpness),
                 bias=float(args.hyb_bias),
+                route_pool_size=int(args.hyb_route_pool_size),
             )
             frame_idx += 1
 

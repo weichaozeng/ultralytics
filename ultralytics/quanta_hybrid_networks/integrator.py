@@ -30,6 +30,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         sharpness: float = 1.0,
         bias: float = 3.0,
         eps: float = 1e-5,
+        route_pool_size: int = 1,
         chunk_size: int = 320,
         subsampling: int = 1,
         hot_pixel_mask: np.ndarray | None = None,
@@ -44,6 +45,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         self.sharpness = float(sharpness)
         self.bias = float(bias)
         self.eps = float(eps)
+        self.route_pool_size = max(int(route_pool_size), 1)
         self.chunk_size = max(int(chunk_size), 1)
         self.subsampling = max(int(subsampling), 1)
         self.hot_pixel_mask = hot_pixel_mask
@@ -60,7 +62,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         return (
             f"{self.__class__.__name__}(fast_window={self.fast_window}, "
             f"slow_window={self.slow_window}, temporal_window={self.temporal_window}, "
-            f"sharpness={self.sharpness}, bias={self.bias})"
+            f"sharpness={self.sharpness}, bias={self.bias}, route_pool_size={self.route_pool_size})"
         )
 
     @staticmethod
@@ -103,7 +105,10 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         needs_rebuild = False
         for name, value in kwargs.items():
             if hasattr(self, name) and value is not None:
-                if name in {"fast_window", "slow_window", "temporal_window", "chunk_size", "subsampling"}:
+                if name in {
+                    "fast_window", "slow_window", "temporal_window", "route_pool_size",
+                    "chunk_size", "subsampling",
+                }:
                     value = max(int(value), 1)
                 elif name in {"fast_tau", "sharpness", "bias", "eps", "quantile"}:
                     value = float(value)
@@ -164,6 +169,18 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         k_dhw = F.pad(k_dhw, (1, 1, 1, 1, 0, 0))
         return F.conv3d(k_dhw, self.stea_kernel)
 
+    def _pool_route_weight(self, weights_flat: Tensor, h: int, w: int, t: int) -> Tensor:
+        """Spatially dilate route weights per frame to reduce edge/interior splits."""
+        if self.route_pool_size <= 1:
+            return weights_flat
+        pool_size = int(self.route_pool_size)
+        weight_thw = weights_flat.reshape(h, w, t).permute(2, 0, 1).unsqueeze(1)
+        padding = pool_size // 2
+        pooled = F.max_pool2d(weight_thw, kernel_size=pool_size, stride=1, padding=padding)
+        if pool_size % 2 == 0:
+            pooled = pooled[..., :h, :w]
+        return pooled.squeeze(1).permute(1, 2, 0).reshape(h * w, 1, t)
+
     @torch.no_grad()
     def _integrate_full_with_debug(self, photon_cube: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         h, w, t = map(int, photon_cube.shape)
@@ -175,6 +192,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
                 "k_raw": empty,
                 "k_smoothed": empty,
                 "route_weight": empty,
+                "route_weight_raw": empty,
                 "fused": empty,
                 "fused_blocks": empty,
                 "motion_blocks": empty,
@@ -188,6 +206,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
                 "scores_last": photon_cube.new_zeros(h, w, 2, dtype=torch.float32),
                 "k_smoothed_last": photon_cube.new_zeros(h, w, dtype=torch.float32),
                 "route_weight_last": photon_cube.new_zeros(h, w, dtype=torch.float32),
+                "route_weight_raw_last": photon_cube.new_zeros(h, w, dtype=torch.float32),
                 "recons_prenorm": empty,
             }
             return empty, debug
@@ -203,7 +222,8 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         k_raw_hwt = k_raw_flat.reshape(h, w, t)
         k_smoothed = self._smooth_kl(k_raw_hwt)
         k_s_flat = k_smoothed.squeeze(0).squeeze(0).permute(1, 2, 0).reshape(h * w, 1, t)
-        weights = torch.sigmoid(self.sharpness * (k_s_flat - self.bias))
+        weights_raw = torch.sigmoid(self.sharpness * (k_s_flat - self.bias))
+        weights = self._pool_route_weight(weights_raw, h, w, t)
         fused_flat = (1.0 - weights) * y_slow + weights * y_fast
         fused = fused_flat.reshape(h, w, t)
 
@@ -214,6 +234,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
 
         y_fast_hwt = y_fast.reshape(h, w, t)
         y_slow_hwt = y_slow.reshape(h, w, t)
+        weight_raw_hwt = weights_raw.reshape(h, w, t)
         weight_hwt = weights.reshape(h, w, t)
         k_s_hwt = k_smoothed.squeeze(0).squeeze(0).permute(1, 2, 0)
         debug = {
@@ -222,6 +243,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             "k_raw": k_raw_hwt,
             "k_smoothed": k_s_hwt,
             "route_weight": weight_hwt,
+            "route_weight_raw": weight_raw_hwt,
             "fused": fused,
             # Compatibility field names used by existing visualization code.
             "fused_blocks": fused,
@@ -236,6 +258,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             "scores_last": torch.stack([k_s_hwt[..., -1], weight_hwt[..., -1]], dim=-1),
             "k_smoothed_last": k_s_hwt[..., -1],
             "route_weight_last": weight_hwt[..., -1],
+            "route_weight_raw_last": weight_raw_hwt[..., -1],
             "recons_prenorm": fused,
         }
         return fused, debug
@@ -265,6 +288,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         sharpness: float | None = None,
         bias: float | None = None,
         eps: float | None = None,
+        route_pool_size: int | None = None,
         **kwargs,
     ) -> Tensor:
         if clear_states:
@@ -284,6 +308,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             sharpness=sharpness,
             bias=bias,
             eps=eps,
+            route_pool_size=route_pool_size,
             **kwargs,
         )
 
@@ -313,6 +338,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         sharpness: float | None = None,
         bias: float | None = None,
         eps: float | None = None,
+        route_pool_size: int | None = None,
         **kwargs,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         if clear_states:
@@ -332,6 +358,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             sharpness=sharpness,
             bias=bias,
             eps=eps,
+            route_pool_size=route_pool_size,
             **kwargs,
         )
 

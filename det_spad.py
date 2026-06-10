@@ -308,6 +308,7 @@ def main():
     ap.add_argument("--hyb_sharpness", type=float, default=1.0, help="Sigmoid sharpness for z-score evidence routing")
     ap.add_argument("--hyb_bias", type=float, default=3.0, help="Variance-normalized evidence bias for sigmoid routing")
     ap.add_argument("--hyb_eps", type=float, default=1e-5, help="Clamp epsilon for Bernoulli rates")
+    ap.add_argument("--hyb_route_pool_size", type=int, default=1, help="Spatial max-pool size for STEA route weights (1 = off)")
     ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
     ap.add_argument(
         "--hyb_prior_strength",
@@ -396,6 +397,7 @@ def main():
             sharpness=float(args.hyb_sharpness),
             bias=float(args.hyb_bias),
             eps=float(args.hyb_eps),
+            route_pool_size=int(args.hyb_route_pool_size),
             subsampling=int(args.chunk_size),
             normalize=bool(args.hyb_normalize),
             quantile=float(args.hyb_quantile),
