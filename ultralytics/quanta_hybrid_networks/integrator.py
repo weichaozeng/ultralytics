@@ -31,6 +31,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         bias: float = 3.0,
         eps: float = 1e-5,
         route_pool_size: int = 1,
+        route_pool_mode: str = "max",
         chunk_size: int = 320,
         subsampling: int = 1,
         hot_pixel_mask: np.ndarray | None = None,
@@ -46,6 +47,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         self.bias = float(bias)
         self.eps = float(eps)
         self.route_pool_size = max(int(route_pool_size), 1)
+        self.route_pool_mode = str(route_pool_mode).lower()
         self.chunk_size = max(int(chunk_size), 1)
         self.subsampling = max(int(subsampling), 1)
         self.hot_pixel_mask = hot_pixel_mask
@@ -62,7 +64,8 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         return (
             f"{self.__class__.__name__}(fast_window={self.fast_window}, "
             f"slow_window={self.slow_window}, temporal_window={self.temporal_window}, "
-            f"sharpness={self.sharpness}, bias={self.bias}, route_pool_size={self.route_pool_size})"
+            f"sharpness={self.sharpness}, bias={self.bias}, "
+            f"route_pool_size={self.route_pool_size}, route_pool_mode={self.route_pool_mode})"
         )
 
     @staticmethod
@@ -114,6 +117,8 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
                     value = float(value)
                 elif name == "normalize":
                     value = bool(value)
+                elif name == "route_pool_mode":
+                    value = str(value).lower()
                 setattr(self, name, value)
                 needs_rebuild = needs_rebuild or name in rebuild_keys
         if needs_rebuild:
@@ -169,32 +174,68 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         k_dhw = F.pad(k_dhw, (1, 1, 1, 1, 0, 0))
         return F.conv3d(k_dhw, self.stea_kernel)
 
-    def _pool_route_weight(self, weights_flat: Tensor, h: int, w: int, t: int) -> Tensor:
-        """Spatially dilate route weights per frame to reduce edge/interior splits."""
-        if self.route_pool_size <= 1:
-            return weights_flat
-        pool_size = int(self.route_pool_size)
-        weight_thw = weights_flat.reshape(h, w, t).permute(2, 0, 1).unsqueeze(1)
-        padding = pool_size // 2
-        pooled = F.max_pool2d(weight_thw, kernel_size=pool_size, stride=1, padding=padding)
+    @staticmethod
+    def _crop_pool_output(pooled: Tensor, h: int, w: int, pool_size: int) -> Tensor:
         if pool_size % 2 == 0:
             pooled = pooled[..., :h, :w]
+        return pooled
+
+    def _max_pool_route_tensor(self, x: Tensor, h: int, w: int, pool_size: int) -> Tensor:
+        pooled = F.max_pool2d(x, kernel_size=pool_size, stride=1, padding=pool_size // 2)
+        return self._crop_pool_output(pooled, h, w, pool_size)
+
+    def _min_pool_route_tensor(self, x: Tensor, h: int, w: int, pool_size: int) -> Tensor:
+        pooled = -F.max_pool2d(-x, kernel_size=pool_size, stride=1, padding=pool_size // 2)
+        return self._crop_pool_output(pooled, h, w, pool_size)
+
+    def _apply_route_morphology(self, x: Tensor, h: int, w: int) -> Tensor:
+        """Apply spatial morphology to route weights. Input shape is [N, 1, H, W]."""
+        if self.route_pool_size <= 1 or self.route_pool_mode in {"none", "off", "identity"}:
+            return x
+        pool_size = int(self.route_pool_size)
+        mode = str(self.route_pool_mode).lower()
+        if mode == "max":
+            return self._max_pool_route_tensor(x, h, w, pool_size)
+        if mode == "min":
+            return self._min_pool_route_tensor(x, h, w, pool_size)
+        if mode in {"open", "opening"}:
+            eroded = self._min_pool_route_tensor(x, h, w, pool_size)
+            return self._max_pool_route_tensor(eroded, h, w, pool_size)
+        if mode in {"close", "closing"}:
+            dilated = self._max_pool_route_tensor(x, h, w, pool_size)
+            return self._min_pool_route_tensor(dilated, h, w, pool_size)
+        if mode in {"open_close", "opening_closing"}:
+            opened = self._apply_route_morphology_with_mode(x, h, w, pool_size, "open")
+            return self._apply_route_morphology_with_mode(opened, h, w, pool_size, "close")
+        if mode in {"close_open", "closing_opening"}:
+            closed = self._apply_route_morphology_with_mode(x, h, w, pool_size, "close")
+            return self._apply_route_morphology_with_mode(closed, h, w, pool_size, "open")
+        raise ValueError(
+            "route_pool_mode must be one of: none, max, min, open, close, open_close, close_open"
+        )
+
+    def _apply_route_morphology_with_mode(self, x: Tensor, h: int, w: int, pool_size: int, mode: str) -> Tensor:
+        if mode == "open":
+            eroded = self._min_pool_route_tensor(x, h, w, pool_size)
+            return self._max_pool_route_tensor(eroded, h, w, pool_size)
+        if mode == "close":
+            dilated = self._max_pool_route_tensor(x, h, w, pool_size)
+            return self._min_pool_route_tensor(dilated, h, w, pool_size)
+        raise ValueError(f"Unsupported internal morphology mode: {mode}")
+
+    def _pool_route_weight(self, weights_flat: Tensor, h: int, w: int, t: int) -> Tensor:
+        """Apply spatial route morphology per frame to reduce edge/interior splits."""
+        weight_thw = weights_flat.reshape(h, w, t).permute(2, 0, 1).unsqueeze(1)
+        pooled = self._apply_route_morphology(weight_thw, h, w)
         return pooled.squeeze(1).permute(1, 2, 0).reshape(h * w, 1, t)
 
     def _pool_route_map(self, weight_hw: Tensor) -> Tensor:
-        """Spatially dilate one route-weight frame."""
-        if self.route_pool_size <= 1:
-            return weight_hw
-        pool_size = int(self.route_pool_size)
-        padding = pool_size // 2
-        pooled = F.max_pool2d(
+        """Apply spatial route morphology to one route-weight frame."""
+        pooled = self._apply_route_morphology(
             weight_hw.unsqueeze(0).unsqueeze(0),
-            kernel_size=pool_size,
-            stride=1,
-            padding=padding,
+            int(weight_hw.shape[0]),
+            int(weight_hw.shape[1]),
         )
-        if pool_size % 2 == 0:
-            pooled = pooled[..., : weight_hw.shape[0], : weight_hw.shape[1]]
         return pooled.squeeze(0).squeeze(0)
 
     def _smooth_kl_last(self, k_raw_hwt: Tensor) -> Tensor:
@@ -368,6 +409,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         bias: float | None = None,
         eps: float | None = None,
         route_pool_size: int | None = None,
+        route_pool_mode: str | None = None,
         **kwargs,
     ) -> Tensor:
         if clear_states:
@@ -388,6 +430,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             bias=bias,
             eps=eps,
             route_pool_size=route_pool_size,
+            route_pool_mode=route_pool_mode,
             **kwargs,
         )
 
@@ -421,6 +464,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         bias: float | None = None,
         eps: float | None = None,
         route_pool_size: int | None = None,
+        route_pool_mode: str | None = None,
         **kwargs,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         if clear_states:
@@ -441,6 +485,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             bias=bias,
             eps=eps,
             route_pool_size=route_pool_size,
+            route_pool_mode=route_pool_mode,
             **kwargs,
         )
 

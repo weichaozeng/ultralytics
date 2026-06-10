@@ -238,6 +238,7 @@ def _save_visuals(
     sharpness: float,
     bias: float,
     route_pool_size: int,
+    route_pool_mode: str,
 ) -> None:
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
     display_hw = recon_bgr.shape[:2]
@@ -274,12 +275,13 @@ def _save_visuals(
     stats_lines = [
         f"stem={stem}",
         f"fast_window={fast_window} slow_window={slow_window} temporal_window={temporal_window}",
-        f"fast_tau={fast_tau} sharpness={sharpness} bias={bias} route_pool_size={route_pool_size}",
+        f"fast_tau={fast_tau} sharpness={sharpness} bias={bias} "
+        f"route_pool_size={route_pool_size} route_pool_mode={route_pool_mode}",
         f"k_smoothed_vmax={k_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
         "k_smoothed is causal-smoothed Bernoulli variance-normalized evidence, not raw KL.",
         "route_weight visualization is fixed grayscale [0, 1] so brightness is monotonic.",
         "route_weight_raw = sigmoid(sharpness * (k_smoothed - bias))",
-        "route_weight = spatial max_pool(route_weight_raw) when route_pool_size > 1",
+        "route_weight = spatial morphology(route_weight_raw) when route_pool_size > 1",
         f"route_raw_from_k_abs_err_max={float(route_abs_err.max()):.8f} mean={float(route_abs_err.mean()):.8f}",
         "",
     ]
@@ -305,6 +307,12 @@ def main() -> None:
     ap.add_argument("--hyb_bias", type=float, default=3.0)
     ap.add_argument("--hyb_eps", type=float, default=1e-5)
     ap.add_argument("--hyb_route_pool_size", type=int, default=1)
+    ap.add_argument(
+        "--hyb_route_pool_mode",
+        type=str,
+        default="max",
+        choices=["none", "max", "min", "open", "close", "open_close", "close_open"],
+    )
     ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
     ap.add_argument("--hyb_prior_strength", type=float, default=1.0, help="Deprecated; ignored by STEA")
     ap.add_argument("--hyb_gating_tau", type=float, default=0.1, help="Deprecated; ignored by STEA")
@@ -348,6 +356,7 @@ def main() -> None:
         bias=float(args.hyb_bias),
         eps=float(args.hyb_eps),
         route_pool_size=int(args.hyb_route_pool_size),
+        route_pool_mode=str(args.hyb_route_pool_mode),
         subsampling=int(args.chunk_size),
         normalize=bool(args.hyb_normalize),
         quantile=float(args.hyb_quantile),
@@ -406,6 +415,7 @@ def main() -> None:
                 sharpness=float(args.hyb_sharpness),
                 bias=float(args.hyb_bias),
                 route_pool_size=int(args.hyb_route_pool_size),
+                route_pool_mode=str(args.hyb_route_pool_mode),
             )
             frame_idx += 1
 
