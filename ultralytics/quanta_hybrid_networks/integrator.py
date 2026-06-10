@@ -181,6 +181,85 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             pooled = pooled[..., :h, :w]
         return pooled.squeeze(1).permute(1, 2, 0).reshape(h * w, 1, t)
 
+    def _pool_route_map(self, weight_hw: Tensor) -> Tensor:
+        """Spatially dilate one route-weight frame."""
+        if self.route_pool_size <= 1:
+            return weight_hw
+        pool_size = int(self.route_pool_size)
+        padding = pool_size // 2
+        pooled = F.max_pool2d(
+            weight_hw.unsqueeze(0).unsqueeze(0),
+            kernel_size=pool_size,
+            stride=1,
+            padding=padding,
+        )
+        if pool_size % 2 == 0:
+            pooled = pooled[..., : weight_hw.shape[0], : weight_hw.shape[1]]
+        return pooled.squeeze(0).squeeze(0)
+
+    def _smooth_kl_last(self, k_raw_hwt: Tensor) -> Tensor:
+        """Return only the final causal 3D-smoothed evidence frame."""
+        h, w, _ = map(int, k_raw_hwt.shape)
+        hist = self._history_or_zeros(self.kl_history, h, w, self.temporal_window - 1, k_raw_hwt)
+        context = torch.cat([hist, k_raw_hwt], dim=-1)[..., -self.temporal_window :]
+        k_dhw = context.permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+        k_dhw = F.pad(k_dhw, (1, 1, 1, 1, 0, 0))
+        return F.conv3d(k_dhw, self.stea_kernel).squeeze(0).squeeze(0).squeeze(0)
+
+    @torch.no_grad()
+    def _integrate_last_with_debug(self, photon_cube: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
+        """Memory-efficient path for chunked scripts that only emit the final frame."""
+        h, w, t = map(int, photon_cube.shape)
+        if t == 0:
+            empty, debug = self._integrate_full_with_debug(photon_cube)
+            return empty, debug
+
+        y_fast, y_slow = self._temporal_basis(photon_cube)
+        y_fast_last = y_fast[..., -1].reshape(h, w)
+        y_slow_last = y_slow[..., -1].reshape(h, w)
+
+        delta2 = (y_fast - y_slow).square()
+        p_ref = y_slow.clamp(self.eps, 1.0 - self.eps)
+        var_delta = p_ref * (1.0 - p_ref) * (self.fast_noise_gain + self.slow_noise_gain)
+        k_raw_flat = delta2 / var_delta.clamp(min=self.eps)
+        k_raw_hwt = k_raw_flat.reshape(h, w, t)
+
+        k_last = self._smooth_kl_last(k_raw_hwt)
+        route_raw_last = torch.sigmoid(self.sharpness * (k_last - self.bias))
+        route_last = self._pool_route_map(route_raw_last)
+        fused_last = (1.0 - route_last) * y_slow_last + route_last * y_fast_last
+        fused = fused_last.unsqueeze(-1)
+
+        max_photon_hist = max(self.fast_window, self.slow_window) - 1
+        max_kl_hist = self.temporal_window - 1
+        self.photon_history = photon_cube.float()[..., -max_photon_hist:].detach() if max_photon_hist > 0 else None
+        self.kl_history = k_raw_hwt[..., -max_kl_hist:].detach() if max_kl_hist > 0 else None
+
+        debug = {
+            "y_fast": y_fast_last.unsqueeze(-1),
+            "y_slow": y_slow_last.unsqueeze(-1),
+            "k_raw": k_raw_hwt[..., -1:],
+            "k_smoothed": k_last.unsqueeze(-1),
+            "route_weight": route_last.unsqueeze(-1),
+            "route_weight_raw": route_raw_last.unsqueeze(-1),
+            "fused": fused,
+            "fused_blocks": fused,
+            "motion_blocks": route_last.unsqueeze(-1),
+            "doe_blocks": k_last.unsqueeze(-1),
+            "weight_gamma_blocks": route_last.unsqueeze(-1),
+            "fused_mean": fused_last,
+            "fused_last": fused_last,
+            "motion_peak": route_last,
+            "motion_blend": route_last,
+            "y_scales_last": torch.stack([y_fast_last, y_slow_last], dim=-1),
+            "scores_last": torch.stack([k_last, route_last], dim=-1),
+            "k_smoothed_last": k_last,
+            "route_weight_last": route_last,
+            "route_weight_raw_last": route_raw_last,
+            "recons_prenorm": fused,
+        }
+        return fused, debug
+
     @torch.no_grad()
     def _integrate_full_with_debug(self, photon_cube: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         h, w, t = map(int, photon_cube.shape)
@@ -313,7 +392,10 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         )
 
         self.set_cube(photon_cube)
-        fused, _ = self._integrate_full_with_debug(photon_cube)
+        if self._t <= self.subsampling:
+            fused, _ = self._integrate_last_with_debug(photon_cube)
+        else:
+            fused, _ = self._integrate_full_with_debug(photon_cube)
         recons = self._subsample_reconstruction(fused)
         if self.hot_pixel_mask is not None:
             recons = nearest_neighbor_inpaint(recons, self.hot_pixel_mask)
@@ -363,7 +445,10 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         )
 
         self.set_cube(photon_cube)
-        fused, motion_debug = self._integrate_full_with_debug(photon_cube)
+        if self._t <= self.subsampling:
+            fused, motion_debug = self._integrate_last_with_debug(photon_cube)
+        else:
+            fused, motion_debug = self._integrate_full_with_debug(photon_cube)
         recons = self._subsample_reconstruction(fused)
         motion_debug["recons_prenorm"] = self._subsample_reconstruction(motion_debug["recons_prenorm"])
         if self.hot_pixel_mask is not None:
