@@ -163,6 +163,13 @@ def _value_to_heatmap(values: np.ndarray, cmap_id: int, *, vmax: float) -> np.nd
     return cv2.applyColorMap(u8, cmap_id)
 
 
+def _value_to_gray_bgr(values: np.ndarray, *, vmin: float = 0.0, vmax: float = 1.0) -> np.ndarray:
+    """Monotonic visualization: black is low, white is high."""
+    denom = max(float(vmax) - float(vmin), 1e-8)
+    u8 = (np.clip((values - float(vmin)) / denom, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    return cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+
+
 def _resolve_vmax(values: np.ndarray, *, fixed_vmax: float, percentile: float) -> float:
     if fixed_vmax > 0.0:
         return float(fixed_vmax)
@@ -241,16 +248,17 @@ def _save_visuals(
         "y_slow": motion_debug["y_scales_last"][..., 1].detach().float().cpu().numpy(),
         "fused": motion_debug["fused_last"].detach().float().cpu().numpy(),
     }
-    evidence_stack = np.stack([maps["k_smoothed"], maps["route_weight"]], axis=0)
-    score_vmax_scale = _resolve_vmax(evidence_stack, fixed_vmax=score_vmax, percentile=score_percentile)
+    k_vmax_scale = _resolve_vmax(maps["k_smoothed"], fixed_vmax=score_vmax, percentile=score_percentile)
 
     score_panels = []
     score_labels = []
     for label, score_map in maps.items():
         disp = _resize_map_to_display(score_map, display_hw)
-        vmax = score_vmax_scale if label in {"k_smoothed", "route_weight"} else 1.0
-        heat = _value_to_heatmap(disp, cmap_id, vmax=vmax)
-        score_panels.append(heat)
+        if label == "k_smoothed":
+            panel = _value_to_heatmap(disp, cmap_id, vmax=k_vmax_scale)
+        else:
+            panel = _value_to_gray_bgr(disp, vmin=0.0, vmax=1.0)
+        score_panels.append(panel)
         score_labels.append(label)
     cv2.imwrite(str(out_dir / f"{stem}_hyb_scores.png"), _stitch_panels(score_panels, score_labels))
 
@@ -259,12 +267,16 @@ def _save_visuals(
         _stitch_panels([sum_bgr, recon_bgr], ["sum", "hyb"]),
     )
 
+    route_from_k = 1.0 / (1.0 + np.exp(-float(sharpness) * (maps["k_smoothed"] - float(bias))))
+    route_abs_err = np.abs(route_from_k - maps["route_weight"])
     stats_lines = [
         f"stem={stem}",
         f"fast_window={fast_window} slow_window={slow_window} temporal_window={temporal_window}",
         f"fast_tau={fast_tau} sharpness={sharpness} bias={bias}",
-        f"evidence_vmax={score_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
+        f"k_smoothed_vmax={k_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
+        "route_weight visualization is fixed grayscale [0, 1] so brightness is monotonic.",
         "route_weight = sigmoid(sharpness * (k_smoothed - bias))",
+        f"route_from_k_abs_err_max={float(route_abs_err.max()):.8f} mean={float(route_abs_err.mean()):.8f}",
         "",
     ]
     for label, values in maps.items():
