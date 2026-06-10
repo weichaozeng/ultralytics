@@ -16,9 +16,9 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
     """
     Spatio-temporal evidence accumulation (STEA) for SPAD photon cubes.
 
-    The tensor path is fully convolutional along time: causal 1D temporal
-    bases, Bernoulli variance-normalized evidence, causal 3D evidence smoothing,
-    then sigmoid soft routing between slow and fast rates.
+    The tensor path follows the 5-stage STEA pipeline: causal 1D temporal
+    bases, pointwise Bernoulli KL, causal 3D spatio-temporal smoothing,
+    time-reversed cummax masking, and inverse-length Bayesian fusion.
     """
 
     def __init__(
@@ -27,11 +27,10 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         slow_window: int = 128,
         temporal_window: int = 5,
         fast_tau: float | None = None,
-        sharpness: float = 1.0,
-        bias: float = 3.0,
+        motion_sharpness: float = 60.0,
+        motion_threshold: float = 0.05,
         eps: float = 1e-5,
-        route_pool_size: int = 1,
-        route_pool_mode: str = "max",
+        stable_prior: float = 16.0,
         chunk_size: int = 320,
         subsampling: int = 1,
         hot_pixel_mask: np.ndarray | None = None,
@@ -43,11 +42,10 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         self.slow_window = max(int(slow_window), 1)
         self.temporal_window = max(int(temporal_window), 1)
         self.fast_tau = float(fast_tau) if fast_tau is not None else max(self.fast_window / 4.0, 1.0)
-        self.sharpness = float(sharpness)
-        self.bias = float(bias)
+        self.motion_sharpness = float(motion_sharpness)
+        self.motion_threshold = float(motion_threshold)
         self.eps = float(eps)
-        self.route_pool_size = max(int(route_pool_size), 1)
-        self.route_pool_mode = str(route_pool_mode).lower()
+        self.stable_prior = float(stable_prior)
         self.chunk_size = max(int(chunk_size), 1)
         self.subsampling = max(int(subsampling), 1)
         self.hot_pixel_mask = hot_pixel_mask
@@ -64,8 +62,8 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         return (
             f"{self.__class__.__name__}(fast_window={self.fast_window}, "
             f"slow_window={self.slow_window}, temporal_window={self.temporal_window}, "
-            f"sharpness={self.sharpness}, bias={self.bias}, "
-            f"route_pool_size={self.route_pool_size}, route_pool_mode={self.route_pool_mode})"
+            f"motion_sharpness={self.motion_sharpness}, "
+            f"motion_threshold={self.motion_threshold}, stable_prior={self.stable_prior})"
         )
 
     @staticmethod
@@ -83,16 +81,11 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         gamma_age = torch.arange(self.fast_window, 0, -1, dtype=torch.float32)
         fast = gamma_age * torch.exp(-gamma_age / max(self.fast_tau, 1e-6))
         slow = torch.ones(self.slow_window, dtype=torch.float32)
-        stea = torch.ones(
-            (1, 1, self.temporal_window, 3, 3),
-            dtype=torch.float32,
-        )
+        stea = torch.ones((1, 1, self.temporal_window, 3, 3), dtype=torch.float32)
 
         self.register_buffer("fast_kernel", self._normalize_kernel(fast).view(1, 1, -1).to(device))
         self.register_buffer("slow_kernel", self._normalize_kernel(slow).view(1, 1, -1).to(device))
         self.register_buffer("stea_kernel", self._normalize_kernel(stea).to(device))
-        self.register_buffer("fast_noise_gain", self.fast_kernel.square().sum().view(1, 1, 1))
-        self.register_buffer("slow_noise_gain", self.slow_kernel.square().sum().view(1, 1, 1))
 
     def update_hyperparams(self, **kwargs) -> None:
         """Update STEA attributes; rebuild convolution kernels when needed."""
@@ -107,18 +100,20 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
 
         needs_rebuild = False
         for name, value in kwargs.items():
+            # Legacy aliases from earlier STEA drafts.
+            if name == "sharpness":
+                name = "motion_sharpness"
+            elif name == "bias":
+                name = "motion_threshold"
             if hasattr(self, name) and value is not None:
                 if name in {
-                    "fast_window", "slow_window", "temporal_window", "route_pool_size",
-                    "chunk_size", "subsampling",
+                    "fast_window", "slow_window", "temporal_window", "chunk_size", "subsampling",
                 }:
                     value = max(int(value), 1)
-                elif name in {"fast_tau", "sharpness", "bias", "eps", "quantile"}:
+                if name in {"fast_tau", "motion_sharpness", "motion_threshold", "eps", "stable_prior", "quantile"}:
                     value = float(value)
                 elif name == "normalize":
                     value = bool(value)
-                elif name == "route_pool_mode":
-                    value = str(value).lower()
                 setattr(self, name, value)
                 needs_rebuild = needs_rebuild or name in rebuild_keys
         if needs_rebuild:
@@ -170,82 +165,20 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
     def _smooth_kl(self, k_raw_hwt: Tensor) -> Tensor:
         h, w, _ = map(int, k_raw_hwt.shape)
         hist = self._history_or_zeros(self.kl_history, h, w, self.temporal_window - 1, k_raw_hwt)
-        k_dhw = torch.cat([hist, k_raw_hwt], dim=-1).permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
-        k_dhw = F.pad(k_dhw, (1, 1, 1, 1, 0, 0))
-        return F.conv3d(k_dhw, self.stea_kernel)
-
-    @staticmethod
-    def _crop_pool_output(pooled: Tensor, h: int, w: int, pool_size: int) -> Tensor:
-        if pool_size % 2 == 0:
-            pooled = pooled[..., :h, :w]
-        return pooled
-
-    def _max_pool_route_tensor(self, x: Tensor, h: int, w: int, pool_size: int) -> Tensor:
-        pooled = F.max_pool2d(x, kernel_size=pool_size, stride=1, padding=pool_size // 2)
-        return self._crop_pool_output(pooled, h, w, pool_size)
-
-    def _min_pool_route_tensor(self, x: Tensor, h: int, w: int, pool_size: int) -> Tensor:
-        pooled = -F.max_pool2d(-x, kernel_size=pool_size, stride=1, padding=pool_size // 2)
-        return self._crop_pool_output(pooled, h, w, pool_size)
-
-    def _apply_route_morphology(self, x: Tensor, h: int, w: int) -> Tensor:
-        """Apply spatial morphology to route weights. Input shape is [N, 1, H, W]."""
-        if self.route_pool_size <= 1 or self.route_pool_mode in {"none", "off", "identity"}:
-            return x
-        pool_size = int(self.route_pool_size)
-        mode = str(self.route_pool_mode).lower()
-        if mode == "max":
-            return self._max_pool_route_tensor(x, h, w, pool_size)
-        if mode == "min":
-            return self._min_pool_route_tensor(x, h, w, pool_size)
-        if mode in {"open", "opening"}:
-            eroded = self._min_pool_route_tensor(x, h, w, pool_size)
-            return self._max_pool_route_tensor(eroded, h, w, pool_size)
-        if mode in {"close", "closing"}:
-            dilated = self._max_pool_route_tensor(x, h, w, pool_size)
-            return self._min_pool_route_tensor(dilated, h, w, pool_size)
-        if mode in {"open_close", "opening_closing"}:
-            opened = self._apply_route_morphology_with_mode(x, h, w, pool_size, "open")
-            return self._apply_route_morphology_with_mode(opened, h, w, pool_size, "close")
-        if mode in {"close_open", "closing_opening"}:
-            closed = self._apply_route_morphology_with_mode(x, h, w, pool_size, "close")
-            return self._apply_route_morphology_with_mode(closed, h, w, pool_size, "open")
-        raise ValueError(
-            "route_pool_mode must be one of: none, max, min, open, close, open_close, close_open"
-        )
-
-    def _apply_route_morphology_with_mode(self, x: Tensor, h: int, w: int, pool_size: int, mode: str) -> Tensor:
-        if mode == "open":
-            eroded = self._min_pool_route_tensor(x, h, w, pool_size)
-            return self._max_pool_route_tensor(eroded, h, w, pool_size)
-        if mode == "close":
-            dilated = self._max_pool_route_tensor(x, h, w, pool_size)
-            return self._min_pool_route_tensor(dilated, h, w, pool_size)
-        raise ValueError(f"Unsupported internal morphology mode: {mode}")
-
-    def _pool_route_weight(self, weights_flat: Tensor, h: int, w: int, t: int) -> Tensor:
-        """Apply spatial route morphology per frame to reduce edge/interior splits."""
-        weight_thw = weights_flat.reshape(h, w, t).permute(2, 0, 1).unsqueeze(1)
-        pooled = self._apply_route_morphology(weight_thw, h, w)
-        return pooled.squeeze(1).permute(1, 2, 0).reshape(h * w, 1, t)
-
-    def _pool_route_map(self, weight_hw: Tensor) -> Tensor:
-        """Apply spatial route morphology to one route-weight frame."""
-        pooled = self._apply_route_morphology(
-            weight_hw.unsqueeze(0).unsqueeze(0),
-            int(weight_hw.shape[0]),
-            int(weight_hw.shape[1]),
-        )
-        return pooled.squeeze(0).squeeze(0)
+        k_context = torch.cat([hist, k_raw_hwt], dim=-1)
+        k_5d = k_context.permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+        k_5d = F.pad(k_5d, (1, 1, 1, 1, 0, 0))
+        return F.conv3d(k_5d, self.stea_kernel).squeeze(0).squeeze(0).permute(1, 2, 0)
 
     def _smooth_kl_last(self, k_raw_hwt: Tensor) -> Tensor:
         """Return only the final causal 3D-smoothed evidence frame."""
         h, w, _ = map(int, k_raw_hwt.shape)
         hist = self._history_or_zeros(self.kl_history, h, w, self.temporal_window - 1, k_raw_hwt)
         context = torch.cat([hist, k_raw_hwt], dim=-1)[..., -self.temporal_window :]
-        k_dhw = context.permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
-        k_dhw = F.pad(k_dhw, (1, 1, 1, 1, 0, 0))
-        return F.conv3d(k_dhw, self.stea_kernel).squeeze(0).squeeze(0).squeeze(0)
+        k_thw = context.permute(2, 0, 1).unsqueeze(1)
+        k_5d = k_thw.unsqueeze(0).transpose(1, 2)
+        k_5d = F.pad(k_5d, (1, 1, 1, 1, 0, 0))
+        return F.conv3d(k_5d, self.stea_kernel).squeeze(0).squeeze(0).squeeze(0)
 
     @torch.no_grad()
     def _integrate_last_with_debug(self, photon_cube: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
@@ -259,16 +192,20 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         y_fast_last = y_fast[..., -1].reshape(h, w)
         y_slow_last = y_slow[..., -1].reshape(h, w)
 
-        delta2 = (y_fast - y_slow).square()
-        p_ref = y_slow.clamp(self.eps, 1.0 - self.eps)
-        var_delta = p_ref * (1.0 - p_ref) * (self.fast_noise_gain + self.slow_noise_gain)
-        k_raw_flat = delta2 / var_delta.clamp(min=self.eps)
+        k_raw_flat = y_fast * torch.log(y_fast / y_slow) + (1.0 - y_fast) * torch.log(
+            (1.0 - y_fast) / (1.0 - y_slow)
+        )
         k_raw_hwt = k_raw_flat.reshape(h, w, t)
+        k_smoothed_hwt = self._smooth_kl(k_raw_hwt)
 
-        k_last = self._smooth_kl_last(k_raw_hwt)
-        route_raw_last = torch.sigmoid(self.sharpness * (k_last - self.bias))
-        route_last = self._pool_route_map(route_raw_last)
-        fused_last = (1.0 - route_last) * y_slow_last + route_last * y_fast_last
+        p_motion = torch.sigmoid(self.motion_sharpness * (k_smoothed_hwt - self.motion_threshold))
+        p_motion_raw = p_motion
+        future_motion = torch.flip(torch.flip(p_motion, dims=(-1,)).cummax(dim=-1).values, dims=(-1,))
+        valid_weight = 1.0 - future_motion
+        stable_support = valid_weight.sum(dim=-1)
+        mean_stable = (valid_weight * photon_cube.float()).sum(dim=-1) / stable_support.clamp(min=self.eps)
+        w_mean = stable_support / (stable_support + max(self.stable_prior, self.eps))
+        fused_last = w_mean * mean_stable + (1.0 - w_mean) * y_fast_last
         fused = fused_last.unsqueeze(-1)
 
         max_photon_hist = max(self.fast_window, self.slow_window) - 1
@@ -280,23 +217,33 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             "y_fast": y_fast_last.unsqueeze(-1),
             "y_slow": y_slow_last.unsqueeze(-1),
             "k_raw": k_raw_hwt[..., -1:],
-            "k_smoothed": k_last.unsqueeze(-1),
-            "route_weight": route_last.unsqueeze(-1),
-            "route_weight_raw": route_raw_last.unsqueeze(-1),
+            "k_smoothed": k_smoothed_hwt,
+            "route_weight": future_motion,
+            "route_weight_raw": p_motion_raw,
+            "p_motion": p_motion,
+            "p_motion_raw": p_motion_raw,
+            "future_motion": future_motion,
+            "valid_weight": valid_weight,
             "fused": fused,
             "fused_blocks": fused,
-            "motion_blocks": route_last.unsqueeze(-1),
-            "doe_blocks": k_last.unsqueeze(-1),
-            "weight_gamma_blocks": route_last.unsqueeze(-1),
+            "motion_blocks": future_motion,
+            "doe_blocks": k_smoothed_hwt,
+            "weight_gamma_blocks": future_motion,
             "fused_mean": fused_last,
             "fused_last": fused_last,
-            "motion_peak": route_last,
-            "motion_blend": route_last,
+            "motion_peak": future_motion.max(dim=-1).values,
+            "motion_blend": future_motion[..., -1],
             "y_scales_last": torch.stack([y_fast_last, y_slow_last], dim=-1),
-            "scores_last": torch.stack([k_last, route_last], dim=-1),
-            "k_smoothed_last": k_last,
-            "route_weight_last": route_last,
-            "route_weight_raw_last": route_raw_last,
+            "scores_last": torch.stack([k_smoothed_hwt[..., -1], future_motion[..., -1]], dim=-1),
+            "k_smoothed_last": k_smoothed_hwt[..., -1],
+            "route_weight_last": future_motion[..., -1],
+            "route_weight_raw_last": p_motion_raw[..., -1],
+            "p_motion_last": p_motion[..., -1],
+            "future_motion_last": future_motion[..., -1],
+            "valid_weight_last": valid_weight[..., -1],
+            "mean_stable": mean_stable,
+            "stable_support": stable_support,
+            "w_mean": w_mean,
             "recons_prenorm": fused,
         }
         return fused, debug
@@ -331,57 +278,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             }
             return empty, debug
 
-        y_fast, y_slow = self._temporal_basis(photon_cube)
-        # Bernoulli variance-normalized fast/slow disagreement. This keeps
-        # bright static regions from looking dynamic only because their absolute
-        # photon variance is larger.
-        delta = y_fast - y_slow
-        p_ref = y_slow.clamp(self.eps, 1.0 - self.eps)
-        var_delta = p_ref * (1.0 - p_ref) * (self.fast_noise_gain + self.slow_noise_gain)
-        k_raw_flat = delta.square() / var_delta.clamp(min=self.eps)
-        k_raw_hwt = k_raw_flat.reshape(h, w, t)
-        k_smoothed = self._smooth_kl(k_raw_hwt)
-        k_s_flat = k_smoothed.squeeze(0).squeeze(0).permute(1, 2, 0).reshape(h * w, 1, t)
-        weights_raw = torch.sigmoid(self.sharpness * (k_s_flat - self.bias))
-        weights = self._pool_route_weight(weights_raw, h, w, t)
-        fused_flat = (1.0 - weights) * y_slow + weights * y_fast
-        fused = fused_flat.reshape(h, w, t)
-
-        max_photon_hist = max(self.fast_window, self.slow_window) - 1
-        max_kl_hist = self.temporal_window - 1
-        self.photon_history = photon_cube.float()[..., -max_photon_hist:].detach() if max_photon_hist > 0 else None
-        self.kl_history = k_raw_hwt[..., -max_kl_hist:].detach() if max_kl_hist > 0 else None
-
-        y_fast_hwt = y_fast.reshape(h, w, t)
-        y_slow_hwt = y_slow.reshape(h, w, t)
-        weight_raw_hwt = weights_raw.reshape(h, w, t)
-        weight_hwt = weights.reshape(h, w, t)
-        k_s_hwt = k_smoothed.squeeze(0).squeeze(0).permute(1, 2, 0)
-        debug = {
-            "y_fast": y_fast_hwt,
-            "y_slow": y_slow_hwt,
-            "k_raw": k_raw_hwt,
-            "k_smoothed": k_s_hwt,
-            "route_weight": weight_hwt,
-            "route_weight_raw": weight_raw_hwt,
-            "fused": fused,
-            # Compatibility field names used by existing visualization code.
-            "fused_blocks": fused,
-            "motion_blocks": weight_hwt,
-            "doe_blocks": k_s_hwt,
-            "weight_gamma_blocks": weight_hwt,
-            "fused_mean": fused.mean(dim=-1),
-            "fused_last": fused[..., -1],
-            "motion_peak": weight_hwt.max(dim=-1).values,
-            "motion_blend": weight_hwt[..., -1],
-            "y_scales_last": torch.stack([y_fast_hwt[..., -1], y_slow_hwt[..., -1]], dim=-1),
-            "scores_last": torch.stack([k_s_hwt[..., -1], weight_hwt[..., -1]], dim=-1),
-            "k_smoothed_last": k_s_hwt[..., -1],
-            "route_weight_last": weight_hwt[..., -1],
-            "route_weight_raw_last": weight_raw_hwt[..., -1],
-            "recons_prenorm": fused,
-        }
-        return fused, debug
+        return self._integrate_last_with_debug(photon_cube)
 
     def _subsample_reconstruction(self, fused_hwt: Tensor) -> Tensor:
         h, w, t = map(int, fused_hwt.shape)
@@ -405,11 +302,10 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         slow_window: int | None = None,
         temporal_window: int | None = None,
         fast_tau: float | None = None,
-        sharpness: float | None = None,
-        bias: float | None = None,
+        motion_sharpness: float | None = None,
+        motion_threshold: float | None = None,
         eps: float | None = None,
-        route_pool_size: int | None = None,
-        route_pool_mode: str | None = None,
+        stable_prior: float | None = None,
         **kwargs,
     ) -> Tensor:
         if clear_states:
@@ -426,11 +322,10 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             slow_window=slow_window,
             temporal_window=temporal_window,
             fast_tau=fast_tau,
-            sharpness=sharpness,
-            bias=bias,
+            motion_sharpness=motion_sharpness,
+            motion_threshold=motion_threshold,
             eps=eps,
-            route_pool_size=route_pool_size,
-            route_pool_mode=route_pool_mode,
+            stable_prior=stable_prior,
             **kwargs,
         )
 
@@ -460,11 +355,10 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         slow_window: int | None = None,
         temporal_window: int | None = None,
         fast_tau: float | None = None,
-        sharpness: float | None = None,
-        bias: float | None = None,
+        motion_sharpness: float | None = None,
+        motion_threshold: float | None = None,
         eps: float | None = None,
-        route_pool_size: int | None = None,
-        route_pool_mode: str | None = None,
+        stable_prior: float | None = None,
         **kwargs,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         if clear_states:
@@ -481,11 +375,10 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
             slow_window=slow_window,
             temporal_window=temporal_window,
             fast_tau=fast_tau,
-            sharpness=sharpness,
-            bias=bias,
+            motion_sharpness=motion_sharpness,
+            motion_threshold=motion_threshold,
             eps=eps,
-            route_pool_size=route_pool_size,
-            route_pool_mode=route_pool_mode,
+            stable_prior=stable_prior,
             **kwargs,
         )
 

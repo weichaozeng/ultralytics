@@ -303,19 +303,12 @@ def main():
     # STEA hybrid preprocessor
     ap.add_argument("--hyb_fast_window", type=int, default=16, help="Fast Gamma temporal basis length for STEA")
     ap.add_argument("--hyb_slow_window", type=int, default=128, help="Slow boxcar temporal basis length for STEA")
-    ap.add_argument("--hyb_temporal_window", type=int, default=5, help="Causal KL smoothing depth for STEA conv3d")
+    ap.add_argument("--hyb_temporal_window", type=int, default=5, help="Causal evidence time blur window for STEA")
     ap.add_argument("--hyb_fast_tau", type=float, default=4.0, help="Gamma kernel tau for the fast STEA basis")
-    ap.add_argument("--hyb_sharpness", type=float, default=1.0, help="Sigmoid sharpness for z-score evidence routing")
-    ap.add_argument("--hyb_bias", type=float, default=3.0, help="Variance-normalized evidence bias for sigmoid routing")
+    ap.add_argument("--hyb_motion_sharpness", type=float, default=60.0, help="Sigmoid sharpness for KL motion probability")
+    ap.add_argument("--hyb_motion_threshold", type=float, default=0.05, help="KL threshold for sigmoid motion probability")
     ap.add_argument("--hyb_eps", type=float, default=1e-5, help="Clamp epsilon for Bernoulli rates")
-    ap.add_argument("--hyb_route_pool_size", type=int, default=1, help="Spatial max-pool size for STEA route weights (1 = off)")
-    ap.add_argument(
-        "--hyb_route_pool_mode",
-        type=str,
-        default="max",
-        choices=["none", "max", "min", "open", "close", "open_close", "close_open"],
-        help="Spatial morphology for STEA route weights",
-    )
+    ap.add_argument("--hyb_blend_const", type=float, default=16.0, help="C in W_mean=L/(L+C) for stable mean confidence")
     ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
     ap.add_argument(
         "--hyb_prior_strength",
@@ -401,11 +394,10 @@ def main():
             slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
             temporal_window=int(args.hyb_temporal_window),
             fast_tau=float(args.hyb_fast_tau),
-            sharpness=float(args.hyb_sharpness),
-            bias=float(args.hyb_bias),
+            motion_sharpness=float(args.hyb_motion_sharpness),
+            motion_threshold=float(args.hyb_motion_threshold),
             eps=float(args.hyb_eps),
-            route_pool_size=int(args.hyb_route_pool_size),
-            route_pool_mode=str(args.hyb_route_pool_mode),
+            stable_prior=float(args.hyb_blend_const),
             subsampling=int(args.chunk_size),
             normalize=bool(args.hyb_normalize),
             quantile=float(args.hyb_quantile),

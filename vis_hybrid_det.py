@@ -254,10 +254,9 @@ def _save_visuals(
     slow_window: int,
     temporal_window: int,
     fast_tau: float,
-    sharpness: float,
-    bias: float,
-    route_pool_size: int,
-    route_pool_mode: str,
+    motion_sharpness: float,
+    motion_threshold: float,
+    blend_const: float,
 ) -> None:
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
     display_hw = recon_bgr.shape[:2]
@@ -268,10 +267,15 @@ def _save_visuals(
         "k_smoothed": motion_debug["k_smoothed_last"].detach().float().cpu().numpy(),
         "k_smoothed_peak": k_smoothed_hwt.max(axis=-1),
         "route_weight_raw": motion_debug["route_weight_raw_last"].detach().float().cpu().numpy(),
-        "route_weight": motion_debug["route_weight_last"].detach().float().cpu().numpy(),
+        "future_motion": motion_debug["future_motion_last"].detach().float().cpu().numpy(),
         "route_weight_peak": route_weight_hwt.max(axis=-1),
+        "valid_weight_sum": motion_debug["stable_support"].detach().float().cpu().numpy() / max(
+            float(motion_debug["valid_weight"].shape[-1]), 1.0
+        ),
         "y_fast": motion_debug["y_scales_last"][..., 0].detach().float().cpu().numpy(),
         "y_slow": motion_debug["y_scales_last"][..., 1].detach().float().cpu().numpy(),
+        "mean_stable": motion_debug["mean_stable"].detach().float().cpu().numpy(),
+        "w_mean": motion_debug["w_mean"].detach().float().cpu().numpy(),
         "fused": motion_debug["fused_last"].detach().float().cpu().numpy(),
     }
     k_vmax_scale = _resolve_vmax(maps["k_smoothed"], fixed_vmax=score_vmax, percentile=score_percentile)
@@ -293,19 +297,21 @@ def _save_visuals(
         _stitch_panels([sum_bgr, recon_bgr], ["sum", "hyb"]),
     )
 
-    route_from_k = 1.0 / (1.0 + np.exp(-float(sharpness) * (maps["k_smoothed"] - float(bias))))
+    route_from_k = 1.0 / (
+        1.0 + np.exp(-float(motion_sharpness) * (maps["k_smoothed"] - float(motion_threshold)))
+    )
     route_abs_err = np.abs(route_from_k - maps["route_weight_raw"])
     stats_lines = [
         f"stem={stem}",
         f"fast_window={fast_window} slow_window={slow_window} temporal_window={temporal_window}",
-        f"fast_tau={fast_tau} sharpness={sharpness} bias={bias} "
-        f"route_pool_size={route_pool_size} route_pool_mode={route_pool_mode}",
+        f"fast_tau={fast_tau} motion_sharpness={motion_sharpness} "
+        f"motion_threshold={motion_threshold} blend_const={blend_const}",
         f"k_smoothed_vmax={k_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
-        "k_smoothed is causal-smoothed Bernoulli variance-normalized evidence, not raw KL.",
+        "k_smoothed is causal-smoothed Bernoulli KL evidence.",
         "route_weight visualization is fixed grayscale [0, 1] so brightness is monotonic.",
-        "route_weight_raw = sigmoid(sharpness * (k_smoothed - bias))",
-        "route_weight = spatial morphology(route_weight_raw) when route_pool_size > 1",
-        "route_weight_peak = max(route_weight) over all frames in the chunk",
+        "route_weight_raw = P_motion = sigmoid(motion_sharpness * (k_smoothed - motion_threshold))",
+        "future_motion = flip(cummax(flip(P_motion)))",
+        "w_mean = L / (L + blend_const), where L=sum(1-Future_Motion)",
         "k_smoothed_peak = max(k_smoothed) over all frames in the chunk",
         f"route_raw_from_k_abs_err_max={float(route_abs_err.max()):.8f} mean={float(route_abs_err.mean()):.8f}",
         "",
@@ -328,16 +334,10 @@ def main() -> None:
     ap.add_argument("--hyb_slow_window", type=int, default=128)
     ap.add_argument("--hyb_temporal_window", type=int, default=5)
     ap.add_argument("--hyb_fast_tau", type=float, default=4.0)
-    ap.add_argument("--hyb_sharpness", type=float, default=1.0)
-    ap.add_argument("--hyb_bias", type=float, default=3.0)
+    ap.add_argument("--hyb_motion_sharpness", type=float, default=60.0)
+    ap.add_argument("--hyb_motion_threshold", type=float, default=0.05)
     ap.add_argument("--hyb_eps", type=float, default=1e-5)
-    ap.add_argument("--hyb_route_pool_size", type=int, default=1)
-    ap.add_argument(
-        "--hyb_route_pool_mode",
-        type=str,
-        default="max",
-        choices=["none", "max", "min", "open", "close", "open_close", "close_open"],
-    )
+    ap.add_argument("--hyb_blend_const", type=float, default=16.0)
     ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
     ap.add_argument("--hyb_prior_strength", type=float, default=1.0, help="Deprecated; ignored by STEA")
     ap.add_argument("--hyb_gating_tau", type=float, default=0.1, help="Deprecated; ignored by STEA")
@@ -377,11 +377,10 @@ def main() -> None:
         slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
         temporal_window=int(args.hyb_temporal_window),
         fast_tau=float(args.hyb_fast_tau),
-        sharpness=float(args.hyb_sharpness),
-        bias=float(args.hyb_bias),
+        motion_sharpness=float(args.hyb_motion_sharpness),
+        motion_threshold=float(args.hyb_motion_threshold),
         eps=float(args.hyb_eps),
-        route_pool_size=int(args.hyb_route_pool_size),
-        route_pool_mode=str(args.hyb_route_pool_mode),
+        stable_prior=float(args.hyb_blend_const),
         subsampling=int(args.chunk_size),
         normalize=bool(args.hyb_normalize),
         quantile=float(args.hyb_quantile),
@@ -439,10 +438,9 @@ def main() -> None:
                 slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
                 temporal_window=int(args.hyb_temporal_window),
                 fast_tau=float(args.hyb_fast_tau),
-                sharpness=float(args.hyb_sharpness),
-                bias=float(args.hyb_bias),
-                route_pool_size=int(args.hyb_route_pool_size),
-                route_pool_mode=str(args.hyb_route_pool_mode),
+                motion_sharpness=float(args.hyb_motion_sharpness),
+                motion_threshold=float(args.hyb_motion_threshold),
+                blend_const=float(args.hyb_blend_const),
             )
             frame_idx += 1
 
