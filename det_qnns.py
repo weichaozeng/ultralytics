@@ -38,7 +38,12 @@ import torch
 from tqdm import tqdm
 
 from ultralytics import YOLO
-from ultralytics.data.spad_packed import bayer_plane_to_rgb_u8, infer_packed_nch, is_packed_spad, packed_frames_to_raw_bayer
+from ultralytics.data.spad_packed import (
+    infer_packed_nch,
+    is_packed_spad,
+    packed_frames_to_raw_video,
+    raw_video_mean_to_rgb_u8,
+)
 from ultralytics.engine.results import Results
 from ultralytics.trackers.track import TRACKER_MAP
 from ultralytics.utils import IterableSimpleNamespace, YAML, nms
@@ -141,9 +146,8 @@ def draw_pose(img_bgr: np.ndarray, pose_kpts: np.ndarray, thresh: float = 0.5, k
 def _packed_frames_to_raw_video(
     frames_packed: np.ndarray, *, expected_w: int = 512, ch_order: str = "RGB"
 ) -> np.ndarray:
-    """Convert packed `(T,H,Wpacked,3|4)` to raw `(T,2H,2W,1)`."""
-    raw = packed_frames_to_raw_bayer(frames_packed, expected_w=expected_w, ch_order=ch_order)
-    return raw[:, :, :, None]
+    """Convert packed `(T,H,Wpacked,3|4)` to integrator raw video."""
+    return packed_frames_to_raw_video(frames_packed, expected_w=expected_w, ch_order=ch_order)
 
 
 def _looks_like_hwt(arr: np.ndarray) -> bool:
@@ -285,24 +289,14 @@ def _resize_to_shape_bgr(img_bgr: np.ndarray, shape_hw: tuple[int, int]) -> np.n
 
 
 def _raw_sum_bgr(raw_video: np.ndarray, *, packed_nch: int) -> np.ndarray:
-    """Sum raw over time, then map Bayer to RGB using packed channel semantics."""
-    if raw_video.ndim != 4 or raw_video.shape[-1] != 1:
-        raise ValueError(f"Expected raw chunk shape (T,H,W,1), got {raw_video.shape}")
-    t = max(int(raw_video.shape[0]), 1)
-    raw_sum = raw_video[..., 0].astype(np.float32).sum(axis=0)
-    raw_u8 = np.clip((raw_sum / float(t)) * 255.0, 0, 255).astype(np.uint8)
-    rgb = bayer_plane_to_rgb_u8(raw_u8, packed_nch=int(packed_nch))
+    """Sum raw over time, then map to RGB using packed channel semantics."""
+    rgb = raw_video_mean_to_rgb_u8(raw_video, packed_nch=int(packed_nch))
     return np.ascontiguousarray(rgb[:, :, ::-1])
 
 
 def _raw_sum_readrgb_like_bgr(raw_video: np.ndarray, *, packed_nch: int) -> np.ndarray:
     """Mean over time, then visualize with the same packed-channel semantics as QNN input."""
-    if raw_video.ndim != 4 or raw_video.shape[-1] != 1:
-        raise ValueError(f"Expected raw chunk shape (T,H,W,1), got {raw_video.shape}")
-    t = max(int(raw_video.shape[0]), 1)
-    raw_sum = raw_video[..., 0].astype(np.float32).sum(axis=0)
-    raw_u8 = np.clip((raw_sum / float(t)) * 255.0, 0, 255).astype(np.uint8)
-    rgb = bayer_plane_to_rgb_u8(raw_u8, packed_nch=int(packed_nch))
+    rgb = raw_video_mean_to_rgb_u8(raw_video, packed_nch=int(packed_nch))
     return np.ascontiguousarray(rgb[:, :, ::-1])
 
 

@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ultralytics.data.spad_packed import infer_packed_nch, packed_frames_to_raw_bayer
+from ultralytics.data.spad_packed import infer_packed_nch, packed_frames_to_raw_video
 
 
 @dataclass(frozen=True)
@@ -161,8 +161,8 @@ class QNNSpadPoseDataset(Dataset):
 
         packed = np.asarray(arr[spad_start:spad_end])
         packed_nch = infer_packed_nch(arr)
-        raw = packed_frames_to_raw_bayer(packed, ch_order=self.packed_ch_order)
-        return raw[:, :, :, None].astype(np.uint8, copy=False), packed_nch
+        raw = packed_frames_to_raw_video(packed, ch_order=self.packed_ch_order)
+        return raw.astype(np.uint8, copy=False), packed_nch
 
     def _labels_for_window(self, window: QNNWindow):
         ann = self.annotations[window.name]

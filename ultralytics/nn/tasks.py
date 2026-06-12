@@ -649,7 +649,10 @@ class QNNPoseModel(PoseModel):
         from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
         from ultralytics.quanta_neural_networks.ssd import SSD
 
+        from ultralytics.data.spad_packed import make_integrator_triplet
+
         self.integrator = PerPixelBayesian(**self.qnn_integrator_kwargs)
+        self.integrators_3ch = make_integrator_triplet(self.integrator)
 
         for layer_idx in self.qnn_ssd_after_layers:
             channels = self._layer_output_channels(layer_idx)
@@ -721,30 +724,41 @@ class QNNPoseModel(PoseModel):
         return x
 
     def _qnn_video_to_frame_sequence(self, video):
-        """Convert B,T,rawH,rawW,1 SPAD raw clips into T',B,3,H,W reconstructed frame sequences."""
+        """Convert SPAD raw clips into T',B,3,H,W reconstructed frame sequences."""
         if self.integrator is None:
             raise RuntimeError("QNN integrator is not initialized.")
         if video.ndim != 5:
-            raise ValueError(f"Expected B,T,rawH,rawW,1 video tensor, got shape={tuple(video.shape)}")
+            raise ValueError(f"Expected B,T,H,W,C video tensor, got shape={tuple(video.shape)}")
 
         bsz, t, raw_h, raw_w, channels = video.shape
-        if channels != 1:
-            raise ValueError(f"QNNPoseModel expects single-channel raw SPAD input, got C={channels}")
-        if raw_h % 2 != 0 or raw_w % 2 != 0:
-            raise ValueError(f"Raw SPAD height/width must be even for Bayer unexpand, got {(raw_h, raw_w)}")
+        packed_nch = int(getattr(self, "qnn_packed_nch", 3) or 3)
+        if channels not in {1, 3}:
+            raise ValueError(f"QNNPoseModel expects C=1 (Bayer) or C=3 (native synthetic), got C={channels}")
+        if channels == 1 and (raw_h % 2 != 0 or raw_w % 2 != 0):
+            raise ValueError(f"Bayer raw SPAD height/width must be even, got {(raw_h, raw_w)}")
 
         frame_ll = []
         t_index_ll = None
         for b in range(bsz):
-            photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
-            recons = self.integrator.process_photon_cube(photon_cube, clear_states=True)
-            packed_nch = int(getattr(self, "qnn_packed_nch", 3) or 3)
-            frames = self._qnn_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
+            if channels == 3 and packed_nch == 3:
+                recons_by_ch = []
+                for ch in range(3):
+                    photon_cube = video[b, :, :, :, ch].permute(1, 2, 0).contiguous().bool()
+                    recons = self.integrators_3ch[ch].process_photon_cube(photon_cube, clear_states=True)
+                    recons_by_ch.append(recons)
+                frames = self._qnn_native3_recons_to_rgb_frames(recons_by_ch)
+                photon_t = int(recons_by_ch[0].shape[2])
+            else:
+                photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
+                recons = self.integrator.process_photon_cube(photon_cube, clear_states=True)
+                frames = self._qnn_raw_recons_to_rgb_frames(recons, packed_nch=4)
+                photon_t = int(photon_cube.shape[2])
+
             frame_ll.append(frames)
 
             if t_index_ll is None:
                 subsampling = int(getattr(self.integrator, "subsampling", 1) or 1)
-                t_index_ll = self._qnn_recon_t_indices(int(photon_cube.shape[2]), subsampling, int(frames.shape[0]))
+                t_index_ll = self._qnn_recon_t_indices(photon_t, subsampling, int(frames.shape[0]))
 
         frame_counts = {frames.shape[0] for frames in frame_ll}
         if len(frame_counts) != 1:
@@ -773,40 +787,18 @@ class QNNPoseModel(PoseModel):
         return idx[:num_frames]
 
     @staticmethod
-    def _qnn_raw_recons_to_rgb_frames(raw_hwt, *, packed_nch: int = 3):
-        """Convert PPB raw Bayer Hraw,Wraw,T to T,3,H/2,W/2.
+    def _qnn_native3_recons_to_rgb_frames(recons_by_channel):
+        """Stack native per-channel ``(H, W, T)`` reconstructions into ``(T, 3, H, W)``."""
+        from ultralytics.data.spad_packed import stack_native_recons_to_rgb
 
-        Synthetic packed (3ch): RGGB plane subsample.
-        Real packed / true Bayer (4ch): demosaic at full res then resize to half.
-        """
-        if not torch.is_tensor(raw_hwt) or raw_hwt.ndim != 3:
-            raise ValueError(f"Expected raw_hwt tensor with shape (Hraw,Wraw,T), got {type(raw_hwt)}")
+        return stack_native_recons_to_rgb(recons_by_channel)
 
-        h_raw, w_raw, t = map(int, raw_hwt.shape)
-        if t <= 0:
-            return torch.zeros((0, 3, h_raw // 2, w_raw // 2), dtype=torch.float32, device=raw_hwt.device)
-        if h_raw % 2 != 0 or w_raw % 2 != 0:
-            raise ValueError(f"Raw reconstruction must have even H/W, got {(h_raw, w_raw)}")
+    @staticmethod
+    def _qnn_raw_recons_to_rgb_frames(raw_hwt, *, packed_nch: int = 4):
+        """Convert Bayer ``(2H, 2W, T)`` PPB output to ``(T, 3, H, W)`` via demosaic."""
+        from ultralytics.data.spad_packed import raw_hwt_to_rgb_float
 
-        if int(packed_nch) == 3:
-            r = raw_hwt[0::2, 0::2, :]
-            g1 = raw_hwt[0::2, 1::2, :]
-            g2 = raw_hwt[1::2, 0::2, :]
-            b = raw_hwt[1::2, 1::2, :]
-            g = 0.5 * (g1 + g2)
-            return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
-
-        target_hw = (w_raw // 2, h_raw // 2)  # cv2.resize expects (W,H)
-        raw_hwt_np = raw_hwt.detach().float().cpu().numpy()
-        frame_ll = []
-        for ti in range(t):
-            raw_u8 = np.clip(raw_hwt_np[:, :, ti] * 255.0, 0, 255).astype(np.uint8)
-            rgb_1024 = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
-            rgb_512 = cv2.resize(rgb_1024, target_hw, interpolation=cv2.INTER_AREA)
-            frame_ll.append(torch.from_numpy(rgb_512).permute(2, 0, 1).float() / 255.0)
-
-        out = torch.stack(frame_ll, dim=0).contiguous()  # T,3,H/2,W/2
-        return out.to(raw_hwt.device)
+        return raw_hwt_to_rgb_float(raw_hwt, packed_nch=int(packed_nch))
 
     @staticmethod
     def _qnn_flatten_temporal(x):

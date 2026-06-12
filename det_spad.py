@@ -28,7 +28,16 @@ from tqdm import tqdm
 
 from ultralytics import YOLO
 from ultralytics.utils.ops import Profile
-from ultralytics.data.spad_packed import infer_packed_nch, is_packed_spad, packed_frames_to_raw_bayer
+from ultralytics.data.spad_packed import (
+    infer_packed_nch,
+    integrate_raw_chunk_to_rgb,
+    is_packed_spad,
+    make_integrator_triplet,
+    packed_frames_to_raw_video,
+    raw_hwt_to_rgb_float,
+    raw_plane_to_photon_cube,
+    sum_raw_chunk_to_rgb,
+)
 from ultralytics.quanta_hybrid_networks.integrator import SpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_motion_networks.integrator import VelIntegrator
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
@@ -138,8 +147,7 @@ def _num_bins(source: SpadSource) -> int:
 def _slice_raw(source: SpadSource, t0: int, t1: int, *, packed_ch_order: str) -> np.ndarray:
     if source.layout == "packed":
         packed = np.asarray(source.array[t0:t1])
-        raw = packed_frames_to_raw_bayer(packed, ch_order=packed_ch_order)
-        return raw[:, :, :, None]
+        return packed_frames_to_raw_video(packed, ch_order=packed_ch_order)
     if source.layout == "thwc1":
         return np.ascontiguousarray(source.array[t0:t1].astype(np.uint8, copy=False))
     if source.layout == "thw":
@@ -147,25 +155,6 @@ def _slice_raw(source: SpadSource, t0: int, t1: int, *, packed_ch_order: str) ->
     if source.layout == "hwt":
         return np.ascontiguousarray(np.transpose(source.array[:, :, t0:t1], (2, 0, 1))[:, :, :, None].astype(np.uint8, copy=False))
     raise ValueError(f"Unsupported layout: {source.layout}")
-
-
-def _raw_hwt_to_rgb_float(raw_hwt: torch.Tensor, *, packed_nch: int) -> torch.Tensor:
-    """Convert raw Bayer H,W,T float [0,1] to T,3,H/2,W/2."""
-    h_raw, w_raw, t = map(int, raw_hwt.shape)
-    if int(packed_nch) == 3:
-        r = raw_hwt[0::2, 0::2, :]
-        g = 0.5 * (raw_hwt[0::2, 1::2, :] + raw_hwt[1::2, 0::2, :])
-        b = raw_hwt[1::2, 1::2, :]
-        return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
-
-    raw_np = raw_hwt.detach().float().cpu().numpy()
-    frames = []
-    for ti in range(t):
-        raw_u8 = np.clip(raw_np[:, :, ti] * 255.0, 0, 255).astype(np.uint8)
-        rgb = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
-        rgb = cv2.resize(rgb, (w_raw // 2, h_raw // 2), interpolation=cv2.INTER_AREA)
-        frames.append(torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0)
-    return torch.stack(frames, dim=0).to(raw_hwt.device)
 
 
 def _rgb_tensor_to_bgr_u8(frames_tchw: torch.Tensor, *, vis_mode: str, percentile: float, gamma: float) -> list[np.ndarray]:
@@ -190,15 +179,27 @@ def _rgb_tensor_to_bgr_u8(frames_tchw: torch.Tensor, *, vis_mode: str, percentil
 
 
 def _preprocess_sum(raw_chunk: np.ndarray, *, packed_nch: int, device: torch.device, **kwargs) -> torch.Tensor:
-    raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).float()
-    raw_mean = raw.mean(dim=2, keepdim=True).clamp(0, 1)
-    return _raw_hwt_to_rgb_float(raw_mean, packed_nch=packed_nch)
+    return sum_raw_chunk_to_rgb(raw_chunk, packed_nch=packed_nch, device=device)
 
 
-def _preprocess_ppb(raw_chunk: np.ndarray, *, packed_nch: int, device: torch.device, integrator: PerPixelBayesian, clear_states: bool, **kwargs) -> torch.Tensor:
-    raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
-    recons = integrator.process_photon_cube(raw, clear_states=clear_states)
-    return _raw_hwt_to_rgb_float(recons, packed_nch=packed_nch)
+def _preprocess_ppb(
+    raw_chunk: np.ndarray,
+    *,
+    packed_nch: int,
+    device: torch.device,
+    integrator: PerPixelBayesian,
+    integrators_3ch: torch.nn.ModuleList | None,
+    clear_states: bool,
+    **kwargs,
+) -> torch.Tensor:
+    return integrate_raw_chunk_to_rgb(
+        integrator,
+        raw_chunk,
+        packed_nch=packed_nch,
+        device=device,
+        clear_states=clear_states,
+        integrators_3ch=integrators_3ch,
+    )
 
 
 def _preprocess_hyb(
@@ -207,20 +208,50 @@ def _preprocess_hyb(
     packed_nch: int,
     device: torch.device,
     integrator: SpatioTemporalEvidenceAccumulation,
+    integrators_3ch: torch.nn.ModuleList | None,
     clear_states: bool,
     **kwargs,
 ) -> torch.Tensor:
-    raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
-    recons = integrator.process_photon_cube(raw, clear_states=clear_states)
-    return _raw_hwt_to_rgb_float(recons, packed_nch=packed_nch)
+    return integrate_raw_chunk_to_rgb(
+        integrator,
+        raw_chunk,
+        packed_nch=packed_nch,
+        device=device,
+        clear_states=clear_states,
+        integrators_3ch=integrators_3ch,
+    )
 
 
-def _preprocess_vel(raw_chunk: np.ndarray, *, packed_nch: int, device: torch.device, integrator: VelIntegrator, clear_states: bool, **kwargs) -> torch.Tensor:
-    raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
-    recons = integrator.process_photon_cube(raw, clear_states=clear_states, packed_nch=packed_nch)
+def _preprocess_vel(
+    raw_chunk: np.ndarray,
+    *,
+    packed_nch: int,
+    device: torch.device,
+    integrator: VelIntegrator,
+    clear_states: bool,
+    **kwargs,
+) -> torch.Tensor:
+    if int(packed_nch) == 3:
+        channels = []
+        for ch in range(3):
+            cube = raw_plane_to_photon_cube(raw_chunk[..., ch], device=device, as_bool=True)
+            recons = integrator.process_photon_cube(
+                cube,
+                clear_states=clear_states and ch == 0,
+                packed_nch=3,
+                compensate_space="raw",
+            )
+            if recons.ndim == 3:
+                channels.append(recons[..., 0].float())
+            else:
+                channels.append(recons.float())
+        return torch.stack(channels, dim=0).unsqueeze(0).clamp(0, 1)
+
+    cube = raw_plane_to_photon_cube(raw_chunk[..., 0], device=device, as_bool=True)
+    recons = integrator.process_photon_cube(cube, clear_states=clear_states, packed_nch=packed_nch)
     if integrator.outputs_rgb:
         return recons.unsqueeze(0)
-    return _raw_hwt_to_rgb_float(recons, packed_nch=packed_nch)
+    return raw_hwt_to_rgb_float(recons.float(), packed_nch=packed_nch)
 
 
 def _extract_track_centers(result) -> tuple[np.ndarray, np.ndarray]:
@@ -421,18 +452,30 @@ def _preprocess_chunk(
     device: torch.device,
     first_chunk: bool,
     ppb: PerPixelBayesian | None,
+    ppb_3ch: torch.nn.ModuleList | None,
     hyb: SpatioTemporalEvidenceAccumulation | None,
+    hyb_3ch: torch.nn.ModuleList | None,
     vel: VelIntegrator | None,
 ) -> torch.Tensor:
     if name == "sum":
         return _preprocess_sum(raw_chunk, packed_nch=packed_nch, device=device)
     if name == "ppb":
         return _preprocess_ppb(
-            raw_chunk, packed_nch=packed_nch, device=device, integrator=ppb, clear_states=first_chunk
+            raw_chunk,
+            packed_nch=packed_nch,
+            device=device,
+            integrator=ppb,
+            integrators_3ch=ppb_3ch,
+            clear_states=first_chunk,
         )
     if name == "hyb":
         return _preprocess_hyb(
-            raw_chunk, packed_nch=packed_nch, device=device, integrator=hyb, clear_states=first_chunk
+            raw_chunk,
+            packed_nch=packed_nch,
+            device=device,
+            integrator=hyb,
+            integrators_3ch=hyb_3ch,
+            clear_states=first_chunk,
         )
     return _preprocess_vel(
         raw_chunk, packed_nch=packed_nch, device=device, integrator=vel, clear_states=first_chunk
@@ -579,6 +622,8 @@ def main():
         if "hyb" in preprocessors
         else None
     )
+    ppb_3ch = make_integrator_triplet(ppb).to(device) if ppb is not None else None
+    hyb_3ch = make_integrator_triplet(hyb).to(device) if hyb is not None else None
 
     timing = PreprocessTiming(warmup_chunks=int(args.time_pre_warmup_chunks)) if args.time_pre else None
     device_str = str(device)
@@ -623,7 +668,9 @@ def main():
                                 device=device,
                                 first_chunk=first_chunk,
                                 ppb=ppb,
+                                ppb_3ch=ppb_3ch,
                                 hyb=hyb,
+                                hyb_3ch=hyb_3ch,
                                 vel=vel,
                             )
                         timing.record(
@@ -642,7 +689,9 @@ def main():
                             device=device,
                             first_chunk=first_chunk,
                             ppb=ppb,
+                            ppb_3ch=ppb_3ch,
                             hyb=hyb,
+                            hyb_3ch=hyb_3ch,
                             vel=vel,
                         )
 

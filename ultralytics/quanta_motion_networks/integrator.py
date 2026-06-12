@@ -152,13 +152,15 @@ class VelIntegrator(nn.Module):
 
     @staticmethod
     def _photon_cube_to_rgb_tchw(cube: Tensor, packed_nch: int) -> Tensor:
-        """Convert ``(H, W, T)`` raw/bayer cube to ``(T, 3, H/2, W/2)`` float RGB."""
+        """Convert ``(H, W, T)`` photon cube to ``(T, 3, H, W)`` float RGB.
+
+        Synthetic ``packed_nch=3`` uses native-resolution mono planes (no Bayer expand).
+        Real ``packed_nch=4`` demosaics a full-resolution Bayer mosaic to half resolution.
+        """
         h_raw, w_raw, t = map(int, cube.shape)
         if int(packed_nch) == 3:
-            r = cube[0::2, 0::2, :]
-            g = 0.5 * (cube[0::2, 1::2, :] + cube[1::2, 0::2, :])
-            b = cube[1::2, 1::2, :]
-            return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
+            mono_t = cube.float().permute(2, 0, 1).unsqueeze(1)
+            return mono_t.expand(-1, 3, -1, -1).contiguous()
 
         import cv2
 

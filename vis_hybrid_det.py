@@ -26,7 +26,16 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from ultralytics.data.spad_packed import infer_packed_nch, is_packed_spad, packed_frames_to_raw_bayer
+from ultralytics.data.spad_packed import (
+    infer_packed_nch,
+    is_packed_spad,
+    make_integrator_triplet,
+    packed_frames_to_raw_video,
+    raw_hwt_to_rgb_float,
+    raw_plane_to_photon_cube,
+    stack_native_recons_to_rgb,
+    sum_raw_chunk_to_rgb,
+)
 from ultralytics.quanta_hybrid_networks.integrator import SpatioTemporalEvidenceAccumulation
 
 COLORMAPS = {
@@ -88,8 +97,7 @@ def _num_bins(source: SpadSource) -> int:
 def _slice_raw(source: SpadSource, t0: int, t1: int, *, packed_ch_order: str) -> np.ndarray:
     if source.layout == "packed":
         packed = np.asarray(source.array[t0:t1])
-        raw = packed_frames_to_raw_bayer(packed, ch_order=packed_ch_order)
-        return raw[:, :, :, None]
+        return packed_frames_to_raw_video(packed, ch_order=packed_ch_order)
     if source.layout == "thwc1":
         return np.ascontiguousarray(source.array[t0:t1].astype(np.uint8, copy=False))
     if source.layout == "thw":
@@ -99,24 +107,6 @@ def _slice_raw(source: SpadSource, t0: int, t1: int, *, packed_ch_order: str) ->
             np.transpose(source.array[:, :, t0:t1], (2, 0, 1))[:, :, :, None].astype(np.uint8, copy=False)
         )
     raise ValueError(f"Unsupported layout: {source.layout}")
-
-
-def _raw_hwt_to_rgb_float(raw_hwt: torch.Tensor, *, packed_nch: int) -> torch.Tensor:
-    h_raw, w_raw, t = map(int, raw_hwt.shape)
-    if int(packed_nch) == 3:
-        r = raw_hwt[0::2, 0::2, :]
-        g = 0.5 * (raw_hwt[0::2, 1::2, :] + raw_hwt[1::2, 0::2, :])
-        b = raw_hwt[1::2, 1::2, :]
-        return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
-
-    raw_np = raw_hwt.detach().float().cpu().numpy()
-    frames = []
-    for ti in range(t):
-        raw_u8 = np.clip(raw_np[:, :, ti] * 255.0, 0, 255).astype(np.uint8)
-        rgb = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
-        rgb = cv2.resize(rgb, (w_raw // 2, h_raw // 2), interpolation=cv2.INTER_AREA)
-        frames.append(torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0)
-    return torch.stack(frames, dim=0).to(raw_hwt.device)
 
 
 def _rgb_tensor_to_bgr_u8(
@@ -385,6 +375,7 @@ def main() -> None:
         normalize=bool(args.hyb_normalize),
         quantile=float(args.hyb_quantile),
     ).to(device)
+    hyb_3ch = make_integrator_triplet(hyb).to(device)
 
     sample_name = in_path.name if in_path.is_dir() else in_path.stem
     stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else int(args.chunk_size)
@@ -402,27 +393,37 @@ def main() -> None:
             if raw_chunk.shape[0] == 0:
                 continue
 
-            raw = torch.from_numpy(raw_chunk[:, :, :, 0]).to(device).permute(1, 2, 0).bool()
-            chunk_t = int(raw.shape[-1])
-            recons, motion_debug = _process_chunk_with_full_debug(
-                hyb, raw, clear_states=cube_idx == 0
-            )
-            if int(recons.shape[-1]) == 0:
-                tqdm.write(f"Skip cube {cube_idx} (no temporal blocks): t{t0:06d}_{t1:06d}")
-                continue
-
             vis_kw = dict(
                 vis_mode=args.vis_mode,
                 percentile=float(args.vis_percentile),
                 gamma=float(args.vis_gamma),
             )
-            recon_bgr = _rgb_tensor_to_bgr_u8(
-                _raw_hwt_to_rgb_float(recons, packed_nch=source.packed_nch), **vis_kw
-            )[0]
-            sum_bgr = _rgb_tensor_to_bgr_u8(
-                _raw_hwt_to_rgb_float(raw.float().mean(dim=-1, keepdim=True), packed_nch=source.packed_nch),
-                **vis_kw,
-            )[0]
+            if int(source.packed_nch) == 3:
+                debug_cube = raw_plane_to_photon_cube(raw_chunk[..., 1], device=device, as_bool=True)
+                recons, motion_debug = _process_chunk_with_full_debug(
+                    hyb, debug_cube, clear_states=cube_idx == 0
+                )
+                channel_recons = []
+                for ch in range(3):
+                    cube = raw_plane_to_photon_cube(raw_chunk[..., ch], device=device, as_bool=True)
+                    ch_recons = hyb_3ch[ch].process_photon_cube(cube, clear_states=cube_idx == 0)
+                    channel_recons.append(ch_recons)
+                recon_rgb = stack_native_recons_to_rgb(channel_recons)
+                sum_rgb = sum_raw_chunk_to_rgb(raw_chunk, packed_nch=3, device=device)
+            else:
+                raw = raw_plane_to_photon_cube(raw_chunk[..., 0], device=device, as_bool=True)
+                recons, motion_debug = _process_chunk_with_full_debug(
+                    hyb, raw, clear_states=cube_idx == 0
+                )
+                recon_rgb = raw_hwt_to_rgb_float(recons.float(), packed_nch=4)
+                sum_rgb = sum_raw_chunk_to_rgb(raw_chunk, packed_nch=4, device=device)
+
+            if int(recons.shape[-1]) == 0:
+                tqdm.write(f"Skip cube {cube_idx} (no temporal blocks): t{t0:06d}_{t1:06d}")
+                continue
+
+            recon_bgr = _rgb_tensor_to_bgr_u8(recon_rgb, **vis_kw)[0]
+            sum_bgr = _rgb_tensor_to_bgr_u8(sum_rgb, **vis_kw)[0]
 
             stem = f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{frame_idx:07d}"
             _save_visuals(
