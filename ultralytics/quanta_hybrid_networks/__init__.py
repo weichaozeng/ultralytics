@@ -1,3 +1,3 @@
-from .integrator import GatedMultiScaleEMA
+from .integrator import SpatioTemporalEvidenceAccumulation
 
-__all__ = ("GatedMultiScaleEMA",)
+__all__ = ("SpatioTemporalEvidenceAccumulation",)

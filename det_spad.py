@@ -15,7 +15,9 @@ The resulting frames are passed to an unmodified pretrained YOLO pose model.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+import json
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -25,6 +27,7 @@ import torch
 from tqdm import tqdm
 
 from ultralytics import YOLO
+from ultralytics.utils.ops import Profile
 from ultralytics.data.spad_packed import infer_packed_nch, is_packed_spad, packed_frames_to_raw_bayer
 from ultralytics.quanta_hybrid_networks.integrator import SpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_motion_networks.integrator import VelIntegrator
@@ -282,6 +285,160 @@ def _output_dir(save_root: Path, sample_name: str, video_idx: int) -> Path:
     return save_root / sample_name / f"video{video_idx:05d}"
 
 
+@dataclass
+class _MethodChunkTiming:
+    chunk_secs: list[float] = field(default_factory=list)
+    chunk_bins: list[int] = field(default_factory=list)
+    first_chunk_secs: list[float] = field(default_factory=list)
+    rest_chunk_secs: list[float] = field(default_factory=list)
+
+
+class PreprocessTiming:
+    """Accumulate per-chunk preprocess wall time (integrator + raw→RGB only)."""
+
+    def __init__(self, *, warmup_chunks: int = 0) -> None:
+        self.warmup_chunks = max(int(warmup_chunks), 0)
+        self.global_stats: dict[str, _MethodChunkTiming] = defaultdict(_MethodChunkTiming)
+        self.per_video_secs: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+
+    def record(
+        self,
+        method: str,
+        dt_sec: float,
+        *,
+        video_key: str,
+        chunk_bins: int,
+        cube_idx: int,
+        is_first_chunk: bool,
+    ) -> None:
+        if cube_idx < self.warmup_chunks:
+            return
+        stats = self.global_stats[method]
+        stats.chunk_secs.append(float(dt_sec))
+        stats.chunk_bins.append(int(chunk_bins))
+        if is_first_chunk:
+            stats.first_chunk_secs.append(float(dt_sec))
+        else:
+            stats.rest_chunk_secs.append(float(dt_sec))
+        self.per_video_secs[video_key][method].append(float(dt_sec))
+
+    @staticmethod
+    def _summarize_chunks(secs: list[float], bins: list[int] | None = None) -> dict[str, float | int] | None:
+        if not secs:
+            return None
+        ms = np.asarray(secs, dtype=np.float64) * 1000.0
+        total_bins = int(sum(bins)) if bins else 0
+        out: dict[str, float | int] = {
+            "chunks": len(secs),
+            "total_s": float(np.sum(secs)),
+            "mean_ms": float(np.mean(ms)),
+            "p50_ms": float(np.percentile(ms, 50)),
+            "p90_ms": float(np.percentile(ms, 90)),
+        }
+        if total_bins > 0:
+            out["ms_per_bin"] = float(np.sum(secs) * 1000.0 / total_bins)
+        return out
+
+    def global_summary(self) -> dict[str, dict]:
+        summary: dict[str, dict] = {}
+        for method, stats in sorted(self.global_stats.items()):
+            entry: dict = {}
+            overall = self._summarize_chunks(stats.chunk_secs, stats.chunk_bins)
+            if overall is not None:
+                entry["overall"] = overall
+            first = self._summarize_chunks(stats.first_chunk_secs)
+            if first is not None:
+                entry["first_chunk"] = first
+            rest = self._summarize_chunks(stats.rest_chunk_secs)
+            if rest is not None:
+                entry["rest_chunks"] = rest
+            if entry:
+                summary[method] = entry
+        return summary
+
+    def per_video_summary(self) -> dict[str, dict[str, dict]]:
+        out: dict[str, dict[str, dict]] = {}
+        for video_key in sorted(self.per_video_secs):
+            methods: dict[str, dict] = {}
+            for method, secs in sorted(self.per_video_secs[video_key].items()):
+                row = self._summarize_chunks(secs)
+                if row is not None:
+                    methods[method] = row
+            if methods:
+                out[video_key] = methods
+        return out
+
+    def to_dict(self, *, chunk_size: int, device: str) -> dict:
+        return {
+            "chunk_size_nominal": int(chunk_size),
+            "device": device,
+            "warmup_chunks_skipped": self.warmup_chunks,
+            "note": "Times cover preprocess only (_preprocess_*: integrator + raw→RGB), not vis/det/imwrite.",
+            "global": self.global_summary(),
+            "per_video": self.per_video_summary(),
+        }
+
+    def print_summary(self) -> None:
+        global_summary = self.global_summary()
+        if not global_summary:
+            print("Preprocess timing: no chunks recorded (increase data or lower --time_pre_warmup_chunks).")
+            return
+
+        print("\n=== Preprocess timing (per chunk, global) ===")
+        header = f"{'method':<6} {'chunks':>7} {'total_s':>9} {'mean_ms':>9} {'p50_ms':>9} {'p90_ms':>9} {'ms/bin':>9}"
+        print(header)
+        print("-" * len(header))
+        for method, entry in global_summary.items():
+            row = entry["overall"]
+            ms_per_bin = row.get("ms_per_bin", float("nan"))
+            print(
+                f"{method:<6} {row['chunks']:>7d} {row['total_s']:>9.3f} "
+                f"{row['mean_ms']:>9.2f} {row['p50_ms']:>9.2f} {row['p90_ms']:>9.2f} {ms_per_bin:>9.4f}"
+            )
+            if "first_chunk" in entry and "rest_chunks" in entry:
+                f_ms = entry["first_chunk"]["mean_ms"]
+                r_ms = entry["rest_chunks"]["mean_ms"]
+                print(f"       first_chunk mean_ms={f_ms:.2f}  rest_chunks mean_ms={r_ms:.2f}")
+
+        per_video = self.per_video_summary()
+        if per_video:
+            print("\n=== Preprocess timing (per video, mean_ms/chunk) ===")
+            for video_key, methods in per_video.items():
+                parts = [f"{m}={methods[m]['mean_ms']:.2f}ms" for m in sorted(methods)]
+                print(f"  {video_key}: " + ", ".join(parts))
+
+    def write_json(self, path: Path, *, chunk_size: int, device: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(chunk_size=chunk_size, device=device), indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote preprocess timing JSON: {path}")
+
+
+def _preprocess_chunk(
+    name: str,
+    raw_chunk: np.ndarray,
+    *,
+    packed_nch: int,
+    device: torch.device,
+    first_chunk: bool,
+    ppb: PerPixelBayesian | None,
+    hyb: SpatioTemporalEvidenceAccumulation | None,
+    vel: VelIntegrator | None,
+) -> torch.Tensor:
+    if name == "sum":
+        return _preprocess_sum(raw_chunk, packed_nch=packed_nch, device=device)
+    if name == "ppb":
+        return _preprocess_ppb(
+            raw_chunk, packed_nch=packed_nch, device=device, integrator=ppb, clear_states=first_chunk
+        )
+    if name == "hyb":
+        return _preprocess_hyb(
+            raw_chunk, packed_nch=packed_nch, device=device, integrator=hyb, clear_states=first_chunk
+        )
+    return _preprocess_vel(
+        raw_chunk, packed_nch=packed_nch, device=device, integrator=vel, clear_states=first_chunk
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description="SPAD preprocess comparison before standard YOLO pose detection")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory, root directory, or .npy path")
@@ -340,6 +497,23 @@ def main():
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
     ap.add_argument("--vis_percentile", type=float, default=99.5)
     ap.add_argument("--vis_gamma", type=float, default=2.2)
+    ap.add_argument(
+        "--time_pre",
+        action="store_true",
+        help="Record preprocess wall time per chunk for each --pre method (integrator + raw→RGB only)",
+    )
+    ap.add_argument(
+        "--time_pre_warmup_chunks",
+        type=int,
+        default=0,
+        help="Skip timing for the first N chunks per video (e.g. 1 to exclude clear_states warmup)",
+    )
+    ap.add_argument(
+        "--time_pre_out",
+        type=str,
+        default="",
+        help="JSON output path for timing stats (default: {save_dir}/preprocess_timing.json)",
+    )
     args = ap.parse_args()
 
     in_path = Path(args.in_path)
@@ -406,6 +580,9 @@ def main():
         else None
     )
 
+    timing = PreprocessTiming(warmup_chunks=int(args.time_pre_warmup_chunks)) if args.time_pre else None
+    device_str = str(device)
+
     for sample_path in sample_paths:
         sample_name = sample_path.name if sample_path.is_dir() else sample_path.stem
         for model in models.values():
@@ -427,6 +604,7 @@ def main():
             frame_idx_by_pre = {name: 0 for name in preprocessors}
             out_dir = _output_dir(save_root, sample_name, video_idx)
             out_dir.mkdir(parents=True, exist_ok=True)
+            video_key = f"{sample_name}/video{video_idx:05d}"
 
             for t0 in range(0, n_bins, stride):
                 t1 = min(t0 + int(args.chunk_size), n_bins)
@@ -434,21 +612,39 @@ def main():
                 if raw_chunk.shape[0] == 0:
                     continue
 
+                chunk_bins = int(t1 - t0)
                 for name in preprocessors:
-                    if name == "sum":
-                        frames = _preprocess_sum(raw_chunk, packed_nch=source.packed_nch, device=device)
-                    elif name == "ppb":
-                        frames = _preprocess_ppb(raw_chunk, packed_nch=source.packed_nch, device=device, integrator=ppb, clear_states=first_chunk)
-                    elif name == "hyb":
-                        frames = _preprocess_hyb(
+                    if timing is not None:
+                        with Profile(device=device) as pre_timer:
+                            frames = _preprocess_chunk(
+                                name,
+                                raw_chunk,
+                                packed_nch=source.packed_nch,
+                                device=device,
+                                first_chunk=first_chunk,
+                                ppb=ppb,
+                                hyb=hyb,
+                                vel=vel,
+                            )
+                        timing.record(
+                            name,
+                            pre_timer.t,
+                            video_key=video_key,
+                            chunk_bins=chunk_bins,
+                            cube_idx=cube_idx,
+                            is_first_chunk=first_chunk,
+                        )
+                    else:
+                        frames = _preprocess_chunk(
+                            name,
                             raw_chunk,
                             packed_nch=source.packed_nch,
                             device=device,
-                            integrator=hyb,
-                            clear_states=first_chunk,
+                            first_chunk=first_chunk,
+                            ppb=ppb,
+                            hyb=hyb,
+                            vel=vel,
                         )
-                    else:
-                        frames = _preprocess_vel(raw_chunk, packed_nch=source.packed_nch, device=device, integrator=vel, clear_states=first_chunk)
 
                     frames_bgr = _rgb_tensor_to_bgr_u8(
                         frames,
@@ -486,6 +682,11 @@ def main():
 
                 first_chunk = False
                 cube_idx += 1
+
+    if timing is not None:
+        timing.print_summary()
+        time_out = Path(args.time_pre_out) if args.time_pre_out else save_root / "preprocess_timing.json"
+        timing.write_json(time_out, chunk_size=int(args.chunk_size), device=device_str)
 
 
 if __name__ == "__main__":
