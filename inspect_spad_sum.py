@@ -78,9 +78,9 @@ def _rggb_raw_video_mean_to_rgb_u8(raw_bayer: np.ndarray) -> np.ndarray:
 
 def _print_stats(name: str, x: np.ndarray) -> None:
     """Print useful brightness statistics."""
-    flat = x.reshape(-1, x.shape[-1]) if x.ndim == 3 else x.reshape(-1)
     print(f"{name}: shape={x.shape} dtype={x.dtype}")
-    if x.ndim == 3:
+    if x.ndim == 3 and x.shape[-1] == 3:
+        flat = x.reshape(-1, x.shape[-1])
         for idx, ch in enumerate("RGB"):
             values = flat[:, idx]
             pct = np.percentile(values, [50, 90, 95, 99, 99.5, 99.9, 100])
@@ -90,6 +90,7 @@ def _print_stats(name: str, x: np.ndarray) -> None:
                 f"p99={pct[3]:.6f} p99.5={pct[4]:.6f} p99.9={pct[5]:.6f} max={pct[6]:.6f}"
             )
     else:
+        flat = x.reshape(-1)
         pct = np.percentile(flat, [50, 90, 95, 99, 99.5, 99.9, 100])
         print(
             f"  mean={flat.mean():.6f} min={flat.min():.6f} p50={pct[0]:.6f} "
