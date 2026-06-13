@@ -73,7 +73,8 @@ def _rggb_raw_video_mean_to_rgb_u8(raw_bayer: np.ndarray) -> np.ndarray:
         raise ValueError(f"Expected Bayer raw video (T,H,W,1), got shape={raw_bayer.shape}")
     raw_mean = raw_bayer[..., 0].astype(np.float32).mean(axis=0)
     raw_u8 = np.clip(raw_mean * 255.0, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
+    bgr = cv2.cvtColor(raw_u8, cv2.COLOR_BayerRG2BGR)
+    return bgr[:, :, ::-1]
 
 
 def _print_stats(name: str, x: np.ndarray) -> None:
