@@ -152,26 +152,10 @@ class VelIntegrator(nn.Module):
 
     @staticmethod
     def _photon_cube_to_rgb_tchw(cube: Tensor, packed_nch: int) -> Tensor:
-        """Convert ``(H, W, T)`` photon cube to ``(T, 3, H, W)`` float RGB.
+        """Convert ``(H, W, T)`` Bayer photon cube to ``(T, 3, H/2, W/2)`` float RGB."""
+        from ultralytics.data.spad_packed import raw_hwt_to_rgb_float
 
-        Synthetic ``packed_nch=3`` uses native-resolution mono planes (no Bayer expand).
-        Real ``packed_nch=4`` demosaics a full-resolution Bayer mosaic to half resolution.
-        """
-        h_raw, w_raw, t = map(int, cube.shape)
-        if int(packed_nch) == 3:
-            mono_t = cube.float().permute(2, 0, 1).unsqueeze(1)
-            return mono_t.expand(-1, 3, -1, -1).contiguous()
-
-        import cv2
-
-        frames = []
-        raw_np = cube.detach().float().cpu().numpy()
-        for ti in range(t):
-            raw_u8 = np.clip(raw_np[:, :, ti] * 255.0, 0, 255).astype(np.uint8)
-            rgb = cv2.cvtColor(raw_u8, cv2.COLOR_BAYER_RG2RGB)
-            rgb = cv2.resize(rgb, (w_raw // 2, h_raw // 2), interpolation=cv2.INTER_AREA)
-            frames.append(torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0)
-        return torch.stack(frames, dim=0).to(device=cube.device)
+        return raw_hwt_to_rgb_float(cube.float(), packed_nch=int(packed_nch))
 
     def _aggregate_displacement(self, disps: np.ndarray) -> tuple[int, int]:
         if disps.size == 0:

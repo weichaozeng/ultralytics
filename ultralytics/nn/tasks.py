@@ -649,10 +649,7 @@ class QNNPoseModel(PoseModel):
         from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
         from ultralytics.quanta_neural_networks.ssd import SSD
 
-        from ultralytics.data.spad_packed import make_integrator_triplet
-
         self.integrator = PerPixelBayesian(**self.qnn_integrator_kwargs)
-        self.integrators_3ch = make_integrator_triplet(self.integrator)
 
         for layer_idx in self.qnn_ssd_after_layers:
             channels = self._layer_output_channels(layer_idx)
@@ -724,41 +721,30 @@ class QNNPoseModel(PoseModel):
         return x
 
     def _qnn_video_to_frame_sequence(self, video):
-        """Convert SPAD raw clips into T',B,3,H,W reconstructed frame sequences."""
+        """Convert B,T,rawH,rawW,1 SPAD Bayer clips into T',B,3,H,W reconstructed frame sequences."""
         if self.integrator is None:
             raise RuntimeError("QNN integrator is not initialized.")
         if video.ndim != 5:
-            raise ValueError(f"Expected B,T,H,W,C video tensor, got shape={tuple(video.shape)}")
+            raise ValueError(f"Expected B,T,rawH,rawW,1 video tensor, got shape={tuple(video.shape)}")
 
         bsz, t, raw_h, raw_w, channels = video.shape
-        packed_nch = int(getattr(self, "qnn_packed_nch", 3) or 3)
-        if channels not in {1, 3}:
-            raise ValueError(f"QNNPoseModel expects C=1 (Bayer) or C=3 (native synthetic), got C={channels}")
-        if channels == 1 and (raw_h % 2 != 0 or raw_w % 2 != 0):
-            raise ValueError(f"Bayer raw SPAD height/width must be even, got {(raw_h, raw_w)}")
+        if channels != 1:
+            raise ValueError(f"QNNPoseModel expects single-channel Bayer raw SPAD input, got C={channels}")
+        if raw_h % 2 != 0 or raw_w % 2 != 0:
+            raise ValueError(f"Raw SPAD height/width must be even for Bayer unexpand, got {(raw_h, raw_w)}")
 
+        packed_nch = int(getattr(self, "qnn_packed_nch", 3) or 3)
         frame_ll = []
         t_index_ll = None
         for b in range(bsz):
-            if channels == 3 and packed_nch == 3:
-                recons_by_ch = []
-                for ch in range(3):
-                    photon_cube = video[b, :, :, :, ch].permute(1, 2, 0).contiguous().bool()
-                    recons = self.integrators_3ch[ch].process_photon_cube(photon_cube, clear_states=True)
-                    recons_by_ch.append(recons)
-                frames = self._qnn_native3_recons_to_rgb_frames(recons_by_ch)
-                photon_t = int(recons_by_ch[0].shape[2])
-            else:
-                photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
-                recons = self.integrator.process_photon_cube(photon_cube, clear_states=True)
-                frames = self._qnn_raw_recons_to_rgb_frames(recons, packed_nch=4)
-                photon_t = int(photon_cube.shape[2])
-
+            photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
+            recons = self.integrator.process_photon_cube(photon_cube, clear_states=True)
+            frames = self._qnn_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
             frame_ll.append(frames)
 
             if t_index_ll is None:
                 subsampling = int(getattr(self.integrator, "subsampling", 1) or 1)
-                t_index_ll = self._qnn_recon_t_indices(photon_t, subsampling, int(frames.shape[0]))
+                t_index_ll = self._qnn_recon_t_indices(int(photon_cube.shape[2]), subsampling, int(frames.shape[0]))
 
         frame_counts = {frames.shape[0] for frames in frame_ll}
         if len(frame_counts) != 1:
@@ -787,15 +773,8 @@ class QNNPoseModel(PoseModel):
         return idx[:num_frames]
 
     @staticmethod
-    def _qnn_native3_recons_to_rgb_frames(recons_by_channel):
-        """Stack native per-channel ``(H, W, T)`` reconstructions into ``(T, 3, H, W)``."""
-        from ultralytics.data.spad_packed import stack_native_recons_to_rgb
-
-        return stack_native_recons_to_rgb(recons_by_channel)
-
-    @staticmethod
-    def _qnn_raw_recons_to_rgb_frames(raw_hwt, *, packed_nch: int = 4):
-        """Convert Bayer ``(2H, 2W, T)`` PPB output to ``(T, 3, H, W)`` via demosaic."""
+    def _qnn_raw_recons_to_rgb_frames(raw_hwt, *, packed_nch: int = 3):
+        """Convert Bayer PPB output to ``(T, 3, H/2, W/2)`` RGB frames."""
         from ultralytics.data.spad_packed import raw_hwt_to_rgb_float
 
         return raw_hwt_to_rgb_float(raw_hwt, packed_nch=int(packed_nch))

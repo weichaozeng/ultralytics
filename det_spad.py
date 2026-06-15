@@ -32,8 +32,8 @@ from ultralytics.data.spad_packed import (
     infer_packed_nch,
     integrate_raw_chunk_to_rgb,
     is_packed_spad,
-    make_integrator_triplet,
     packed_frames_to_raw_video,
+    raw_chunk_plane,
     raw_hwt_to_rgb_float,
     raw_plane_to_photon_cube,
     sum_raw_chunk_to_rgb,
@@ -188,7 +188,6 @@ def _preprocess_ppb(
     packed_nch: int,
     device: torch.device,
     integrator: PerPixelBayesian,
-    integrators_3ch: torch.nn.ModuleList | None,
     clear_states: bool,
     **kwargs,
 ) -> torch.Tensor:
@@ -198,7 +197,6 @@ def _preprocess_ppb(
         packed_nch=packed_nch,
         device=device,
         clear_states=clear_states,
-        integrators_3ch=integrators_3ch,
     )
 
 
@@ -208,7 +206,6 @@ def _preprocess_hyb(
     packed_nch: int,
     device: torch.device,
     integrator: SpatioTemporalEvidenceAccumulation,
-    integrators_3ch: torch.nn.ModuleList | None,
     clear_states: bool,
     **kwargs,
 ) -> torch.Tensor:
@@ -218,7 +215,6 @@ def _preprocess_hyb(
         packed_nch=packed_nch,
         device=device,
         clear_states=clear_states,
-        integrators_3ch=integrators_3ch,
     )
 
 
@@ -231,27 +227,14 @@ def _preprocess_vel(
     clear_states: bool,
     **kwargs,
 ) -> torch.Tensor:
-    if int(packed_nch) == 3:
-        channels = []
-        for ch in range(3):
-            cube = raw_plane_to_photon_cube(raw_chunk[..., ch], device=device, as_bool=True)
-            recons = integrator.process_photon_cube(
-                cube,
-                clear_states=clear_states and ch == 0,
-                packed_nch=3,
-                compensate_space="raw",
-            )
-            if recons.ndim == 3:
-                channels.append(recons[..., 0].float())
-            else:
-                channels.append(recons.float())
-        return torch.stack(channels, dim=0).unsqueeze(0).clamp(0, 1)
-
-    cube = raw_plane_to_photon_cube(raw_chunk[..., 0], device=device, as_bool=True)
+    cube = raw_plane_to_photon_cube(raw_chunk_plane(raw_chunk, packed_nch=packed_nch), device=device, as_bool=True)
     recons = integrator.process_photon_cube(cube, clear_states=clear_states, packed_nch=packed_nch)
     if integrator.outputs_rgb:
         return recons.unsqueeze(0)
-    return raw_hwt_to_rgb_float(recons.float(), packed_nch=packed_nch)
+    rgb_tchw = raw_hwt_to_rgb_float(recons.float(), packed_nch=packed_nch)
+    if int(rgb_tchw.shape[0]) <= 0:
+        return rgb_tchw
+    return rgb_tchw[-1:].contiguous()
 
 
 def _extract_track_centers(result) -> tuple[np.ndarray, np.ndarray]:
@@ -452,9 +435,7 @@ def _preprocess_chunk(
     device: torch.device,
     first_chunk: bool,
     ppb: PerPixelBayesian | None,
-    ppb_3ch: torch.nn.ModuleList | None,
     hyb: SpatioTemporalEvidenceAccumulation | None,
-    hyb_3ch: torch.nn.ModuleList | None,
     vel: VelIntegrator | None,
 ) -> torch.Tensor:
     if name == "sum":
@@ -465,7 +446,6 @@ def _preprocess_chunk(
             packed_nch=packed_nch,
             device=device,
             integrator=ppb,
-            integrators_3ch=ppb_3ch,
             clear_states=first_chunk,
         )
     if name == "hyb":
@@ -474,7 +454,6 @@ def _preprocess_chunk(
             packed_nch=packed_nch,
             device=device,
             integrator=hyb,
-            integrators_3ch=hyb_3ch,
             clear_states=first_chunk,
         )
     return _preprocess_vel(
@@ -622,9 +601,6 @@ def main():
         if "hyb" in preprocessors
         else None
     )
-    ppb_3ch = make_integrator_triplet(ppb).to(device) if ppb is not None else None
-    hyb_3ch = make_integrator_triplet(hyb).to(device) if hyb is not None else None
-
     timing = PreprocessTiming(warmup_chunks=int(args.time_pre_warmup_chunks)) if args.time_pre else None
     device_str = str(device)
 
@@ -668,9 +644,7 @@ def main():
                                 device=device,
                                 first_chunk=first_chunk,
                                 ppb=ppb,
-                                ppb_3ch=ppb_3ch,
                                 hyb=hyb,
-                                hyb_3ch=hyb_3ch,
                                 vel=vel,
                             )
                         timing.record(
@@ -689,9 +663,7 @@ def main():
                             device=device,
                             first_chunk=first_chunk,
                             ppb=ppb,
-                            ppb_3ch=ppb_3ch,
                             hyb=hyb,
-                            hyb_3ch=hyb_3ch,
                             vel=vel,
                         )
 

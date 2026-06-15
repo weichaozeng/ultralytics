@@ -29,11 +29,9 @@ from tqdm import tqdm
 from ultralytics.data.spad_packed import (
     infer_packed_nch,
     is_packed_spad,
-    make_integrator_triplet,
     packed_frames_to_raw_video,
     raw_hwt_to_rgb_float,
     raw_plane_to_photon_cube,
-    stack_native_recons_to_rgb,
     sum_raw_chunk_to_rgb,
 )
 from ultralytics.quanta_hybrid_networks.integrator import SpatioTemporalEvidenceAccumulation
@@ -375,7 +373,6 @@ def main() -> None:
         normalize=bool(args.hyb_normalize),
         quantile=float(args.hyb_quantile),
     ).to(device)
-    hyb_3ch = make_integrator_triplet(hyb).to(device)
 
     sample_name = in_path.name if in_path.is_dir() else in_path.stem
     stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else int(args.chunk_size)
@@ -393,34 +390,23 @@ def main() -> None:
             if raw_chunk.shape[0] == 0:
                 continue
 
+            raw = raw_plane_to_photon_cube(
+                raw_chunk[..., 0], device=device, as_bool=True
+            )
+            recons, motion_debug = _process_chunk_with_full_debug(
+                hyb, raw, clear_states=cube_idx == 0
+            )
+            if int(recons.shape[-1]) == 0:
+                tqdm.write(f"Skip cube {cube_idx} (no temporal blocks): t{t0:06d}_{t1:06d}")
+                continue
+
             vis_kw = dict(
                 vis_mode=args.vis_mode,
                 percentile=float(args.vis_percentile),
                 gamma=float(args.vis_gamma),
             )
-            if int(source.packed_nch) == 3:
-                debug_cube = raw_plane_to_photon_cube(raw_chunk[..., 1], device=device, as_bool=True)
-                recons, motion_debug = _process_chunk_with_full_debug(
-                    hyb, debug_cube, clear_states=cube_idx == 0
-                )
-                channel_recons = []
-                for ch in range(3):
-                    cube = raw_plane_to_photon_cube(raw_chunk[..., ch], device=device, as_bool=True)
-                    ch_recons = hyb_3ch[ch].process_photon_cube(cube, clear_states=cube_idx == 0)
-                    channel_recons.append(ch_recons)
-                recon_rgb = stack_native_recons_to_rgb(channel_recons)
-                sum_rgb = sum_raw_chunk_to_rgb(raw_chunk, packed_nch=3, device=device)
-            else:
-                raw = raw_plane_to_photon_cube(raw_chunk[..., 0], device=device, as_bool=True)
-                recons, motion_debug = _process_chunk_with_full_debug(
-                    hyb, raw, clear_states=cube_idx == 0
-                )
-                recon_rgb = raw_hwt_to_rgb_float(recons.float(), packed_nch=4)
-                sum_rgb = sum_raw_chunk_to_rgb(raw_chunk, packed_nch=4, device=device)
-
-            if int(recons.shape[-1]) == 0:
-                tqdm.write(f"Skip cube {cube_idx} (no temporal blocks): t{t0:06d}_{t1:06d}")
-                continue
+            recon_rgb = raw_hwt_to_rgb_float(recons.float(), packed_nch=source.packed_nch)
+            sum_rgb = sum_raw_chunk_to_rgb(raw_chunk, packed_nch=source.packed_nch, device=device)
 
             recon_bgr = _rgb_tensor_to_bgr_u8(recon_rgb, **vis_kw)[0]
             sum_bgr = _rgb_tensor_to_bgr_u8(sum_rgb, **vis_kw)[0]

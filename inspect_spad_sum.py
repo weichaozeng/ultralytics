@@ -1,10 +1,8 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Inspect summed VisionSIM SPAD chunks.
 
-This utility is for generated VisionSIM packed `frames.npy` data, e.g.
-`renders-spc8kHz/.../frames.npy`, where frames are shaped `(T, H, Wpacked, 3)`.
-It can inspect either native R/G/B planes or an RGGB Bayer mosaic sampled from
-those planes, then visualizes `sum / chunk_size` over a temporal chunk.
+Synthetic packed `frames.npy` is expanded to RGGB Bayer, temporally averaged, then
+subsampled to RGB with ``G=(G1+G2)/2``.
 """
 
 from __future__ import annotations
@@ -19,7 +17,6 @@ from ultralytics.data.spad_packed import packed_frames_to_raw_video, raw_video_m
 
 
 def _load_frames(path: Path) -> np.ndarray:
-    """Load a VisionSIM `frames.npy` array with mmap."""
     npy = path / "frames.npy" if path.is_dir() else path
     if not npy.exists():
         raise FileNotFoundError(f"frames.npy not found: {npy}")
@@ -30,7 +27,6 @@ def _load_frames(path: Path) -> np.ndarray:
 
 
 def _to_bgr_u8(rgb: np.ndarray, *, mode: str, gamma: float, percentile: float) -> np.ndarray:
-    """Map linear RGB float image to BGR uint8 for OpenCV."""
     rgb = rgb.astype(np.float32, copy=False)
     if mode == "linear":
         vis = np.clip(rgb, 0.0, 1.0)
@@ -48,39 +44,7 @@ def _to_bgr_u8(rgb: np.ndarray, *, mode: str, gamma: float, percentile: float) -
     return np.ascontiguousarray((vis * 255.0).round().astype(np.uint8)[:, :, ::-1])
 
 
-def _synthetic_rgb_video_to_rggb_raw(raw_rgb: np.ndarray, *, ch_order: str) -> np.ndarray:
-    """Sample synthetic RGB photon planes into one RGGB Bayer raw video."""
-    if raw_rgb.ndim != 4 or raw_rgb.shape[-1] != 3:
-        raise ValueError(f"Expected raw RGB video (T,H,W,3), got shape={raw_rgb.shape}")
-    order = ch_order.upper()
-    if order == "BGR":
-        r_idx, g_idx, b_idx = 2, 1, 0
-    else:
-        r_idx, g_idx, b_idx = 0, 1, 2
-
-    raw = np.empty(raw_rgb.shape[:3] + (1,), dtype=np.uint8)
-    raw[..., 0] = 0
-    raw[:, 0::2, 0::2, 0] = raw_rgb[:, 0::2, 0::2, r_idx]
-    raw[:, 0::2, 1::2, 0] = raw_rgb[:, 0::2, 1::2, g_idx]
-    raw[:, 1::2, 0::2, 0] = raw_rgb[:, 1::2, 0::2, g_idx]
-    raw[:, 1::2, 1::2, 0] = raw_rgb[:, 1::2, 1::2, b_idx]
-    return raw
-
-
-def _rggb_raw_video_mean_to_rgb_u8(raw_bayer: np.ndarray) -> np.ndarray:
-    """Temporal mean of an RGGB raw video, demosaiced to native-size RGB uint8."""
-    if raw_bayer.ndim != 4 or raw_bayer.shape[-1] != 1:
-        raise ValueError(f"Expected Bayer raw video (T,H,W,1), got shape={raw_bayer.shape}")
-    raw_mean = raw_bayer[..., 0].astype(np.float32).mean(axis=0)
-    raw_u8 = np.clip(raw_mean * 255.0, 0, 255).astype(np.uint8)
-    # OpenCV's Bayer conversion names are easy to misread in RGB/BGR pipelines.
-    # For the RGGB mosaic sampled above, this code returns RGB colors consistent
-    # with the native packed RGB inspection path.
-    return cv2.cvtColor(raw_u8, cv2.COLOR_BayerBG2RGB)
-
-
 def _print_stats(name: str, x: np.ndarray) -> None:
-    """Print useful brightness statistics."""
     print(f"{name}: shape={x.shape} dtype={x.dtype}")
     if x.ndim == 3 and x.shape[-1] == 3:
         flat = x.reshape(-1, x.shape[-1])
@@ -104,28 +68,15 @@ def _print_stats(name: str, x: np.ndarray) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect sum/chunk_size visualization for synthetic VisionSIM SPAD data")
-    parser.add_argument("--in_path", type=Path, required=True, help="VisionSIM sample directory containing frames.npy, or frames.npy path")
-    parser.add_argument("--save_dir", type=Path, required=True, help="Directory to save inspection PNGs")
-    parser.add_argument("--t0", type=int, default=0, help="Chunk start index")
-    parser.add_argument("--chunk_size", type=int, default=320, help="Number of SPAD frames to average")
-    parser.add_argument("--expected_w", type=int, default=512, help="Unpacked synthetic RGB width")
+    parser.add_argument("--in_path", type=Path, required=True)
+    parser.add_argument("--save_dir", type=Path, required=True)
+    parser.add_argument("--t0", type=int, default=0)
+    parser.add_argument("--chunk_size", type=int, default=320)
+    parser.add_argument("--expected_w", type=int, default=512)
     parser.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
-    parser.add_argument(
-        "--packed3_mode",
-        type=str,
-        default="rgb",
-        choices=["rgb", "bayer"],
-        help="Interpret synthetic packed RGB as native RGB planes or sample an RGGB Bayer raw mosaic.",
-    )
-    parser.add_argument(
-        "--vis_mode",
-        type=str,
-        default="linear",
-        choices=["linear", "gamma", "percentile", "percentile_gamma"],
-        help="Display mapping for the saved image. The underlying summed image is always sum/chunk_size.",
-    )
-    parser.add_argument("--gamma", type=float, default=2.2, help="Gamma for gamma display modes")
-    parser.add_argument("--percentile", type=float, default=99.5, help="Percentile for percentile display modes")
+    parser.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
+    parser.add_argument("--gamma", type=float, default=2.2)
+    parser.add_argument("--percentile", type=float, default=99.5)
     args = parser.parse_args()
 
     frames = _load_frames(args.in_path)
@@ -137,21 +88,16 @@ def main() -> None:
     args.save_dir.mkdir(parents=True, exist_ok=True)
 
     packed = np.asarray(frames[t0:t1])
-    raw_rgb = packed_frames_to_raw_video(packed, expected_w=args.expected_w, ch_order=args.packed_ch_order)
-    if args.packed3_mode == "bayer":
-        raw = _synthetic_rgb_video_to_rggb_raw(raw_rgb, ch_order=args.packed_ch_order)
-        rgb_u8 = _rggb_raw_video_mean_to_rgb_u8(raw)
-    else:
-        raw = raw_rgb
-        rgb_u8 = raw_video_mean_to_rgb_u8(raw, packed_nch=3)
+    raw = packed_frames_to_raw_video(packed, expected_w=args.expected_w, ch_order=args.packed_ch_order)
+    rgb_u8 = raw_video_mean_to_rgb_u8(raw, packed_nch=3)
     rgb_mean = rgb_u8.astype(np.float32) / 255.0
 
     _print_stats("packed_chunk", packed)
-    _print_stats("raw_mean", raw.astype(np.float32).mean(axis=0))
+    _print_stats("bayer_mean", raw[..., 0].astype(np.float32).mean(axis=0))
     _print_stats("rgb_mean", rgb_mean)
 
     bgr = _to_bgr_u8(rgb_mean, mode=args.vis_mode, gamma=float(args.gamma), percentile=float(args.percentile))
-    out = args.save_dir / f"sum_t{t0:06d}_{t1:06d}_div{args.chunk_size}_{args.packed3_mode}_{args.vis_mode}.png"
+    out = args.save_dir / f"sum_t{t0:06d}_{t1:06d}_div{args.chunk_size}_{args.vis_mode}.png"
     cv2.imwrite(str(out), bgr)
     print(f"Saved {out}")
 

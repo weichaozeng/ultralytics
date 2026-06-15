@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from typing import Any
 
 import numpy as np
@@ -29,7 +28,7 @@ def is_packed_spad(arr: np.ndarray) -> bool:
 
 
 def is_synthetic_packed(packed_nch: int) -> bool:
-    """Synthetic VisionSIM packed data uses three native R/G/B planes (no Bayer expand)."""
+    """Synthetic VisionSIM packed data (3ch) uses RGGB Bayer expand + plane subsample."""
     return int(packed_nch) == 3
 
 
@@ -44,6 +43,24 @@ def unpack_packed_frames(frames_packed: np.ndarray, *, expected_w: int = 512) ->
     if unpacked.shape[2] > expected_w:
         unpacked = unpacked[:, :, :expected_w, :]
     return unpacked.astype(bool, copy=False)
+
+
+def _unpacked3_to_bayer(unpacked: np.ndarray, ch_order: str) -> np.ndarray:
+    """Map synthetic RGB planes to an RGGB Bayer mosaic ``(T, 2H, 2W)``.
+
+    G is written to both Bayer G sites (G1 and G2).
+    """
+    t, h, w, _ = unpacked.shape
+    raw = np.zeros((t, h * 2, w * 2), dtype=np.uint8)
+    if ch_order.upper() == "BGR":
+        r_ch, g_ch, b_ch = 2, 1, 0
+    else:
+        r_ch, g_ch, b_ch = 0, 1, 2
+    raw[:, 0::2, 0::2] = unpacked[:, :, :, r_ch]
+    raw[:, 0::2, 1::2] = unpacked[:, :, :, g_ch]
+    raw[:, 1::2, 0::2] = unpacked[:, :, :, g_ch]
+    raw[:, 1::2, 1::2] = unpacked[:, :, :, b_ch]
+    return raw
 
 
 def _unpacked4_to_bayer(unpacked: np.ndarray, ch_order: str) -> np.ndarray:
@@ -67,18 +84,11 @@ def packed_frames_to_raw_bayer(
     expected_w: int = 512,
     ch_order: str = "RGB",
 ) -> np.ndarray:
-    """Expand real-device packed frames to Bayer raw ``(T, 2H, 2W)`` uint8.
-
-  For synthetic ``C=3`` data use :func:`packed_frames_to_raw_video` instead; do not
-  interleave RGB into a fake Bayer grid.
-    """
+    """Expand packed frames to Bayer raw ``(T, 2H, 2W)`` uint8."""
     unpacked = unpack_packed_frames(frames_packed, expected_w=expected_w)
     n_ch = int(unpacked.shape[-1])
     if n_ch == 3:
-        raise ValueError(
-            "packed_frames_to_raw_bayer is for 4-channel real Bayer data only; "
-            "use packed_frames_to_raw_video for synthetic 3-channel frames.npy"
-        )
+        return _unpacked3_to_bayer(unpacked, ch_order)
     return _unpacked4_to_bayer(unpacked, ch_order)
 
 
@@ -88,23 +98,15 @@ def packed_frames_to_raw_video(
     expected_w: int = 512,
     ch_order: str = "RGB",
 ) -> np.ndarray:
-    """Convert packed frames to integrator-ready raw video.
-
-    - ``C=3`` (synthetic): ``(T, H, W, 3)`` native R/G/B photon planes (no 2× Bayer expand).
-    - ``C=4`` (real): ``(T, 2H, 2W, 1)`` full Bayer mosaic.
-    """
-    unpacked = unpack_packed_frames(frames_packed, expected_w=expected_w)
-    n_ch = int(unpacked.shape[-1])
-    if n_ch == 3:
-        return unpacked.astype(np.uint8, copy=False)
-    raw = _unpacked4_to_bayer(unpacked, ch_order)
+    """Convert packed frames to integrator-ready Bayer raw ``(T, 2H, 2W, 1)`` uint8."""
+    raw = packed_frames_to_raw_bayer(frames_packed, expected_w=expected_w, ch_order=ch_order)
     return raw[:, :, :, None]
 
 
-def raw_chunk_plane(raw_chunk: np.ndarray, channel: int, *, packed_nch: int) -> np.ndarray:
-    """Return one photon plane as ``(T, H, W)``."""
-    if int(packed_nch) == 3:
-        return np.ascontiguousarray(raw_chunk[..., int(channel)])
+def raw_chunk_plane(raw_chunk: np.ndarray, *, packed_nch: int) -> np.ndarray:
+    """Return the Bayer photon plane as ``(T, H, W)``."""
+    if raw_chunk.ndim != 4 or raw_chunk.shape[-1] != 1:
+        raise ValueError(f"Expected Bayer raw chunk (T,H,W,1), got shape={raw_chunk.shape}")
     return np.ascontiguousarray(raw_chunk[..., 0])
 
 
@@ -122,15 +124,22 @@ def raw_plane_to_photon_cube(
     return cube.float()
 
 
-def make_integrator_triplet(integrator: Any) -> torch.nn.ModuleList:
-    """Three independent integrator instances for streaming per-channel 3ch synthetic data."""
-    return torch.nn.ModuleList([copy.deepcopy(integrator) for _ in range(3)])
+def _bayer_rggb_hwt_to_rgb_tchw(raw_hwt: Tensor) -> Tensor:
+    """Subsample RGGB Bayer ``(2H, 2W, T)`` to ``(T, 3, H, W)`` with ``G=(G1+G2)/2``."""
+    r = raw_hwt[0::2, 0::2, :]
+    g1 = raw_hwt[0::2, 1::2, :]
+    g2 = raw_hwt[1::2, 0::2, :]
+    b = raw_hwt[1::2, 1::2, :]
+    g = 0.5 * (g1 + g2)
+    return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
 
 
-def _last_recon_hw(recons_hwt: Tensor) -> Tensor:
-    if int(recons_hwt.shape[-1]) <= 0:
-        raise ValueError("integrator returned empty reconstruction")
-    return recons_hwt[..., -1]
+def _bayer_rggb_hw_to_rgb_hw3(bayer_hw: Tensor) -> Tensor:
+    """Subsample one RGGB Bayer frame ``(2H, 2W)`` to ``(3, H, W)``."""
+    r = bayer_hw[0::2, 0::2]
+    g = 0.5 * (bayer_hw[0::2, 1::2] + bayer_hw[1::2, 0::2])
+    b = bayer_hw[1::2, 1::2]
+    return torch.stack((r, g, b), dim=0)
 
 
 def integrate_raw_chunk_to_rgb(
@@ -140,52 +149,31 @@ def integrate_raw_chunk_to_rgb(
     packed_nch: int,
     device: torch.device | str,
     clear_states: bool,
-    integrators_3ch: torch.nn.ModuleList | None = None,
     **integrator_kwargs: Any,
 ) -> Tensor:
-    """Run a stateful integrator on a raw chunk and return ``(1, 3, H, W)`` float RGB."""
-    if int(packed_nch) == 3:
-        integrators = integrators_3ch
-        if integrators is None:
-            raise ValueError("integrators_3ch is required for synthetic 3-channel raw chunks")
-        channels = []
-        for ch in range(3):
-            cube = raw_plane_to_photon_cube(
-                raw_chunk_plane(raw_chunk, ch, packed_nch=3),
-                device=device,
-                as_bool=True,
-            )
-            recons = integrators[ch].process_photon_cube(cube, clear_states=clear_states, **integrator_kwargs)
-            channels.append(_last_recon_hw(recons.float()))
-        rgb_hw3 = torch.stack(channels, dim=-1)
-        return rgb_hw3.permute(2, 0, 1).unsqueeze(0).contiguous()
-
-    cube = raw_plane_to_photon_cube(
-        raw_chunk_plane(raw_chunk, 0, packed_nch=4),
-        device=device,
-        as_bool=True,
-    )
+    """Run a stateful integrator on Bayer raw and return ``(1, 3, H/2, W/2)`` float RGB."""
+    cube = raw_plane_to_photon_cube(raw_chunk_plane(raw_chunk, packed_nch=packed_nch), device=device, as_bool=True)
     recons = integrator.process_photon_cube(cube, clear_states=clear_states, **integrator_kwargs)
-    return raw_hwt_to_rgb_float(recons.float(), packed_nch=4)
+    rgb_tchw = raw_hwt_to_rgb_float(recons.float(), packed_nch=int(packed_nch))
+    if int(rgb_tchw.shape[0]) <= 0:
+        return rgb_tchw
+    return rgb_tchw[-1:].contiguous()
 
 
 def sum_raw_chunk_to_rgb(raw_chunk: np.ndarray, *, packed_nch: int, device: torch.device | str) -> Tensor:
-    """Temporal mean over a raw chunk -> ``(1, 3, H, W)`` float RGB."""
-    if int(packed_nch) == 3:
-        raw = torch.from_numpy(raw_chunk).to(device).float()
-        mean_hw3 = raw.mean(dim=0)
-        return mean_hw3.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
-
-    raw = torch.from_numpy(raw_chunk_plane(raw_chunk, 0, packed_nch=4)).to(device).float()
-    raw_mean = raw.mean(dim=0, keepdim=True).permute(1, 2, 0)
-    return raw_hwt_to_rgb_float(raw_mean, packed_nch=4)
+    """Temporal mean over Bayer raw -> ``(1, 3, H/2, W/2)`` float RGB."""
+    raw = torch.from_numpy(raw_chunk_plane(raw_chunk, packed_nch=packed_nch)).to(device).float()
+    raw_mean = raw.mean(dim=0)
+    if is_synthetic_packed(packed_nch):
+        return _bayer_rggb_hw_to_rgb_hw3(raw_mean).unsqueeze(0).clamp(0, 1)
+    return raw_hwt_to_rgb_float(raw_mean.unsqueeze(-1), packed_nch=4)
 
 
 def raw_hwt_to_rgb_float(raw_hwt: Tensor, *, packed_nch: int) -> Tensor:
-    """Convert integrator output ``(H, W, T)`` to ``(T, 3, H, W)`` float RGB.
+    """Convert integrator output ``(H, W, T)`` to ``(T, 3, H_out, W_out)`` float RGB.
 
-    - ``packed_nch=3``: native-resolution mono planes are stacked as R=G=B grayscale RGB.
-    - ``packed_nch=4``: demosaic full-resolution Bayer then resize to half resolution.
+    - ``packed_nch=3``: RGGB plane subsample, ``G=(G1+G2)/2``.
+    - ``packed_nch=4``: OpenCV demosaic then resize to half resolution.
     """
     if not torch.is_tensor(raw_hwt):
         raise TypeError(f"Expected torch.Tensor, got {type(raw_hwt)}")
@@ -194,17 +182,13 @@ def raw_hwt_to_rgb_float(raw_hwt: Tensor, *, packed_nch: int) -> Tensor:
 
     h_raw, w_raw, t = map(int, raw_hwt.shape)
     if t <= 0:
-        out_h = h_raw if is_synthetic_packed(packed_nch) else h_raw // 2
-        out_w = w_raw if is_synthetic_packed(packed_nch) else w_raw // 2
-        return raw_hwt.new_zeros((0, 3, out_h, out_w))
-
-    if is_synthetic_packed(packed_nch):
-        mono = raw_hwt.float()
-        rgb = mono.unsqueeze(2).expand(-1, -1, 3, -1)
-        return rgb.permute(3, 2, 0, 1).contiguous()
+        return raw_hwt.new_zeros((0, 3, h_raw // 2, w_raw // 2))
 
     if h_raw % 2 != 0 or w_raw % 2 != 0:
         raise ValueError(f"Bayer raw reconstruction must have even H/W, got {(h_raw, w_raw)}")
+
+    if is_synthetic_packed(packed_nch):
+        return _bayer_rggb_hwt_to_rgb_tchw(raw_hwt.float())
 
     import cv2
 
@@ -218,32 +202,23 @@ def raw_hwt_to_rgb_float(raw_hwt: Tensor, *, packed_nch: int) -> Tensor:
     return torch.stack(frames, dim=0).to(raw_hwt.device)
 
 
-def stack_native_recons_to_rgb(recons_by_channel: list[Tensor] | tuple[Tensor, ...]) -> Tensor:
-    """Stack per-channel ``(H, W, T)`` reconstructions into ``(T, 3, H, W)``."""
-    if not recons_by_channel:
-        raise ValueError("recons_by_channel must not be empty")
-    stacked = torch.stack([recons.float() for recons in recons_by_channel], dim=2)
-    return stacked.permute(3, 2, 0, 1).contiguous()
-
-
 def bayer_plane_to_rgb_u8(raw_hw: np.ndarray, *, packed_nch: int) -> np.ndarray:
-    """Map one reconstructed frame to RGB uint8 at native output resolution.
+    """Map one Bayer frame to RGB uint8 at half resolution.
 
-    - ``packed_nch=3``: ``(H, W)`` mono or ``(H, W, 3)`` native RGB (no Bayer subsample).
-    - ``packed_nch=4``: ``(2H, 2W)`` Bayer demosaic to ``(H, W, 3)``.
+    - ``packed_nch=3``: RGGB subsample with ``G=(G1+G2)/2``.
+    - ``packed_nch=4``: demosaic then resize if needed.
     """
-    if raw_hw.ndim == 3 and int(raw_hw.shape[-1]) == 3:
-        rgb = raw_hw if raw_hw.dtype == np.uint8 else np.clip(raw_hw, 0, 255).astype(np.uint8)
-        return rgb
-
     if raw_hw.ndim != 2:
-        raise ValueError(f"Expected raw frame (H,W) or (H,W,3), got shape={raw_hw.shape}")
+        raise ValueError(f"Expected Bayer frame (H,W), got shape={raw_hw.shape}")
 
     raw_u8 = raw_hw if raw_hw.dtype == np.uint8 else np.clip(raw_hw, 0, 255).astype(np.uint8)
     h, w = raw_u8.shape
 
     if is_synthetic_packed(packed_nch):
-        return np.stack([raw_u8, raw_u8, raw_u8], axis=2)
+        r = raw_u8[0::2, 0::2]
+        g = (0.5 * (raw_u8[0::2, 1::2].astype(np.float32) + raw_u8[1::2, 0::2].astype(np.float32))).astype(np.uint8)
+        b = raw_u8[1::2, 1::2]
+        return np.stack((r, g, b), axis=2)
 
     import cv2
 
@@ -255,16 +230,9 @@ def bayer_plane_to_rgb_u8(raw_hw: np.ndarray, *, packed_nch: int) -> np.ndarray:
 
 
 def raw_video_mean_to_rgb_u8(raw_video: np.ndarray, *, packed_nch: int) -> np.ndarray:
-    """Temporal mean of a raw video chunk, returned as RGB uint8 ``(H, W, 3)``."""
-    if raw_video.ndim != 4:
-        raise ValueError(f"Expected raw video (T,H,W,C), got shape={raw_video.shape}")
-    t = max(int(raw_video.shape[0]), 1)
-    if is_synthetic_packed(packed_nch):
-        mean_hw3 = raw_video.astype(np.float32).mean(axis=0)
-        return np.clip(mean_hw3 * 255.0, 0, 255).astype(np.uint8)
-
-    if raw_video.shape[-1] != 1:
+    """Temporal mean of a Bayer raw video chunk, returned as RGB uint8 ``(H/2, W/2, 3)``."""
+    if raw_video.ndim != 4 or raw_video.shape[-1] != 1:
         raise ValueError(f"Expected Bayer raw video (T,H,W,1), got shape={raw_video.shape}")
     raw_mean = raw_video[..., 0].astype(np.float32).mean(axis=0)
     raw_u8 = np.clip(raw_mean * 255.0, 0, 255).astype(np.uint8)
-    return bayer_plane_to_rgb_u8(raw_u8, packed_nch=4)
+    return bayer_plane_to_rgb_u8(raw_u8, packed_nch=int(packed_nch))
