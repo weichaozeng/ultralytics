@@ -2,6 +2,7 @@
 
 from .bot_sort import BOTSORT
 from .byte_tracker import BYTETracker
+from .spad_tracker import SPADTracker
 from .track import register_tracker
 
-__all__ = "BOTSORT", "BYTETracker", "register_tracker"  # allow simpler import
+__all__ = "BOTSORT", "BYTETracker", "SPADTracker", "register_tracker"  # allow simpler import

@@ -1,0 +1,20 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# SPADTracker defaults for mode="track"
+tracker_type: spad_tracker
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: True
+
+# Dense Gaussian velocity field
+field_value_source: predicted # predicted|measured
+field_sigma_scale_x: 0.35
+field_sigma_scale_y: 0.35
+field_min_sigma: 2.0
+field_min_weight: 1e-4
+field_max_speed: 32.0
+field_extent: 3.0
+prediction_horizon: 1.0

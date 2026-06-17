@@ -250,6 +250,25 @@ def _extract_track_centers(result) -> tuple[np.ndarray, np.ndarray]:
     return ids, centers
 
 
+def _get_live_tracker(model: YOLO):
+    if not hasattr(model, "predictor") or model.predictor is None:
+        return None
+    trackers = getattr(model.predictor, "trackers", None)
+    if not trackers:
+        return None
+    return trackers[0]
+
+
+def _set_vel_field_from_tracker(model: YOLO, integrator: VelIntegrator) -> None:
+    tracker = _get_live_tracker(model)
+    if tracker is None:
+        integrator.set_velocity_field(None, source_space="rgb")
+        return
+    if not hasattr(tracker, "last_velocity_field"):
+        raise TypeError("The 'vel' preprocessor requires a tracker that exposes 'last_velocity_field'.")
+    integrator.set_velocity_field(getattr(tracker, "last_velocity_field", None), source_space="rgb")
+
+
 def _run_detector_on_frames(model: YOLO, frames_bgr: list[np.ndarray], *, conf: float, tracker_cfg: str, device: str):
     kwargs = {"conf": conf, "persist": True, "tracker": tracker_cfg, "verbose": False}
     if device:
@@ -472,7 +491,7 @@ def main():
     ap.add_argument("--chunk_stride", type=int, default=0)
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--det_thresh", type=float, default=0.4)
-    ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort"])
+    ap.add_argument("--tracker", type=str, default="spad_tracker", choices=["bytetrack", "botsort", "spad_tracker"])
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
    # perpixelbayesian
     ap.add_argument("--ppb_gamma", type=float, default=5e-4)
@@ -511,7 +530,7 @@ def main():
     )
     # velintegrator
     ap.add_argument("--vel_max_shift", type=int, default=16)
-    ap.add_argument("--vel_patch_size", type=int, default=0, help="Per-patch vel from tracks in patch (0 = global median)")
+    ap.add_argument("--vel_patch_size", type=int, default=0, help="Deprecated; ignored by the dense-field integrator")
     ap.add_argument("--vel_compensate", type=str, default="rgb", choices=["rgb", "raw"], help="Shift in RGB (avoids Bayer color fringing) or raw")
     ap.add_argument("--vel_quantile", type=float, default=1.0)
     ap.add_argument("--vel_normalize", action=argparse.BooleanOptionalAction, default=False)
@@ -555,6 +574,8 @@ def main():
     invalid = sorted(set(preprocessors) - {"sum", "ppb", "vel", "hyb"})
     if invalid:
         raise ValueError(f"Unsupported preprocessors: {invalid}")
+    if "vel" in preprocessors and args.tracker != "spad_tracker":
+        raise ValueError("The 'vel' preprocessor now requires '--tracker spad_tracker'.")
 
     device = _resolve_device(args.device)
     tracker_cfg = f"{args.tracker}.yaml"
@@ -681,7 +702,6 @@ def main():
                         device=args.device,
                     )
 
-                    raw_hw = (int(raw_chunk.shape[1]), int(raw_chunk.shape[2]))
                     for frame_bgr, result in zip(frames_bgr, results):
                         stem = (
                             f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}"
@@ -692,14 +712,8 @@ def main():
                         cv2.imwrite(str(recon_path), frame_bgr)
                         cv2.imwrite(str(overlay_path), _draw_results(frame_bgr, result))
                         frame_idx_by_pre[name] += 1
-                        if name == "vel":
-                            track_ids, centers = _extract_track_centers(result)
-                            vel.push_detection(
-                                track_ids,
-                                centers,
-                                det_hw=frame_bgr.shape[:2],
-                                raw_hw=raw_hw,
-                            )
+                    if name == "vel":
+                        _set_vel_field_from_tracker(models["vel"], vel)
 
                 first_chunk = False
                 cube_idx += 1

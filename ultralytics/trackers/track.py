@@ -8,11 +8,12 @@ import torch
 from ultralytics.utils import YAML, IterableSimpleNamespace
 from ultralytics.utils.checks import check_yaml
 
-from .bot_sort import BOTSORT
 from .byte_tracker import BYTETracker
+from .spad_tracker import SPADTracker
+from .bot_sort import BOTSORT
 
 # A mapping of tracker types to corresponding tracker classes
-TRACKER_MAP = {"bytetrack": BYTETracker, "botsort": BOTSORT}
+TRACKER_MAP = {"bytetrack": BYTETracker, "botsort": BOTSORT, "spad_tracker": SPADTracker}
 
 
 def on_predict_start(predictor: object, persist: bool = False) -> None:
@@ -36,8 +37,10 @@ def on_predict_start(predictor: object, persist: bool = False) -> None:
     tracker = check_yaml(predictor.args.tracker)
     cfg = IterableSimpleNamespace(**YAML.load(tracker))
 
-    if cfg.tracker_type not in {"bytetrack", "botsort"}:
-        raise AssertionError(f"Only 'bytetrack' and 'botsort' are supported for now, but got '{cfg.tracker_type}'")
+    if cfg.tracker_type not in {"bytetrack", "botsort", "spad_tracker"}:
+        raise AssertionError(
+            f"Only 'bytetrack', 'botsort', and 'spad_tracker' are supported for now, but got '{cfg.tracker_type}'"
+        )
 
     predictor._feats = None  # reset in case used earlier
     if hasattr(predictor, "_hook"):
