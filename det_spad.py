@@ -1,5 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Compare SPAD preprocessing methods before a standard YOLO pose detector.
+"""Compare SPAD preprocessors before a standard YOLO pose detector.
 
 This script does not use QNNPoseModel. It converts SPAD chunks into RGB-like
 frames with one of:
@@ -7,7 +7,7 @@ frames with one of:
 - ppb: PerPixelBayesian reconstruction
 - vel: detection-guided velocity-compensated integration
 
-- hyb: STEA (causal temporal bases + KL spatio-temporal soft routing)
+- stea: STEA (causal temporal bases + KL spatio-temporal soft routing)
 
 The resulting frames are passed to an unmodified pretrained YOLO pose model.
 """
@@ -38,8 +38,8 @@ from ultralytics.data.spad_packed import (
     raw_plane_to_photon_cube,
     sum_raw_chunk_to_rgb,
 )
-from ultralytics.quanta_hybrid_networks.integrator import SpatioTemporalEvidenceAccumulation
-from ultralytics.quanta_motion_networks.integrator import VelIntegrator
+from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation
+from ultralytics.quanta_vel_networks.integrator import VelIntegrator
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
 
 
@@ -200,7 +200,7 @@ def _preprocess_ppb(
     )
 
 
-def _preprocess_hyb(
+def _preprocess_stea(
     raw_chunk: np.ndarray,
     *,
     packed_nch: int,
@@ -454,7 +454,7 @@ def _preprocess_chunk(
     device: torch.device,
     first_chunk: bool,
     ppb: PerPixelBayesian | None,
-    hyb: SpatioTemporalEvidenceAccumulation | None,
+    stea: SpatioTemporalEvidenceAccumulation | None,
     vel: VelIntegrator | None,
 ) -> torch.Tensor:
     if name == "sum":
@@ -467,12 +467,12 @@ def _preprocess_chunk(
             integrator=ppb,
             clear_states=first_chunk,
         )
-    if name == "hyb":
-        return _preprocess_hyb(
+    if name == "stea":
+        return _preprocess_stea(
             raw_chunk,
             packed_nch=packed_nch,
             device=device,
-            integrator=hyb,
+            integrator=stea,
             clear_states=first_chunk,
         )
     return _preprocess_vel(
@@ -481,54 +481,54 @@ def _preprocess_chunk(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="SPAD preprocess comparison before standard YOLO pose detection")
+    ap = argparse.ArgumentParser(description="Compare SPAD preprocessors before standard YOLO pose detection")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory, root directory, or .npy path")
     ap.add_argument("--in_glob", type=str, default=None, help="Optional glob for a root folder containing sample directories")
     ap.add_argument("--ckpt", type=str, required=True, help="Standard pretrained YOLO pose checkpoint")
     ap.add_argument("--save_dir", type=str, required=True)
-    ap.add_argument("--pre", type=str, default="sum,ppb,vel", help="Comma-separated preprocessors: sum,ppb,vel,hyb")
+    ap.add_argument("--pre", type=str, default="sum,ppb,vel", help="Comma-separated preprocessors: sum,ppb,vel,stea")
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--chunk_stride", type=int, default=0)
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--det_thresh", type=float, default=0.4)
     ap.add_argument("--tracker", type=str, default="spad_tracker", choices=["bytetrack", "botsort", "spad_tracker"])
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
-   # perpixelbayesian
+    # PerPixelBayesian preprocessor
     ap.add_argument("--ppb_gamma", type=float, default=5e-4)
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
-    # STEA hybrid preprocessor
-    ap.add_argument("--hyb_fast_window", type=int, default=16, help="Fast Gamma temporal basis length for STEA")
-    ap.add_argument("--hyb_slow_window", type=int, default=128, help="Slow boxcar temporal basis length for STEA")
-    ap.add_argument("--hyb_temporal_window", type=int, default=5, help="Causal evidence time blur window for STEA")
-    ap.add_argument("--hyb_fast_tau", type=float, default=4.0, help="Gamma kernel tau for the fast STEA basis")
-    ap.add_argument("--hyb_motion_sharpness", type=float, default=60.0, help="Sigmoid sharpness for KL motion probability")
-    ap.add_argument("--hyb_motion_threshold", type=float, default=0.05, help="KL threshold for sigmoid motion probability")
-    ap.add_argument("--hyb_eps", type=float, default=1e-5, help="Clamp epsilon for Bernoulli rates")
-    ap.add_argument("--hyb_blend_const", type=float, default=16.0, help="C in W_mean=L/(L+C) for stable mean confidence")
-    ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
+    # STEA preprocessor
+    ap.add_argument("--stea_fast_window", type=int, default=16, help="Fast Gamma temporal basis length for STEA")
+    ap.add_argument("--stea_slow_window", type=int, default=128, help="Slow boxcar temporal basis length for STEA")
+    ap.add_argument("--stea_temporal_window", type=int, default=5, help="Causal evidence time blur window for STEA")
+    ap.add_argument("--stea_fast_tau", type=float, default=4.0, help="Gamma kernel tau for the fast STEA basis")
+    ap.add_argument("--stea_motion_sharpness", type=float, default=60.0, help="Sigmoid sharpness for KL motion probability")
+    ap.add_argument("--stea_motion_threshold", type=float, default=0.05, help="KL threshold for sigmoid motion probability")
+    ap.add_argument("--stea_eps", type=float, default=1e-5, help="Clamp epsilon for Bernoulli rates")
+    ap.add_argument("--stea_blend_const", type=float, default=16.0, help="C in W_mean=L/(L+C) for stable mean confidence")
+    ap.add_argument("--stea_kernel_size", type=int, default=None, help="Deprecated alias for --stea_slow_window")
     ap.add_argument(
-        "--hyb_prior_strength",
+        "--stea_prior_strength",
         type=float,
         default=1.0,
         help="Deprecated; ignored by STEA",
     )
     ap.add_argument(
-        "--hyb_gating_tau",
+        "--stea_gating_tau",
         type=float,
         default=0.1,
         help="Deprecated; ignored by STEA",
     )
-    ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--hyb_quantile", type=float, default=1.0)
+    ap.add_argument("--stea_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--stea_quantile", type=float, default=1.0)
     ap.add_argument(
-        "--hyb_max_filter_size",
+        "--stea_max_filter_size",
         type=int,
         default=3,
         help="Deprecated; ignored by STEA",
     )
-    # velintegrator
+    # VelIntegrator preprocessor
     ap.add_argument("--vel_max_shift", type=int, default=16)
     ap.add_argument("--vel_patch_size", type=int, default=0, help="Deprecated; ignored by the dense-field integrator")
     ap.add_argument("--vel_compensate", type=str, default="rgb", choices=["rgb", "raw"], help="Shift in RGB (avoids Bayer color fringing) or raw")
@@ -571,7 +571,7 @@ def main():
         raise FileNotFoundError(f"No inputs matched: {in_path}/{args.in_glob}")
 
     preprocessors = [x.strip() for x in args.pre.split(",") if x.strip()]
-    invalid = sorted(set(preprocessors) - {"sum", "ppb", "vel", "hyb"})
+    invalid = sorted(set(preprocessors) - {"sum", "ppb", "vel", "stea"})
     if invalid:
         raise ValueError(f"Unsupported preprocessors: {invalid}")
     if "vel" in preprocessors and args.tracker != "spad_tracker":
@@ -604,22 +604,22 @@ def main():
         if "vel" in preprocessors
         else None
     )
-    hyb = (
+    stea = (
         SpatioTemporalEvidenceAccumulation(
             chunk_size=int(args.chunk_size),
-            fast_window=int(args.hyb_fast_window),
-            slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
-            temporal_window=int(args.hyb_temporal_window),
-            fast_tau=float(args.hyb_fast_tau),
-            motion_sharpness=float(args.hyb_motion_sharpness),
-            motion_threshold=float(args.hyb_motion_threshold),
-            eps=float(args.hyb_eps),
-            stable_prior=float(args.hyb_blend_const),
+            fast_window=int(args.stea_fast_window),
+            slow_window=int(args.stea_kernel_size or args.stea_slow_window),
+            temporal_window=int(args.stea_temporal_window),
+            fast_tau=float(args.stea_fast_tau),
+            motion_sharpness=float(args.stea_motion_sharpness),
+            motion_threshold=float(args.stea_motion_threshold),
+            eps=float(args.stea_eps),
+            stable_prior=float(args.stea_blend_const),
             subsampling=int(args.chunk_size),
-            normalize=bool(args.hyb_normalize),
-            quantile=float(args.hyb_quantile),
+            normalize=bool(args.stea_normalize),
+            quantile=float(args.stea_quantile),
         ).to(device)
-        if "hyb" in preprocessors
+        if "stea" in preprocessors
         else None
     )
     timing = PreprocessTiming(warmup_chunks=int(args.time_pre_warmup_chunks)) if args.time_pre else None
@@ -665,7 +665,7 @@ def main():
                                 device=device,
                                 first_chunk=first_chunk,
                                 ppb=ppb,
-                                hyb=hyb,
+                                stea=stea,
                                 vel=vel,
                             )
                         timing.record(
@@ -684,7 +684,7 @@ def main():
                             device=device,
                             first_chunk=first_chunk,
                             ppb=ppb,
-                            hyb=hyb,
+                            stea=stea,
                             vel=vel,
                         )
 

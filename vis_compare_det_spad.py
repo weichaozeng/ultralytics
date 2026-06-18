@@ -1,12 +1,12 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Stitch det_spad outputs (sum / ppb / vel / hyb) into side-by-side comparison images.
+"""Stitch `det_spad.py` outputs (sum / ppb / vel / stea) into side-by-side comparison images.
 
-Expected layout from ``det_spad.py``::
+Expected layout from `det_spad.py`::
 
     {save_dir}/{sample}/video00000/cube00000_t000000_000320_frame0000000_sum_recon.png
-    {save_dir}/{sample}/video00000/cube00000_t000000_000320_frame0000000_hyb_overlay.png
+    {save_dir}/{sample}/video00000/cube00000_t000000_000320_frame0000000_stea_overlay.png
 
-For sample ``0428_wc/acq00002``, writes to ``0428_wc/acq00002_compare`` (sibling folder).
+For sample `0428_wc/acq00002`, writes to `0428_wc/acq00002_compare` (sibling folder).
 
 Example
 -------
@@ -27,47 +27,47 @@ import numpy as np
 from tqdm import tqdm
 
 FNAME_RE = re.compile(
-    r"^(?P<stem>cube\d+_t\d+_\d+_frame\d+)_(?P<pre>sum|ppb|vel|hyb)_(?P<kind>recon|overlay)\.png$",
+    r"^(?P<stem>cube\d+_t\d+_\d+_frame\d+)_(?P<pre>sum|ppb|vel|stea)_(?P<kind>recon|overlay)\.png$",
     re.IGNORECASE,
 )
 
-ALL_METHODS = ("sum", "ppb", "vel", "hyb")
+ALL_METHODS = ("sum", "ppb", "vel", "stea")
 
 LABEL_COLORS = {
     "sum": (0, 255, 255),
     "ppb": (0, 255, 0),
     "vel": (255, 128, 0),
-    "hyb": (255, 0, 255),
+    "stea": (255, 0, 255),
 }
 
 
 def _parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Side-by-side comparison for det_spad preprocess outputs")
+    ap = argparse.ArgumentParser(description="Side-by-side comparison for det_spad preprocessor outputs")
     ap.add_argument(
         "--save_dir",
         type=str,
         required=True,
-        help="Root directory that contains sample folders (same as det_spad --save_dir)",
+        help="Root directory that contains sample folders (same as `det_spad.py --save_dir`)",
     )
     ap.add_argument(
         "--in_dir",
         type=str,
         default=None,
-        help="Single sample folder, e.g. 0428_wc/acq00002 (overrides --sample_glob)",
+        help="Single sample folder, e.g. `0428_wc/acq00002` (overrides `--sample_glob`)",
     )
     ap.add_argument(
         "--sample_glob",
         type=str,
         default="*/*",
-        help="Glob under --save_dir for sample folders (default: */*)",
+        help="Glob under `--save_dir` for sample folders (default: `*/*`)",
     )
     ap.add_argument(
         "--pre",
         type=str,
         default=",".join(ALL_METHODS),
-        help="Comma-separated methods (sum,ppb,vel,hyb), left-to-right order",
+        help="Comma-separated methods in left-to-right display order: `sum,ppb,vel,stea`",
     )
-    ap.add_argument("--kinds", type=str, default="recon,overlay", help="Comma-separated: recon, overlay")
+    ap.add_argument("--kinds", type=str, default="recon,overlay", help="Comma-separated output kinds: `recon,overlay`")
     ap.add_argument("--gap", type=int, default=8, help="Pixels between panels")
     ap.add_argument("--label_h", type=int, default=28, help="Header height for method labels")
     ap.add_argument("--font_scale", type=float, default=0.7)

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Visualize SPADTracker dense motion fields and velocity-guided reconstructions.
+"""Visualize SPADTracker dense velocity fields and velocity-guided reconstructions.
 
 Writes per-chunk outputs under ``{save_dir}/{sample}/videoXXXXX/``:
 
-- ``{stem}_motion_compare.png`` - sum vs vel reconstruction side-by-side
-- ``{stem}_motion_flow.png`` - dense velocity field rendered as a color wheel
-- ``{stem}_motion_overlay.png`` - velocity arrows over the tracked vel reconstruction
-- ``{stem}_motion_stats.txt`` - percentile summary and per-track motion values
+- ``{stem}_vel_compare.png`` - sum vs vel reconstruction side-by-side
+- ``{stem}_vel_flow.png`` - dense velocity field rendered as a color wheel
+- ``{stem}_vel_overlay.png`` - velocity arrows over the tracked vel reconstruction
+- ``{stem}_vel_stats.txt`` - percentile summary and per-track vel values
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from det_spad import (
 )
 from ultralytics import YOLO
 from ultralytics.data.spad_packed import sum_raw_chunk_to_rgb
-from ultralytics.quanta_motion_networks.integrator import VelIntegrator
+from ultralytics.quanta_vel_networks.integrator import VelIntegrator
 
 
 def _resize_map_to_display(score_hw: np.ndarray, display_hw: tuple[int, int]) -> np.ndarray:
@@ -132,19 +132,19 @@ def _save_visuals(
     flow_bgr: np.ndarray,
     overlay_bgr: np.ndarray,
     flow_hw2: np.ndarray,
-    tracker_motion: list[dict[str, float]],
+    tracker_vel: list[dict[str, float]],
     tracker_name: str,
     arrow_stride: int,
     arrow_scale: float,
     arrow_min_speed: float,
 ) -> None:
     cv2.imwrite(
-        str(out_dir / f"{stem}_motion_compare.png"),
+        str(out_dir / f"{stem}_vel_compare.png"),
         _stitch_panels([sum_bgr, recon_bgr], ["sum", "vel"]),
     )
-    cv2.imwrite(str(out_dir / f"{stem}_motion_flow.png"), flow_bgr)
+    cv2.imwrite(str(out_dir / f"{stem}_vel_flow.png"), flow_bgr)
     cv2.imwrite(
-        str(out_dir / f"{stem}_motion_overlay.png"),
+        str(out_dir / f"{stem}_vel_overlay.png"),
         _stitch_panels([tracked_bgr, overlay_bgr], ["tracked", "flow_arrows"]),
     )
 
@@ -156,7 +156,7 @@ def _save_visuals(
         f"stem={stem}",
         f"tracker={tracker_name}",
         f"arrow_stride={arrow_stride} arrow_scale={arrow_scale} arrow_min_speed={arrow_min_speed}",
-        f"n_tracks={len(tracker_motion)}",
+        f"n_tracks={len(tracker_vel)}",
         "",
     ]
     lines.extend(_percentile_summary(fx, name="vx", percentiles=percentiles))
@@ -166,10 +166,10 @@ def _save_visuals(
     lines.extend(_percentile_summary(speed, name="speed", percentiles=percentiles))
     lines.append("")
     lines.append("[tracks]")
-    if not tracker_motion:
+    if not tracker_vel:
         lines.append("  none")
     else:
-        for item in tracker_motion:
+        for item in tracker_vel:
             lines.append(
                 "  "
                 f"id={int(item['track_id'])} "
@@ -179,11 +179,11 @@ def _save_visuals(
                 f"meas_v=({item.get('measured_vx', 0.0):.3f},{item.get('measured_vy', 0.0):.3f}) "
                 f"score={item['score']:.3f} len={int(item['tracklet_len'])}"
             )
-    (out_dir / f"{stem}_motion_stats.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (out_dir / f"{stem}_vel_stats.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Visualize SPADTracker motion fields and vel reconstructions")
+    ap = argparse.ArgumentParser(description="Visualize SPADTracker velocity fields and vel reconstructions")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory or .npy path")
     ap.add_argument("--save_dir", type=str, required=True, help="Output root directory")
     ap.add_argument("--ckpt", type=str, required=True, help="YOLO checkpoint for tracking")
@@ -235,7 +235,7 @@ def main() -> None:
     sources = list(_iter_sources(in_path))
 
     _reset_tracker(model)
-    for video_idx, source in enumerate(tqdm(sources, desc=f"motion vis [{sample_name}]")):
+    for video_idx, source in enumerate(tqdm(sources, desc=f"vel vis [{sample_name}]")):
         n_bins = _num_bins(source)
         out_dir = _output_dir(save_root, sample_name, video_idx)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -276,10 +276,10 @@ def main() -> None:
             flow_t = getattr(tracker, "last_velocity_field", None) if tracker is not None else None
             if flow_t is None:
                 flow_hw2 = np.zeros((recon_bgr.shape[0], recon_bgr.shape[1], 2), dtype=np.float32)
-                tracker_motion = []
+                tracker_vel = []
             else:
                 flow_hw2 = flow_t.detach().cpu().numpy().astype(np.float32)
-                tracker_motion = list(getattr(tracker, "last_track_motion", []))
+                tracker_vel = list(getattr(tracker, "last_track_vel", []))
 
             speed = np.linalg.norm(flow_hw2, axis=2)
             if float(args.flow_max_speed) > 0.0:
@@ -307,7 +307,7 @@ def main() -> None:
                 flow_bgr=flow_bgr,
                 overlay_bgr=overlay_bgr,
                 flow_hw2=flow_hw2,
-                tracker_motion=tracker_motion,
+                tracker_vel=tracker_vel,
                 tracker_name=args.tracker,
                 arrow_stride=int(args.arrow_stride),
                 arrow_scale=float(args.arrow_scale),
@@ -321,7 +321,7 @@ def main() -> None:
                 f"(n_bins={n_bins}; check chunk_size={args.chunk_size})"
             )
 
-    print(f"Saved motion visualizations under {save_root / sample_name}")
+    print(f"Saved vel visualizations under {save_root / sample_name}")
 
 
 if __name__ == "__main__":

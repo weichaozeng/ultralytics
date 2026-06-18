@@ -1,4 +1,4 @@
-"""Motion-compensated SPAD integration utilities."""
+"""Velocity-guided SPAD integration utilities."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ class VelIntegrator(nn.Module):
         self.last_velocity_vy: Tensor | None = None
 
     def reset(self) -> None:
-        """Clear cached motion state."""
+        """Clear cached velocity-field state."""
         self.velocity_field = None
         self.velocity_field_space = "rgb"
         self.last_velocity = (0.0, 0.0)

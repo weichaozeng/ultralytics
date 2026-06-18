@@ -1,4 +1,4 @@
-"""Hybrid SPAD integrators with PerPixelBayesian-compatible streaming API."""
+"""STEA SPAD integrators with PerPixelBayesian-compatible streaming API."""
 
 from __future__ import annotations
 
@@ -90,7 +90,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
     def update_hyperparams(self, **kwargs) -> None:
         """Update STEA attributes; rebuild convolution kernels when needed."""
         rebuild_keys = {"fast_window", "slow_window", "temporal_window", "fast_tau"}
-        # Compatibility with the previous hybrid CLI/API naming.
+        # Compatibility with earlier STEA CLI/API aliases.
         if kwargs.get("kernel_size") is not None and kwargs.get("slow_window") is None:
             kwargs["slow_window"] = kwargs.pop("kernel_size")
         kwargs.pop("prior_strength", None)

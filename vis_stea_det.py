@@ -3,15 +3,15 @@
 
 Writes per-chunk outputs under ``{save_dir}/{sample}/videoXXXXX/``:
 
-- ``{stem}_hyb_stats.txt`` — percentile summary of STEA evidence tensors
-- ``{stem}_hyb_compare.png`` — sum vs hyb reconstruction (side-by-side)
-- ``{stem}_hyb_scores.png`` — heatmaps of KL evidence, routing weights, temporal peaks, and temporal bases
+- ``{stem}_stea_stats.txt`` — percentile summary of STEA evidence tensors
+- ``{stem}_stea_compare.png`` — sum vs stea reconstruction (side-by-side)
+- ``{stem}_stea_scores.png`` — heatmaps of KL evidence, routing weights, temporal peaks, and temporal bases
 
 Example
 -------
-python ultralytics/vis_hybrid_det.py \\
+python ultralytics/vis_stea_det.py \\
   --in_path /path/to/sample \\
-  --save_dir /path/to/hyb_vis \\
+  --save_dir /path/to/stea_vis \\
   --chunk_size 320
 """
 
@@ -34,7 +34,7 @@ from ultralytics.data.spad_packed import (
     raw_plane_to_photon_cube,
     sum_raw_chunk_to_rgb,
 )
-from ultralytics.quanta_hybrid_networks.integrator import SpatioTemporalEvidenceAccumulation
+from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation
 
 COLORMAPS = {
     "turbo": cv2.COLORMAP_TURBO,
@@ -210,21 +210,21 @@ def _stitch_panels(panels: list[np.ndarray], labels: list[str], gap: int = 6) ->
 
 
 def _process_chunk_with_full_debug(
-    hyb: SpatioTemporalEvidenceAccumulation,
+    stea: SpatioTemporalEvidenceAccumulation,
     raw: torch.Tensor,
     *,
     clear_states: bool,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Run full temporal STEA integration so per-chunk route_weight peaks are available."""
     if clear_states:
-        hyb.t_absolute = 0
-        hyb._clear_histories()
-    hyb.set_cube(raw)
-    fused, motion_debug = hyb._integrate_full_with_debug(raw)
-    recons = hyb._subsample_reconstruction(fused)
-    motion_debug["recons_prenorm"] = hyb._subsample_reconstruction(motion_debug["recons_prenorm"])
-    recons = hyb.clamp_recons(recons)
-    hyb.t_absolute += int(raw.shape[-1])
+        stea.t_absolute = 0
+        stea._clear_histories()
+    stea.set_cube(raw)
+    fused, motion_debug = stea._integrate_full_with_debug(raw)
+    recons = stea._subsample_reconstruction(fused)
+    motion_debug["recons_prenorm"] = stea._subsample_reconstruction(motion_debug["recons_prenorm"])
+    recons = stea.clamp_recons(recons)
+    stea.t_absolute += int(raw.shape[-1])
     return recons, motion_debug
 
 
@@ -278,11 +278,11 @@ def _save_visuals(
             panel = _value_to_gray_bgr(disp, vmin=0.0, vmax=1.0)
         score_panels.append(panel)
         score_labels.append(label)
-    cv2.imwrite(str(out_dir / f"{stem}_hyb_scores.png"), _stitch_panels(score_panels, score_labels))
+    cv2.imwrite(str(out_dir / f"{stem}_stea_scores.png"), _stitch_panels(score_panels, score_labels))
 
     cv2.imwrite(
-        str(out_dir / f"{stem}_hyb_compare.png"),
-        _stitch_panels([sum_bgr, recon_bgr], ["sum", "hyb"]),
+        str(out_dir / f"{stem}_stea_compare.png"),
+        _stitch_panels([sum_bgr, recon_bgr], ["sum", "stea"]),
     )
 
     route_from_k = 1.0 / (
@@ -307,31 +307,31 @@ def _save_visuals(
     for label, values in maps.items():
         stats_lines.extend(_percentile_summary(values, name=label, percentiles=percentiles))
         stats_lines.append("")
-    (out_dir / f"{stem}_hyb_stats.txt").write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
+    (out_dir / f"{stem}_stea_stats.txt").write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Visualize hybrid integrator scores and reconstructions")
+    ap = argparse.ArgumentParser(description="Visualize STEA integrator scores and reconstructions")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory or .npy path")
     ap.add_argument("--save_dir", type=str, required=True, help="Output root directory")
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--chunk_stride", type=int, default=0)
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
-    ap.add_argument("--hyb_fast_window", type=int, default=16)
-    ap.add_argument("--hyb_slow_window", type=int, default=128)
-    ap.add_argument("--hyb_temporal_window", type=int, default=5)
-    ap.add_argument("--hyb_fast_tau", type=float, default=4.0)
-    ap.add_argument("--hyb_motion_sharpness", type=float, default=60.0)
-    ap.add_argument("--hyb_motion_threshold", type=float, default=0.05)
-    ap.add_argument("--hyb_eps", type=float, default=1e-5)
-    ap.add_argument("--hyb_blend_const", type=float, default=16.0)
-    ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
-    ap.add_argument("--hyb_prior_strength", type=float, default=1.0, help="Deprecated; ignored by STEA")
-    ap.add_argument("--hyb_gating_tau", type=float, default=0.1, help="Deprecated; ignored by STEA")
-    ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--hyb_quantile", type=float, default=1.0)
-    ap.add_argument("--hyb_max_filter_size", type=int, default=3, help="Deprecated; ignored by STEA")
+    ap.add_argument("--stea_fast_window", type=int, default=16)
+    ap.add_argument("--stea_slow_window", type=int, default=128)
+    ap.add_argument("--stea_temporal_window", type=int, default=5)
+    ap.add_argument("--stea_fast_tau", type=float, default=4.0)
+    ap.add_argument("--stea_motion_sharpness", type=float, default=60.0)
+    ap.add_argument("--stea_motion_threshold", type=float, default=0.05)
+    ap.add_argument("--stea_eps", type=float, default=1e-5)
+    ap.add_argument("--stea_blend_const", type=float, default=16.0)
+    ap.add_argument("--stea_kernel_size", type=int, default=None, help="Deprecated alias for --stea_slow_window")
+    ap.add_argument("--stea_prior_strength", type=float, default=1.0, help="Deprecated; ignored by STEA")
+    ap.add_argument("--stea_gating_tau", type=float, default=0.1, help="Deprecated; ignored by STEA")
+    ap.add_argument("--stea_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--stea_quantile", type=float, default=1.0)
+    ap.add_argument("--stea_max_filter_size", type=int, default=3, help="Deprecated; ignored by STEA")
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
     ap.add_argument("--vis_percentile", type=float, default=99.5)
     ap.add_argument("--vis_gamma", type=float, default=2.2)
@@ -359,26 +359,26 @@ def main() -> None:
     device = _resolve_device(args.device)
     cmap_id = COLORMAPS[args.colormap]
 
-    hyb = SpatioTemporalEvidenceAccumulation(
+    stea = SpatioTemporalEvidenceAccumulation(
         chunk_size=int(args.chunk_size),
-        fast_window=int(args.hyb_fast_window),
-        slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
-        temporal_window=int(args.hyb_temporal_window),
-        fast_tau=float(args.hyb_fast_tau),
-        motion_sharpness=float(args.hyb_motion_sharpness),
-        motion_threshold=float(args.hyb_motion_threshold),
-        eps=float(args.hyb_eps),
-        stable_prior=float(args.hyb_blend_const),
+        fast_window=int(args.stea_fast_window),
+        slow_window=int(args.stea_kernel_size or args.stea_slow_window),
+        temporal_window=int(args.stea_temporal_window),
+        fast_tau=float(args.stea_fast_tau),
+        motion_sharpness=float(args.stea_motion_sharpness),
+        motion_threshold=float(args.stea_motion_threshold),
+        eps=float(args.stea_eps),
+        stable_prior=float(args.stea_blend_const),
         subsampling=int(args.chunk_size),
-        normalize=bool(args.hyb_normalize),
-        quantile=float(args.hyb_quantile),
+        normalize=bool(args.stea_normalize),
+        quantile=float(args.stea_quantile),
     ).to(device)
 
     sample_name = in_path.name if in_path.is_dir() else in_path.stem
     stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else int(args.chunk_size)
     sources = list(_iter_sources(in_path))
 
-    for video_idx, source in enumerate(tqdm(sources, desc=f"hyb vis [{sample_name}]")):
+    for video_idx, source in enumerate(tqdm(sources, desc=f"stea vis [{sample_name}]")):
         n_bins = _num_bins(source)
         out_dir = _output_dir(save_root, sample_name, video_idx)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -394,7 +394,7 @@ def main() -> None:
                 raw_chunk[..., 0], device=device, as_bool=True
             )
             recons, motion_debug = _process_chunk_with_full_debug(
-                hyb, raw, clear_states=cube_idx == 0
+                stea, raw, clear_states=cube_idx == 0
             )
             if int(recons.shape[-1]) == 0:
                 tqdm.write(f"Skip cube {cube_idx} (no temporal blocks): t{t0:06d}_{t1:06d}")
@@ -421,13 +421,13 @@ def main() -> None:
                 cmap_id=cmap_id,
                 score_vmax=float(args.score_vmax),
                 score_percentile=float(args.score_percentile),
-                fast_window=int(args.hyb_fast_window),
-                slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
-                temporal_window=int(args.hyb_temporal_window),
-                fast_tau=float(args.hyb_fast_tau),
-                motion_sharpness=float(args.hyb_motion_sharpness),
-                motion_threshold=float(args.hyb_motion_threshold),
-                blend_const=float(args.hyb_blend_const),
+                fast_window=int(args.stea_fast_window),
+                slow_window=int(args.stea_kernel_size or args.stea_slow_window),
+                temporal_window=int(args.stea_temporal_window),
+                fast_tau=float(args.stea_fast_tau),
+                motion_sharpness=float(args.stea_motion_sharpness),
+                motion_threshold=float(args.stea_motion_threshold),
+                blend_const=float(args.stea_blend_const),
             )
             frame_idx += 1
 
@@ -437,7 +437,7 @@ def main() -> None:
                 f"(n_bins={n_bins}; check chunk_size={args.chunk_size})"
             )
 
-    print(f"Saved hybrid visualizations under {save_root / sample_name}")
+    print(f"Saved STEA visualizations under {save_root / sample_name}")
 
 
 if __name__ == "__main__":
