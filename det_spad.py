@@ -491,7 +491,13 @@ def main():
     ap.add_argument("--chunk_stride", type=int, default=0)
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--det_thresh", type=float, default=0.4)
-    ap.add_argument("--tracker", type=str, default="spad_tracker", choices=["bytetrack", "botsort", "spad_tracker"])
+    ap.add_argument(
+        "--tracker",
+        type=str,
+        default="bytetrack",
+        choices=["bytetrack", "botsort", "spad_tracker"],
+        help="Default tracker for `sum`, `ppb`, and `stea`; `vel` ignores this and always uses `spad_tracker`.",
+    )
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     # PerPixelBayesian preprocessor
     ap.add_argument("--ppb_gamma", type=float, default=5e-4)
@@ -574,11 +580,9 @@ def main():
     invalid = sorted(set(preprocessors) - {"sum", "ppb", "vel", "stea"})
     if invalid:
         raise ValueError(f"Unsupported preprocessors: {invalid}")
-    if "vel" in preprocessors and args.tracker != "spad_tracker":
-        raise ValueError("The 'vel' preprocessor now requires '--tracker spad_tracker'.")
-
     device = _resolve_device(args.device)
-    tracker_cfg = f"{args.tracker}.yaml"
+    default_tracker_cfg = f"{args.tracker}.yaml"
+    vel_tracker_cfg = "spad_tracker.yaml"
 
     models = {name: YOLO(args.ckpt) for name in preprocessors}
     ppb = (
@@ -694,6 +698,7 @@ def main():
                         percentile=float(args.vis_percentile),
                         gamma=float(args.vis_gamma),
                     )
+                    tracker_cfg = vel_tracker_cfg if name == "vel" else default_tracker_cfg
                     results = _run_detector_on_frames(
                         models[name],
                         frames_bgr,
