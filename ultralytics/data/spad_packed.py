@@ -134,6 +134,23 @@ def _bayer_rggb_hwt_to_rgb_tchw(raw_hwt: Tensor) -> Tensor:
     return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
 
 
+def rgb_tchw_to_raw_hwt(rgb_tchw: Tensor) -> Tensor:
+    """Project ``(T, 3, H, W)`` RGB back to an RGGB Bayer-like ``(2H, 2W, T)`` tensor."""
+    if not torch.is_tensor(rgb_tchw):
+        raise TypeError(f"Expected torch.Tensor, got {type(rgb_tchw)}")
+    if rgb_tchw.ndim != 4 or int(rgb_tchw.shape[1]) != 3:
+        raise ValueError(f"Expected rgb_tchw (T,3,H,W), got shape={tuple(rgb_tchw.shape)}")
+
+    t, _, h_rgb, w_rgb = map(int, rgb_tchw.shape)
+    rgb = rgb_tchw.float()
+    raw_hwt = rgb.new_zeros((h_rgb * 2, w_rgb * 2, t))
+    raw_hwt[0::2, 0::2, :] = rgb[:, 0].permute(1, 2, 0)
+    raw_hwt[0::2, 1::2, :] = rgb[:, 1].permute(1, 2, 0)
+    raw_hwt[1::2, 0::2, :] = rgb[:, 1].permute(1, 2, 0)
+    raw_hwt[1::2, 1::2, :] = rgb[:, 2].permute(1, 2, 0)
+    return raw_hwt.contiguous()
+
+
 def _bayer_rggb_hw_to_rgb_hw3(bayer_hw: Tensor) -> Tensor:
     """Subsample one RGGB Bayer frame ``(2H, 2W)`` to ``(3, H, W)``."""
     r = bayer_hw[0::2, 0::2]

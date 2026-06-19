@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ultralytics.data.spad_packed import rgb_tchw_to_raw_hwt
 from ultralytics.quanta_neural_networks.ops.image import nearest_neighbor_inpaint
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_neural_networks.ops.array_ops import torch_quantile
@@ -119,6 +120,23 @@ class HybridSpatioTemporalEvidenceAccumulation(SpatioTemporalEvidenceAccumulatio
             align_corners=True,
         )
 
+    @staticmethod
+    def _raw_hwt_to_rgb_tchw(raw_hwt: Tensor) -> Tensor:
+        if raw_hwt.ndim != 3:
+            raise ValueError(f"Expected raw_hwt (H,W,T), got shape={tuple(raw_hwt.shape)}")
+        h, w, _ = map(int, raw_hwt.shape)
+        if h % 2 != 0 or w % 2 != 0:
+            raise ValueError(f"Expected even Bayer dimensions, got {(h, w)}")
+        r = raw_hwt[0::2, 0::2, :]
+        g = 0.5 * (raw_hwt[0::2, 1::2, :] + raw_hwt[1::2, 0::2, :])
+        b = raw_hwt[1::2, 1::2, :]
+        return torch.stack((r, g, b), dim=0).permute(3, 0, 1, 2).contiguous()
+
+    def _warp_raw_frames_in_rgb(self, raw_hwt: Tensor, flow_hw2: Tensor, gaps: Tensor, denom: float) -> Tensor:
+        rgb_tchw = self._raw_hwt_to_rgb_tchw(raw_hwt)
+        warped_rgb = self._warp_frames(rgb_tchw, flow_hw2, gaps, denom)
+        return rgb_tchw_to_raw_hwt(warped_rgb)
+
     def _fast_temporal_basis(self, photon_cube: Tensor) -> Tensor:
         h, w, t = map(int, photon_cube.shape)
         x = photon_cube.float()
@@ -138,7 +156,7 @@ class HybridSpatioTemporalEvidenceAccumulation(SpatioTemporalEvidenceAccumulatio
             y_slow = F.conv1d(support_flat, self.slow_kernel)
             return y_slow.clamp(self.eps, 1.0 - self.eps)
 
-        flow = self._resized_velocity_field((h, w), device=x.device, dtype=x.dtype)
+        flow = self._resized_velocity_field((h // 2, w // 2), device=x.device, dtype=x.dtype)
         if not bool(torch.any(flow.abs() > 1e-6)):
             support = torch.cat([slow_hist, x], dim=-1)
             support_flat = support.reshape(h * w, 1, support.shape[-1])
@@ -153,15 +171,15 @@ class HybridSpatioTemporalEvidenceAccumulation(SpatioTemporalEvidenceAccumulatio
 
         for start in range(0, support_len, self.warp_block_size):
             end = min(start + self.warp_block_size, support_len)
-            frames = support[..., start:end].permute(2, 0, 1).unsqueeze(1)
+            frames = support[..., start:end]
             gaps = (support_len - 1) - torch.arange(start, end, device=x.device)
-            warped = self._warp_frames(frames, flow, gaps, denom)
+            warped = self._warp_raw_frames_in_rgb(frames, flow, gaps, denom)
             for local_idx, support_idx in enumerate(range(start, end)):
                 t_start = max(0, support_idx - self.slow_window + 1)
                 t_end = min(support_idx, t - 1)
                 if t_start > t_end:
                     continue
-                frame = warped[local_idx, 0]
+                frame = warped[..., local_idx]
                 diff[..., t_start] += frame
                 if t_end + 1 < t:
                     diff[..., t_end + 1] -= frame
@@ -176,7 +194,7 @@ class HybridSpatioTemporalEvidenceAccumulation(SpatioTemporalEvidenceAccumulatio
             stable_support = valid_weight.sum(dim=-1)
             return (valid_weight * x).sum(dim=-1) / stable_support.clamp(min=self.eps)
 
-        flow = self._resized_velocity_field((h, w), device=x.device, dtype=x.dtype)
+        flow = self._resized_velocity_field((h // 2, w // 2), device=x.device, dtype=x.dtype)
         if not bool(torch.any(flow.abs() > 1e-6)):
             stable_support = valid_weight.sum(dim=-1)
             return (valid_weight * x).sum(dim=-1) / stable_support.clamp(min=self.eps)
@@ -185,9 +203,9 @@ class HybridSpatioTemporalEvidenceAccumulation(SpatioTemporalEvidenceAccumulatio
         denom = max(int(self.chunk_size) - 1, 1)
         for start in range(0, t, self.warp_block_size):
             end = min(start + self.warp_block_size, t)
-            frames = x[..., start:end].permute(2, 0, 1).unsqueeze(1)
+            frames = x[..., start:end]
             gaps = (t - 1) - torch.arange(start, end, device=x.device)
-            warped = self._warp_frames(frames, flow, gaps, denom).squeeze(1).permute(1, 2, 0)
+            warped = self._warp_raw_frames_in_rgb(frames, flow, gaps, denom)
             accum += (warped * valid_weight[..., start:end]).sum(dim=-1)
         stable_support = valid_weight.sum(dim=-1)
         return accum / stable_support.clamp(min=self.eps)
