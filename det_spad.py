@@ -8,6 +8,7 @@ frames with one of:
 - vel: detection-guided velocity-compensated integration
 
 - stea: STEA (causal temporal bases + KL spatio-temporal soft routing)
+- hyb: STEA with tracker-guided velocity-compensated slow branch
 
 The resulting frames are passed to an unmodified pretrained YOLO pose model.
 """
@@ -38,6 +39,7 @@ from ultralytics.data.spad_packed import (
     raw_plane_to_photon_cube,
     sum_raw_chunk_to_rgb,
 )
+from ultralytics.quanta_hyb_networks.integrator import HybridSpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_vel_networks.integrator import VelIntegrator
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
@@ -218,6 +220,24 @@ def _preprocess_stea(
     )
 
 
+def _preprocess_hyb(
+    raw_chunk: np.ndarray,
+    *,
+    packed_nch: int,
+    device: torch.device,
+    integrator: HybridSpatioTemporalEvidenceAccumulation,
+    clear_states: bool,
+    **kwargs,
+) -> torch.Tensor:
+    return integrate_raw_chunk_to_rgb(
+        integrator,
+        raw_chunk,
+        packed_nch=packed_nch,
+        device=device,
+        clear_states=clear_states,
+    )
+
+
 def _preprocess_vel(
     raw_chunk: np.ndarray,
     *,
@@ -259,13 +279,13 @@ def _get_live_tracker(model: YOLO):
     return trackers[0]
 
 
-def _set_vel_field_from_tracker(model: YOLO, integrator: VelIntegrator) -> None:
+def _set_tracker_field_on_integrator(model: YOLO, integrator) -> None:
     tracker = _get_live_tracker(model)
     if tracker is None:
         integrator.set_velocity_field(None, source_space="rgb")
         return
     if not hasattr(tracker, "last_velocity_field"):
-        raise TypeError("The 'vel' preprocessor requires a tracker that exposes 'last_velocity_field'.")
+        raise TypeError("This preprocessor requires a tracker that exposes 'last_velocity_field'.")
     integrator.set_velocity_field(getattr(tracker, "last_velocity_field", None), source_space="rgb")
 
 
@@ -454,6 +474,7 @@ def _preprocess_chunk(
     device: torch.device,
     first_chunk: bool,
     ppb: PerPixelBayesian | None,
+    hyb: HybridSpatioTemporalEvidenceAccumulation | None,
     stea: SpatioTemporalEvidenceAccumulation | None,
     vel: VelIntegrator | None,
 ) -> torch.Tensor:
@@ -475,6 +496,14 @@ def _preprocess_chunk(
             integrator=stea,
             clear_states=first_chunk,
         )
+    if name == "hyb":
+        return _preprocess_hyb(
+            raw_chunk,
+            packed_nch=packed_nch,
+            device=device,
+            integrator=hyb,
+            clear_states=first_chunk,
+        )
     return _preprocess_vel(
         raw_chunk, packed_nch=packed_nch, device=device, integrator=vel, clear_states=first_chunk
     )
@@ -486,7 +515,7 @@ def main():
     ap.add_argument("--in_glob", type=str, default=None, help="Optional glob for a root folder containing sample directories")
     ap.add_argument("--ckpt", type=str, required=True, help="Standard pretrained YOLO pose checkpoint")
     ap.add_argument("--save_dir", type=str, required=True)
-    ap.add_argument("--pre", type=str, default="sum,ppb,vel", help="Comma-separated preprocessors: sum,ppb,vel,stea")
+    ap.add_argument("--pre", type=str, default="sum,ppb,vel", help="Comma-separated preprocessors: sum,ppb,vel,stea,hyb")
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--chunk_stride", type=int, default=0)
     ap.add_argument("--device", type=str, default="")
@@ -496,7 +525,7 @@ def main():
         type=str,
         default="bytetrack",
         choices=["bytetrack", "botsort", "spad_tracker"],
-        help="Default tracker for `sum`, `ppb`, and `stea`; `vel` ignores this and always uses `spad_tracker`.",
+        help="Default tracker for `sum`, `ppb`, and `stea`; `vel` and `hyb` ignore this and always use `spad_tracker`.",
     )
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     # PerPixelBayesian preprocessor
@@ -534,6 +563,22 @@ def main():
         default=3,
         help="Deprecated; ignored by STEA",
     )
+    # Hybrid STEA+velocity preprocessor
+    ap.add_argument("--hyb_fast_window", type=int, default=64, help="Fast Gamma temporal basis length for the hybrid STEA basis")
+    ap.add_argument("--hyb_slow_window", type=int, default=128, help="Slow boxcar temporal basis length for the hybrid STEA basis")
+    ap.add_argument("--hyb_temporal_window", type=int, default=5, help="Causal evidence time blur window for the hybrid STEA basis")
+    ap.add_argument("--hyb_fast_tau", type=float, default=6.0, help="Gamma kernel tau for the hybrid fast basis")
+    ap.add_argument("--hyb_motion_sharpness", type=float, default=60.0, help="Sigmoid sharpness for hybrid KL motion probability")
+    ap.add_argument("--hyb_motion_threshold", type=float, default=0.05, help="KL threshold for hybrid motion probability")
+    ap.add_argument("--hyb_eps", type=float, default=1e-5, help="Clamp epsilon for hybrid Bernoulli rates")
+    ap.add_argument("--hyb_blend_const", type=float, default=16.0, help="C in W_mean=L/(L+C) for hybrid stable mean confidence")
+    ap.add_argument("--hyb_kernel_size", type=int, default=None, help="Deprecated alias for --hyb_slow_window")
+    ap.add_argument("--hyb_prior_strength", type=float, default=1.0, help="Deprecated; ignored by the hybrid STEA")
+    ap.add_argument("--hyb_gating_tau", type=float, default=0.1, help="Deprecated; ignored by the hybrid STEA")
+    ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--hyb_quantile", type=float, default=1.0)
+    ap.add_argument("--hyb_max_filter_size", type=int, default=3, help="Deprecated; ignored by the hybrid STEA")
+    ap.add_argument("--hyb_warp_block_size", type=int, default=16, help="Temporal block size for memory-aware hybrid photon warping")
     # VelIntegrator preprocessor
     ap.add_argument("--vel_max_shift", type=int, default=16)
     ap.add_argument("--vel_patch_size", type=int, default=0, help="Deprecated; ignored by the dense-field integrator")
@@ -577,12 +622,13 @@ def main():
         raise FileNotFoundError(f"No inputs matched: {in_path}/{args.in_glob}")
 
     preprocessors = [x.strip() for x in args.pre.split(",") if x.strip()]
-    invalid = sorted(set(preprocessors) - {"sum", "ppb", "vel", "stea"})
+    invalid = sorted(set(preprocessors) - {"sum", "ppb", "vel", "stea", "hyb"})
     if invalid:
         raise ValueError(f"Unsupported preprocessors: {invalid}")
     device = _resolve_device(args.device)
     default_tracker_cfg = f"{args.tracker}.yaml"
     vel_tracker_cfg = "spad_tracker.yaml"
+    hyb_tracker_cfg = "spad_tracker.yaml"
 
     models = {name: YOLO(args.ckpt) for name in preprocessors}
     ppb = (
@@ -606,6 +652,25 @@ def main():
             quantile=float(args.vel_quantile),
         ).to(device)
         if "vel" in preprocessors
+        else None
+    )
+    hyb = (
+        HybridSpatioTemporalEvidenceAccumulation(
+            chunk_size=int(args.chunk_size),
+            fast_window=int(args.hyb_fast_window),
+            slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
+            temporal_window=int(args.hyb_temporal_window),
+            fast_tau=float(args.hyb_fast_tau),
+            motion_sharpness=float(args.hyb_motion_sharpness),
+            motion_threshold=float(args.hyb_motion_threshold),
+            eps=float(args.hyb_eps),
+            stable_prior=float(args.hyb_blend_const),
+            subsampling=int(args.chunk_size),
+            normalize=bool(args.hyb_normalize),
+            quantile=float(args.hyb_quantile),
+            warp_block_size=int(args.hyb_warp_block_size),
+        ).to(device)
+        if "hyb" in preprocessors
         else None
     )
     stea = (
@@ -635,6 +700,8 @@ def main():
             _reset_tracker(model)
         if vel is not None:
             vel.reset()
+        if hyb is not None:
+            hyb.reset()
 
         sources = list(_iter_sources(sample_path))
         for video_idx, source in enumerate(tqdm(sources, desc=f"Processing [{sample_name}]")):
@@ -644,6 +711,9 @@ def main():
             if "vel" in preprocessors:
                 vel.reset()
                 _reset_tracker(models["vel"])
+            if "hyb" in preprocessors:
+                hyb.reset()
+                _reset_tracker(models["hyb"])
 
             first_chunk = True
             cube_idx = 0
@@ -669,6 +739,7 @@ def main():
                                 device=device,
                                 first_chunk=first_chunk,
                                 ppb=ppb,
+                                hyb=hyb,
                                 stea=stea,
                                 vel=vel,
                             )
@@ -688,6 +759,7 @@ def main():
                             device=device,
                             first_chunk=first_chunk,
                             ppb=ppb,
+                            hyb=hyb,
                             stea=stea,
                             vel=vel,
                         )
@@ -698,7 +770,11 @@ def main():
                         percentile=float(args.vis_percentile),
                         gamma=float(args.vis_gamma),
                     )
-                    tracker_cfg = vel_tracker_cfg if name == "vel" else default_tracker_cfg
+                    tracker_cfg = default_tracker_cfg
+                    if name == "vel":
+                        tracker_cfg = vel_tracker_cfg
+                    elif name == "hyb":
+                        tracker_cfg = hyb_tracker_cfg
                     results = _run_detector_on_frames(
                         models[name],
                         frames_bgr,
@@ -718,7 +794,9 @@ def main():
                         cv2.imwrite(str(overlay_path), _draw_results(frame_bgr, result))
                         frame_idx_by_pre[name] += 1
                     if name == "vel":
-                        _set_vel_field_from_tracker(models["vel"], vel)
+                        _set_tracker_field_on_integrator(models["vel"], vel)
+                    elif name == "hyb":
+                        _set_tracker_field_on_integrator(models["hyb"], hyb)
 
                 first_chunk = False
                 cube_idx += 1

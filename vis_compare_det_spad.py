@@ -1,5 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Stitch `det_spad.py` outputs (sum / ppb / vel / stea) into side-by-side comparison images.
+"""Stitch `det_spad.py` outputs (sum / ppb / vel / stea / hyb) into side-by-side comparison images.
 
 Expected layout from `det_spad.py`::
 
@@ -27,17 +27,18 @@ import numpy as np
 from tqdm import tqdm
 
 FNAME_RE = re.compile(
-    r"^(?P<stem>cube\d+_t\d+_\d+_frame\d+)_(?P<pre>sum|ppb|vel|stea)_(?P<kind>recon|overlay)\.png$",
+    r"^(?P<stem>cube\d+_t\d+_\d+_frame\d+)_(?P<pre>sum|ppb|vel|stea|hyb)_(?P<kind>recon|overlay)\.png$",
     re.IGNORECASE,
 )
 
-ALL_METHODS = ("sum", "ppb", "vel", "stea")
+ALL_METHODS = ("sum", "ppb", "vel", "stea", "hyb")
 
 LABEL_COLORS = {
     "sum": (0, 255, 255),
     "ppb": (0, 255, 0),
     "vel": (255, 128, 0),
     "stea": (255, 0, 255),
+    "hyb": (128, 0, 255),
 }
 
 
@@ -65,7 +66,7 @@ def _parse_args() -> argparse.Namespace:
         "--pre",
         type=str,
         default=",".join(ALL_METHODS),
-        help="Comma-separated methods in left-to-right display order: `sum,ppb,vel,stea`",
+        help="Comma-separated methods in left-to-right display order: `sum,ppb,vel,stea,hyb`",
     )
     ap.add_argument("--kinds", type=str, default="recon,overlay", help="Comma-separated output kinds: `recon,overlay`")
     ap.add_argument("--gap", type=int, default=8, help="Pixels between panels")
