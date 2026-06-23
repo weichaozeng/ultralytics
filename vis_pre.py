@@ -56,13 +56,8 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--bitdim", type=int, default=2, help="0-based axis to unpack with np.unpackbits")
     ap.add_argument("--expected_w", type=int, default=512, help="Crop unpacked bit dimension to this width")
     ap.add_argument("--bitorder", type=str, default="big", choices=["big", "little"])
-    ap.add_argument("--transpose_hw", action="store_true", help="Swap H/W after unpack for debugging geometry")
-    ap.add_argument("--flip_x", action="store_true", help="Flip unpacked frames left-right for debugging geometry")
-    ap.add_argument("--flip_y", action="store_true", help="Flip unpacked frames top-bottom for debugging geometry")
-    ap.add_argument("--dump_unpacked", action="store_true", help="Save unpacked frames before any preprocessing")
-    ap.add_argument("--dump_only", action="store_true", help="Only dump unpacked frames, skip preprocessors")
-    ap.add_argument("--t0", type=int, default=0, help="First frame index to dump when --dump_unpacked is set")
-    ap.add_argument("--max_dump_frames", type=int, default=8, help="Max unpacked frames to dump")
+    ap.add_argument("--flip_x", action="store_true", help="Flip frames left-right before preprocessing")
+    ap.add_argument("--flip_y", action="store_true", help="Flip frames top-bottom before preprocessing")
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--chunk_stride", type=int, default=0, help="0 means equal to chunk_size")
     ap.add_argument("--device", type=str, default="")
@@ -171,21 +166,13 @@ def _infer_input_kind(unpacked: np.ndarray) -> str:
     )
 
 
-def _apply_spatial_debug_ops(
+def _apply_spatial_preprocess_ops(
     unpacked: np.ndarray,
     *,
-    transpose_hw: bool,
     flip_x: bool,
     flip_y: bool,
 ) -> np.ndarray:
     out = unpacked
-    if transpose_hw:
-        if out.ndim == 3:
-            out = np.transpose(out, (0, 2, 1))
-        elif out.ndim == 4:
-            out = np.transpose(out, (0, 2, 1, 3))
-        else:
-            raise ValueError(f"Unsupported ndim for transpose_hw: {out.ndim}")
     if flip_x:
         out = np.flip(out, axis=2)
     if flip_y:
@@ -452,40 +439,6 @@ def _frames_tensor_to_bgr_u8(
     return out
 
 
-def _unpacked_frame_to_bgr(frame: np.ndarray, *, kind: str) -> np.ndarray:
-    if kind == "single":
-        if frame.ndim != 2:
-            raise ValueError(f"Expected single frame HW, got {frame.shape}")
-        u8 = (frame.astype(np.uint8) * 255) if frame.dtype != np.uint8 or frame.max() <= 1 else frame.astype(np.uint8)
-        return np.repeat(u8[:, :, None], 3, axis=2)
-
-    if frame.ndim != 3 or frame.shape[2] != 3:
-        raise ValueError(f"Expected RGB-plane frame HWC, got {frame.shape}")
-    rgb = (frame.astype(np.uint8) * 255) if frame.max() <= 1 else frame.astype(np.uint8)
-    return np.ascontiguousarray(rgb[:, :, ::-1])
-
-
-def _dump_unpacked_frames(
-    unpacked: np.ndarray,
-    *,
-    kind: str,
-    out_dir: Path,
-    t0: int,
-    max_dump_frames: int,
-) -> int:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    n = int(unpacked.shape[0])
-    start = max(int(t0), 0)
-    stop = min(start + max(int(max_dump_frames), 0), n)
-    n_written = 0
-    for ti in range(start, stop):
-        frame = unpacked[ti] if kind == "single" else unpacked[ti, :, :, :]
-        bgr = _unpacked_frame_to_bgr(frame, kind=kind)
-        cv2.imwrite(str(out_dir / f"t{ti:06d}_unpacked.png"), bgr)
-        n_written += 1
-    return n_written
-
-
 def _label_panel(img_bgr: np.ndarray, text: str, color: tuple[int, int, int], label_h: int, font_scale: float) -> np.ndarray:
     h, w = img_bgr.shape[:2]
     header = np.zeros((label_h, w, 3), dtype=np.uint8)
@@ -573,9 +526,8 @@ def main() -> None:
         raise ValueError("No preprocessors selected")
 
     unpacked = _load_unpacked(npy, bitdim=int(args.bitdim), expected_w=int(args.expected_w), bitorder=str(args.bitorder))
-    unpacked = _apply_spatial_debug_ops(
+    unpacked = _apply_spatial_preprocess_ops(
         unpacked,
-        transpose_hw=bool(args.transpose_hw),
         flip_x=bool(args.flip_x),
         flip_y=bool(args.flip_y),
     )
@@ -597,26 +549,7 @@ def main() -> None:
     print(f"unpacked: shape={unpacked.shape} kind={kind}")
     print(f"raw_video: shape={raw_video.shape}")
     print(f"writing outputs to: {out_dir}")
-    print(
-        "debug_ops:"
-        f" bitorder={args.bitorder}"
-        f" transpose_hw={bool(args.transpose_hw)}"
-        f" flip_x={bool(args.flip_x)}"
-        f" flip_y={bool(args.flip_y)}"
-    )
-
-    if args.dump_unpacked:
-        dump_dir = args.save_dir / sample / "unpacked_debug"
-        dumped = _dump_unpacked_frames(
-            unpacked,
-            kind=kind,
-            out_dir=dump_dir,
-            t0=int(args.t0),
-            max_dump_frames=int(args.max_dump_frames),
-        )
-        print(f"Dumped {dumped} unpacked frame(s) to {dump_dir}")
-        if args.dump_only:
-            return
+    print(f"preprocess flips: flip_x={bool(args.flip_x)} flip_y={bool(args.flip_y)} bitorder={args.bitorder}")
 
     first_chunk = True
     frame_idx = 0
