@@ -564,7 +564,7 @@ def main():
         help="Deprecated; ignored by STEA",
     )
     # Hybrid STEA+velocity preprocessor
-    ap.add_argument("--hyb_fast_window", type=int, default=64, help="Fast Gamma temporal basis length for the hybrid STEA basis")
+    ap.add_argument("--hyb_fast_window", type=int, default=16, help="Fast Gamma temporal basis length for the hybrid STEA basis")
     ap.add_argument("--hyb_slow_window", type=int, default=128, help="Slow boxcar temporal basis length for the hybrid STEA basis")
     ap.add_argument("--hyb_temporal_window", type=int, default=5, help="Causal evidence time blur window for the hybrid STEA basis")
     ap.add_argument("--hyb_fast_tau", type=float, default=6.0, help="Gamma kernel tau for the hybrid fast basis")
