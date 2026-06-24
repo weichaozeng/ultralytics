@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from ultralytics.data.qnn_spad_dataset import QNNSpadPoseDataset
+from ultralytics.data.qnn_spad_dataset import QNNSpadPoseDataset, load_visionsim_split_json
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import PoseModel, QNNPoseModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, nms
@@ -158,35 +158,34 @@ class QNNPoseTrainer(PoseTrainer):
 
     def get_dataset(self) -> dict[str, Any]:
         """Return a minimal dataset dictionary for QNN SPAD training."""
-        qnn_gt_root = getattr(self.args, "qnn_gt_root", None)
-        qnn_spad_root = getattr(self.args, "qnn_spad_root", None)
-        if qnn_gt_root and qnn_spad_root:
+        qnn_train_json = getattr(self.args, "qnn_train_json", None)
+        qnn_test_json = getattr(self.args, "qnn_test_json", None)
+        if qnn_train_json and qnn_test_json:
             return {
-                "train": qnn_gt_root,
-                "val": qnn_gt_root,
+                "train": qnn_train_json,
+                "val": qnn_test_json,
                 "nc": 2,
                 "names": {0: "left_hand", 1: "right_hand"},
                 "channels": 3,
                 "kpt_shape": [21, 3],
-                "qnn_gt_root": qnn_gt_root,
-                "qnn_spad_root": qnn_spad_root,
+                "qnn_train_json": qnn_train_json,
+                "qnn_test_json": qnn_test_json,
             }
         return super().get_dataset()
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
-        """Build QNN SPAD pose dataset for train/val."""
-        gt_root = getattr(self.args, "qnn_gt_root", None) or self.data.get("qnn_gt_root") or img_path
-        spad_root = getattr(self.args, "qnn_spad_root", None) or self.data.get("qnn_spad_root")
-        if not spad_root:
-            raise ValueError("QNNPoseTrainer requires `qnn_spad_root` in args or data yaml.")
+        """Build QNN SPAD pose dataset for train/val from VisionSIM split JSON."""
+        json_path = getattr(self.args, "qnn_train_json", None) or self.data.get("qnn_train_json")
+        if mode != "train":
+            json_path = getattr(self.args, "qnn_test_json", None) or self.data.get("qnn_test_json")
+        if not json_path:
+            raise ValueError("QNNPoseTrainer requires `qnn_train_json` and `qnn_test_json` in args or data yaml.")
+
+        samples = load_visionsim_split_json(json_path)
+        LOGGER.info(f"Loaded {len(samples)} samples from {json_path} for mode={mode!r}")
 
         return QNNSpadPoseDataset(
-            gt_root=gt_root,
-            spad_root=spad_root,
-            split="train" if mode == "train" else "val",
-            test_keywords=getattr(self.args, "qnn_test_keywords", self.data.get("qnn_test_keywords", None)),
-            test_fraction=float(getattr(self.args, "qnn_test_fraction", self.data.get("qnn_test_fraction", 0.2))),
-            split_seed=int(getattr(self.args, "qnn_split_seed", self.data.get("qnn_split_seed", 0))),
+            samples=samples,
             output_frames=int(getattr(self.args, "qnn_output_frames", self.data.get("qnn_output_frames", 4))),
             spad_per_gt=int(getattr(self.args, "qnn_spad_per_gt", self.data.get("qnn_spad_per_gt", 64))),
             spad_step=int(getattr(self.args, "qnn_subsampling", self.data.get("qnn_subsampling", 64))),

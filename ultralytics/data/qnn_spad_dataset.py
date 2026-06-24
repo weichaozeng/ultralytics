@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,11 +19,55 @@ class QNNWindow:
     """A fixed temporal training window inside one video."""
 
     name: str
-    gt_dir: Path
+    gt_ann_path: Path
     spad_path: Path
     gt_start: int
     output_frames: int
     spad_step: int
+
+
+def load_visionsim_split_json(path: str | Path) -> list[dict[str, str]]:
+    """Load VisionSIM train/test split JSON produced by build_visionsim_split.py."""
+    json_path = Path(path)
+    if not json_path.is_file():
+        raise FileNotFoundError(f"Split JSON not found: {json_path}")
+
+    with json_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    raw_samples = payload.get("samples")
+    if not isinstance(raw_samples, dict) or not raw_samples:
+        raise ValueError(f"No samples found in split JSON: {json_path}")
+
+    records: list[dict[str, str]] = []
+    for sample_id, entry in sorted(raw_samples.items()):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Invalid sample entry for {sample_id!r} in {json_path}")
+        gt = entry.get("gt")
+        spad = entry.get("spad")
+        if not gt or not spad:
+            raise ValueError(f"Sample {sample_id!r} must include gt and spad paths in {json_path}")
+
+        gt_path = Path(gt)
+        spad_path = Path(spad)
+        if not gt_path.is_file():
+            raise FileNotFoundError(f"GT annotation not found for {sample_id!r}: {gt_path}")
+        if not spad_path.is_file():
+            raise FileNotFoundError(f"SPAD frames not found for {sample_id!r}: {spad_path}")
+
+        record = {
+            "id": str(sample_id),
+            "gt": str(gt_path.resolve()),
+            "spad": str(spad_path.resolve()),
+            "version": str(entry.get("version", "")),
+            "name": str(entry.get("name", Path(sample_id).name)),
+        }
+        rgb = entry.get("rgb")
+        if rgb:
+            record["rgb"] = str(Path(rgb).resolve())
+        records.append(record)
+
+    return records
 
 
 class QNNSpadPoseDataset(Dataset):
@@ -34,13 +77,8 @@ class QNNSpadPoseDataset(Dataset):
 
     def __init__(
         self,
-        gt_root: str | Path,
-        spad_root: str | Path,
+        samples: list[dict[str, str]],
         *,
-        split: str = "train",
-        test_keywords: str | list[str] | tuple[str, ...] | None = None,
-        test_fraction: float = 0.2,
-        split_seed: int = 0,
         output_frames: int = 4,
         spad_per_gt: int = 64,
         spad_step: int | None = None,
@@ -48,12 +86,9 @@ class QNNSpadPoseDataset(Dataset):
         image_size: int = 512,
         packed_ch_order: str = "RGB",
     ):
-        self.gt_root = Path(gt_root)
-        self.spad_root = Path(spad_root)
-        self.split = split
-        self.test_keywords = self._parse_keywords(test_keywords)
-        self.test_fraction = float(test_fraction)
-        self.split_seed = int(split_seed)
+        if not samples:
+            raise ValueError("samples must be a non-empty list")
+
         self.output_frames = int(output_frames)
         self.spad_per_gt = int(spad_per_gt)
         self.spad_step = int(spad_step or spad_per_gt)
@@ -68,43 +103,15 @@ class QNNSpadPoseDataset(Dataset):
         if self.spad_step <= 0:
             raise ValueError(f"spad_step must be > 0, got {self.spad_step}")
 
-        self.video_names = self._select_video_names()
+        self.sample_records = {rec["id"]: rec for rec in samples}
+        self.video_names = sorted(self.sample_records)
         self.annotations = {name: self._load_annotation(name) for name in self.video_names}
         self.windows = self._build_windows()
         if not self.windows:
-            raise RuntimeError(f"No QNN SPAD windows found for split={split!r}")
-
-    @staticmethod
-    def _parse_keywords(keywords) -> tuple[str, ...]:
-        if keywords is None:
-            return ()
-        if isinstance(keywords, str):
-            return tuple(x.strip() for x in keywords.split(",") if x.strip())
-        return tuple(str(x).strip() for x in keywords if str(x).strip())
-
-    def _select_video_names(self) -> list[str]:
-        gt_names = {p.name for p in self.gt_root.iterdir() if p.is_dir()}
-        spad_names = {p.name for p in self.spad_root.iterdir() if p.is_dir() and (p / "frames.npy").exists()}
-        names = sorted(gt_names & spad_names)
-
-        if self.test_keywords:
-            test_names = [n for n in names if any(k in n for k in self.test_keywords)]
-        else:
-            rng = random.Random(self.split_seed)
-            shuffled = names[:]
-            rng.shuffle(shuffled)
-            n_test = max(1, int(round(len(shuffled) * self.test_fraction))) if shuffled else 0
-            test_names = sorted(shuffled[:n_test])
-
-        test_set = set(test_names)
-        if self.split in {"val", "test"}:
-            return sorted(test_set)
-        if self.split == "train":
-            return [n for n in names if n not in test_set]
-        raise ValueError(f"Unsupported split: {self.split}")
+            raise RuntimeError(f"No QNN SPAD windows found for {len(self.video_names)} samples")
 
     def _load_annotation(self, name: str) -> dict[str, Any]:
-        path = self.gt_root / name / "hand_ann.json"
+        path = Path(self.sample_records[name]["gt"])
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
 
@@ -117,12 +124,14 @@ class QNNSpadPoseDataset(Dataset):
             max_start = int(np.floor((n_gt - 1) - last_gt_offset))
             if max_start < 0:
                 continue
+            spad_path = Path(self.sample_records[name]["spad"])
+            gt_ann_path = Path(self.sample_records[name]["gt"])
             for gt_start in range(0, max_start + 1, self.stride_frames):
                 windows.append(
                     QNNWindow(
                         name=name,
-                        gt_dir=self.gt_root / name,
-                        spad_path=self.spad_root / name / "frames.npy",
+                        gt_ann_path=gt_ann_path,
+                        spad_path=spad_path,
                         gt_start=gt_start,
                         output_frames=self.output_frames,
                         spad_step=self.spad_step,

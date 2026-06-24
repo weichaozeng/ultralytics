@@ -26,6 +26,9 @@ from ultralytics.models.yolo.pose import QNNPoseTrainer
 from ultralytics.utils import DEFAULT_CFG_DICT, RANK, nms
 
 
+DEFAULT_TRAIN_JSON = "/home/zvc/Data/visionsim/outputs/train.json"
+DEFAULT_TEST_JSON = "/home/zvc/Data/visionsim/outputs/test.json"
+
 BONE_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -215,16 +218,16 @@ def parse_args():
     )
     ap.add_argument("--ckpt", type=str, required=True, help="Path to pretrained YOLO pose checkpoint (.pt)")
     ap.add_argument(
-        "--gt-root",
+        "--train-json",
         type=str,
-        required=True,
-        help="VisionSIM GT root; each video subdir must contain hand_ann.json",
+        default=DEFAULT_TRAIN_JSON,
+        help="VisionSIM train split JSON from build_visionsim_split.py",
     )
     ap.add_argument(
-        "--spad-root",
+        "--test-json",
         type=str,
-        required=True,
-        help="VisionSIM packed SPAD root; each video subdir must contain frames.npy",
+        default=DEFAULT_TEST_JSON,
+        help="VisionSIM test split JSON from build_visionsim_split.py",
     )
     ap.add_argument("--project", type=str, default="Runs/qnn_pose", help="Ultralytics project directory for runs")
     ap.add_argument("--name", type=str, default="debug", help="Run name under --project")
@@ -250,12 +253,6 @@ def parse_args():
         "--val",
         action="store_true",
         help="Also run the built-in Ultralytics validator (experimental for QNN batches)",
-    )
-    ap.add_argument(
-        "--test-keywords",
-        type=str,
-        default="white-room",
-        help="Comma-separated substrings; matching video names go to val/test split",
     )
     ap.add_argument(
         "--qnn-output-frames",
@@ -361,6 +358,13 @@ def parse_args():
 
 
 def _validate_args(ap: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    train_json = Path(args.train_json)
+    test_json = Path(args.test_json)
+    if not train_json.is_file():
+        ap.error(f"--train-json not found: {train_json}")
+    if not test_json.is_file():
+        ap.error(f"--test-json not found: {test_json}")
+
     device = str(args.device).strip().lower()
     if device not in {"cpu", "mps"} and "," in device:
         n_gpus = len([x for x in device.split(",") if x.strip()])
@@ -389,9 +393,8 @@ def main():
     cfg = dict(DEFAULT_CFG_DICT)
     cfg.update(
         {
-            "qnn_gt_root": args.gt_root,
-            "qnn_spad_root": args.spad_root,
-            "qnn_test_keywords": args.test_keywords,
+            "qnn_train_json": args.train_json,
+            "qnn_test_json": args.test_json,
             "qnn_output_frames": args.qnn_output_frames,
             "qnn_stride_frames": args.qnn_stride_frames,
             "qnn_spad_per_gt": args.qnn_spad_per_gt,

@@ -534,7 +534,7 @@ def main():
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
     # STEA preprocessor
-    ap.add_argument("--stea_fast_window", type=int, default=64, help="Fast Gamma temporal basis length for STEA")
+    ap.add_argument("--stea_fast_window", type=int, default=16, help="Fast Gamma temporal basis length for STEA")
     ap.add_argument("--stea_slow_window", type=int, default=128, help="Slow boxcar temporal basis length for STEA")
     ap.add_argument("--stea_temporal_window", type=int, default=5, help="Causal evidence time blur window for STEA")
     ap.add_argument("--stea_fast_tau", type=float, default=6.0, help="Gamma kernel tau for the fast STEA basis")
