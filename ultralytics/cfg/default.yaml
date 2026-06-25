@@ -134,7 +134,7 @@ cfg: # (str, optional) path to a config.yaml that overrides defaults
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: botsort.yaml # (str) tracker config file: botsort.yaml or bytetrack.yaml
 
-# SPAD/QNN (custom) ---------------------------------------------------------------------------------------------------
+# SPAD (custom) -------------------------------------------------------------------------------------------------------
 spad: False # (bool) enable SPAD photon-cube preprocessing pipeline
 spad_pre: perpixelbayesian # (str) SPAD preprocessor name, e.g. 'perpixelbayesian'
 spad_clear_states: False # (bool) reset SPAD preprocessor state at sequence start

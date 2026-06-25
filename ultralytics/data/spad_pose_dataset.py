@@ -1,4 +1,4 @@
-"""QNN SPAD pose dataset for VisionSIM hand annotations."""
+"""SPAD pose dataset for VisionSIM hand annotations."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from ultralytics.data.spad_packed import infer_packed_nch, packed_frames_to_raw_
 
 
 @dataclass(frozen=True)
-class QNNWindow:
+class SpadWindow:
     """A fixed temporal training window inside one video."""
 
     name: str
@@ -70,7 +70,7 @@ def load_visionsim_split_json(path: str | Path) -> list[dict[str, str]]:
     return records
 
 
-class QNNSpadPoseDataset(Dataset):
+class SpadPoseDataset(Dataset):
     """Load fixed windows from packed SPAD videos and timestamp-aligned hand pose labels."""
 
     HAND_TO_CLASS = {"left_hand": 0, "right_hand": 1}
@@ -80,7 +80,7 @@ class QNNSpadPoseDataset(Dataset):
         samples: list[dict[str, str]],
         *,
         output_frames: int = 4,
-        spad_per_gt: int = 64,
+        spad_bins_per_gt: int = 64,
         spad_step: int | None = None,
         stride_frames: int | None = None,
         image_size: int = 512,
@@ -90,16 +90,16 @@ class QNNSpadPoseDataset(Dataset):
             raise ValueError("samples must be a non-empty list")
 
         self.output_frames = int(output_frames)
-        self.spad_per_gt = int(spad_per_gt)
-        self.spad_step = int(spad_step or spad_per_gt)
+        self.spad_bins_per_gt = int(spad_bins_per_gt)
+        self.spad_step = int(spad_step or spad_bins_per_gt)
         self.stride_frames = int(stride_frames or output_frames)
         self.image_size = int(image_size)
         self.packed_ch_order = packed_ch_order.upper()
 
         if self.output_frames <= 0:
             raise ValueError(f"output_frames must be > 0, got {self.output_frames}")
-        if self.spad_per_gt <= 0:
-            raise ValueError(f"spad_per_gt must be > 0, got {self.spad_per_gt}")
+        if self.spad_bins_per_gt <= 0:
+            raise ValueError(f"spad_bins_per_gt must be > 0, got {self.spad_bins_per_gt}")
         if self.spad_step <= 0:
             raise ValueError(f"spad_step must be > 0, got {self.spad_step}")
 
@@ -108,19 +108,19 @@ class QNNSpadPoseDataset(Dataset):
         self.annotations = {name: self._load_annotation(name) for name in self.video_names}
         self.windows = self._build_windows()
         if not self.windows:
-            raise RuntimeError(f"No QNN SPAD windows found for {len(self.video_names)} samples")
+            raise RuntimeError(f"No SPAD pose windows found for {len(self.video_names)} samples")
 
     def _load_annotation(self, name: str) -> dict[str, Any]:
         path = Path(self.sample_records[name]["gt"])
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _build_windows(self) -> list[QNNWindow]:
-        windows: list[QNNWindow] = []
+    def _build_windows(self) -> list[SpadWindow]:
+        windows: list[SpadWindow] = []
         for name in self.video_names:
             ann = self.annotations[name]
             n_gt = len(ann)
-            last_gt_offset = self.output_frames * self.spad_step / self.spad_per_gt
+            last_gt_offset = self.output_frames * self.spad_step / self.spad_bins_per_gt
             max_start = int(np.floor((n_gt - 1) - last_gt_offset))
             if max_start < 0:
                 continue
@@ -128,7 +128,7 @@ class QNNSpadPoseDataset(Dataset):
             gt_ann_path = Path(self.sample_records[name]["gt"])
             for gt_start in range(0, max_start + 1, self.stride_frames):
                 windows.append(
-                    QNNWindow(
+                    SpadWindow(
                         name=name,
                         gt_ann_path=gt_ann_path,
                         spad_path=spad_path,
@@ -159,8 +159,8 @@ class QNNSpadPoseDataset(Dataset):
             "resized_shape": (self.image_size, self.image_size),
         }
 
-    def _load_raw_window(self, window: QNNWindow) -> np.ndarray:
-        spad_start = window.gt_start * self.spad_per_gt
+    def _load_raw_window(self, window: SpadWindow) -> np.ndarray:
+        spad_start = window.gt_start * self.spad_bins_per_gt
         spad_len = window.output_frames * window.spad_step
         spad_end = spad_start + spad_len
 
@@ -173,12 +173,12 @@ class QNNSpadPoseDataset(Dataset):
         raw = packed_frames_to_raw_video(packed, ch_order=self.packed_ch_order)
         return raw.astype(np.uint8, copy=False), packed_nch
 
-    def _labels_for_window(self, window: QNNWindow):
+    def _labels_for_window(self, window: SpadWindow):
         ann = self.annotations[window.name]
         cls_ll, bbox_ll, kpt_ll, batch_idx_ll = [], [], [], []
 
         for out_i in range(window.output_frames):
-            gt_time = window.gt_start + ((out_i + 1) * window.spad_step / self.spad_per_gt)
+            gt_time = window.gt_start + ((out_i + 1) * window.spad_step / self.spad_bins_per_gt)
             for hand_name, cls_id in self.HAND_TO_CLASS.items():
                 hand = self._interpolate_hand_annotation(ann, gt_time, hand_name)
                 if not hand:

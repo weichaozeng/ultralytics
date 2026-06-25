@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Compare SPAD preprocessors before a standard YOLO pose detector.
 
-This script does not use QNNPoseModel. It converts SPAD chunks into RGB-like
+This script does not use the end-to-end SPAD pose model. It converts SPAD chunks into RGB-like
 frames with one of:
 - sum: temporal mean over the chunk
 - ppb: PerPixelBayesian reconstruction

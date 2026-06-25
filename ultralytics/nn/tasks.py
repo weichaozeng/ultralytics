@@ -591,21 +591,19 @@ class PoseModel(DetectionModel):
         return v8PoseLoss(self)
 
 
-class QNNPoseModel(PoseModel):
-    """Pose model with QNN preprocessing hooks for SPAD videos.
+class SpadPoseModel(PoseModel):
+    """Pose model with SPAD preprocessing hooks for raw SPAD videos.
 
     This subclass keeps the original YOLO pose layers in ``self.model`` unchanged so pretrained pose checkpoints can
-    still load into the same ``model.*`` parameter names. QNN modules live outside the detector graph and are wired into
+        still load into the same ``model.*`` parameter names. SPAD modules live outside the detector graph and are wired into
     the forward path by later steps.
     """
 
-    # Default insertion points for the inspected detector:
-    #   0 Conv  -> 48 channels
-    #   2 C2f   -> 96 channels
-    #   4 C2f   -> 192 channels
-    #   6 C2f   -> 384 channels
-    # This mirrors the QNNS PhotonEncoder pattern: initial conv projection, SSD, stage, SSD, stage, ...
-    DEFAULT_SSD_AFTER_LAYERS = (0, 2, 4, 6)
+    # Default detector-scale insertion points for YOLO11 pose:
+    #   16 -> P3/8
+    #   19 -> P4/16
+    #   22 -> P5/32
+    DEFAULT_PLUGIN_LAYERS = (16, 19, 22)
 
     def __init__(
         self,
@@ -614,52 +612,69 @@ class QNNPoseModel(PoseModel):
         nc=None,
         data_kpt_shape=(None, None),
         verbose=True,
-        qnn_enabled=True,
-        qnn_integrator_kwargs=None,
-        qnn_ssd_after_layers=None,
-        qnn_ssd_state_dim=8,
-        qnn_ssd_head_divisor=4,
-        qnn_ssd_kwargs=None,
+        spad_enabled=True,
+        preprocessor="ppb",
+        preprocessor_kwargs=None,
+        plugin="temporal_ssd",
+        plugin_layers=None,
+        temporal_core="ssd",
+        ssd_state_dim=8,
+        ssd_head_divisor=4,
+        ssd_kwargs=None,
+        spatial_reduce_ratio=2,
+        spatial_kernel_size=3,
+        plugin_alpha_init=0.0,
     ):
-        """Initialize a QNN-augmented YOLO pose model.
+        """Initialize a SPAD-augmented YOLO pose model.
 
-        Args mirror ``PoseModel`` and add QNN-specific configuration. ``qnn_ssd_after_layers`` contains YOLO layer
-        indices after which an SSD block will be applied to the temporal feature sequence.
+        Args mirror ``PoseModel`` and add SPAD-specific configuration. ``plugin_layers`` contains YOLO layer
+        indices after which a detector-side plugin will be applied to the temporal feature sequence.
         """
-        self.qnn_enabled = qnn_enabled
-        self.qnn_integrator_kwargs = {"normalize": True, **dict(qnn_integrator_kwargs or {})}
-        self.qnn_ssd_after_layers = tuple(
-            self.DEFAULT_SSD_AFTER_LAYERS if qnn_ssd_after_layers is None else qnn_ssd_after_layers
+        self.spad_enabled = spad_enabled
+        self.preprocessor_name = str(preprocessor).strip().lower()
+        self.preprocessor_kwargs = dict(preprocessor_kwargs or {})
+        self.plugin_name = str(plugin).strip().lower()
+        self.plugin_layers = tuple(
+            self.DEFAULT_PLUGIN_LAYERS if plugin_layers is None else plugin_layers
         )
-        self.qnn_ssd_state_dim = qnn_ssd_state_dim
-        self.qnn_ssd_head_divisor = qnn_ssd_head_divisor
-        self.qnn_ssd_kwargs = dict(qnn_ssd_kwargs or {})
-        self.qnn_packed_nch = 3
+        self.temporal_core = str(temporal_core).strip().lower()
+        self.ssd_state_dim = ssd_state_dim
+        self.ssd_head_divisor = ssd_head_divisor
+        self.ssd_kwargs = dict(ssd_kwargs or {})
+        self.spatial_reduce_ratio = spatial_reduce_ratio
+        self.spatial_kernel_size = spatial_kernel_size
+        self.plugin_alpha_init = plugin_alpha_init
+        self.spad_packed_nch = 3
 
         super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
 
-        self.integrator = None
-        self.ssd_by_layer = torch.nn.ModuleDict()
-        self.qnn_ssd_layer_info = {}
-        if self.qnn_enabled:
-            self._init_qnn_modules()
+        self.preprocessor = None
+        self.plugins_by_layer = torch.nn.ModuleDict()
+        self.spad_plugin_layer_info = {}
+        if self.spad_enabled:
+            self._init_spad_modules()
 
-    def _init_qnn_modules(self):
-        """Create PerPixelBayesian and SSD modules without changing the base YOLO graph."""
-        from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
-        from ultralytics.quanta_neural_networks.ssd import SSD
+    def _init_spad_modules(self):
+        """Create SPAD preprocessors and detector plugins without changing the base YOLO graph."""
+        from ultralytics.models.yolo.pose.spad_plugins import build_spad_plugin
+        from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_preprocessor
 
-        self.integrator = PerPixelBayesian(**self.qnn_integrator_kwargs)
+        self.preprocessor = build_spad_preprocessor(self.preprocessor_name, kwargs=self.preprocessor_kwargs)
 
-        for layer_idx in self.qnn_ssd_after_layers:
+        for layer_idx in self.plugin_layers:
             channels = self._layer_output_channels(layer_idx)
             head_dim = self._ssd_head_dim(channels)
-            self.qnn_ssd_layer_info[int(layer_idx)] = {"in_dim": int(channels), "head_dim": int(head_dim)}
-            self.ssd_by_layer[str(layer_idx)] = SSD(
+            self.spad_plugin_layer_info[int(layer_idx)] = {"in_dim": int(channels), "head_dim": int(head_dim)}
+            self.plugins_by_layer[str(layer_idx)] = build_spad_plugin(
+                self.plugin_name,
                 in_dim=channels,
-                state_dim=self.qnn_ssd_state_dim,
+                state_dim=self.ssd_state_dim,
                 head_dim=head_dim,
-                **self.qnn_ssd_kwargs,
+                reduce_ratio=self.spatial_reduce_ratio,
+                kernel_size=self.spatial_kernel_size,
+                alpha_init=self.plugin_alpha_init,
+                temporal_core=self.temporal_core,
+                ssd_kwargs=self.ssd_kwargs,
             )
 
     def _layer_output_channels(self, layer_idx):
@@ -677,18 +692,18 @@ class QNNPoseModel(PoseModel):
 
     def _ssd_head_dim(self, channels):
         """Choose an SSD head dimension that divides the feature channel count."""
-        divisor = max(int(self.qnn_ssd_head_divisor), 1)
+        divisor = max(int(self.ssd_head_divisor), 1)
         head_dim = max(channels // divisor, 1)
         while channels % head_dim != 0 and head_dim > 1:
             head_dim -= 1
         return head_dim
 
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
-        """Run the standard YOLO graph, injecting QNN modules for SPAD video tensors."""
-        if not self.qnn_enabled or not torch.is_tensor(x) or x.ndim != 5:
+        """Run the standard YOLO graph, injecting SPAD modules for raw SPAD video tensors."""
+        if not self.spad_enabled or not torch.is_tensor(x) or x.ndim != 5:
             return super()._predict_once(x, profile, visualize, embed)
 
-        x, t_index_ll = self._qnn_video_to_frame_sequence(x)
+        x, t_index_ll = self._spad_video_to_frame_sequence(x)
         y, dt, embeddings = [], [], []
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
@@ -697,7 +712,7 @@ class QNNPoseModel(PoseModel):
             if m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
 
-            layer_input = self._qnn_flatten_temporal(x)
+            layer_input = self._spad_flatten_temporal(x)
             if profile:
                 self._profile_one_layer(m, layer_input, dt)
             out = m(layer_input)
@@ -705,60 +720,63 @@ class QNNPoseModel(PoseModel):
             if m == self.model[-1]:
                 return out
 
-            x = self._qnn_unflatten_temporal(out, batch_size=self.qnn_batch_size, num_frame=self.qnn_num_frame)
-            if str(m.i) in self.ssd_by_layer:
-                x, t_index_ll = self._qnn_apply_ssd(m.i, x, t_index_ll)
+            x = self._spad_unflatten_temporal(out, batch_size=self.spad_batch_size, num_frame=self.spad_num_frame)
+            if str(m.i) in self.plugins_by_layer:
+                x, t_index_ll = self._spad_apply_plugin(m.i, x, t_index_ll)
 
             y.append(x if m.i in self.save else None)
             if visualize:
-                self._qnn_visualize_temporal(x, m, visualize)
+                self._spad_visualize_temporal(x, m, visualize)
             if m.i in embed:
-                pooled = torch.nn.functional.adaptive_avg_pool2d(self._qnn_flatten_temporal(x), (1, 1))
+                pooled = torch.nn.functional.adaptive_avg_pool2d(self._spad_flatten_temporal(x), (1, 1))
                 embeddings.append(pooled.squeeze(-1).squeeze(-1))
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
 
         return x
 
-    def _qnn_video_to_frame_sequence(self, video):
+    def _spad_video_to_frame_sequence(self, video):
         """Convert B,T,rawH,rawW,1 SPAD Bayer clips into T',B,3,H,W reconstructed frame sequences."""
-        if self.integrator is None:
-            raise RuntimeError("QNN integrator is not initialized.")
+        if self.preprocessor is None:
+            raise RuntimeError("SPAD preprocessor is not initialized.")
         if video.ndim != 5:
             raise ValueError(f"Expected B,T,rawH,rawW,1 video tensor, got shape={tuple(video.shape)}")
 
         bsz, t, raw_h, raw_w, channels = video.shape
         if channels != 1:
-            raise ValueError(f"QNNPoseModel expects single-channel Bayer raw SPAD input, got C={channels}")
+            raise ValueError(f"SpadPoseModel expects single-channel Bayer raw SPAD input, got C={channels}")
         if raw_h % 2 != 0 or raw_w % 2 != 0:
             raise ValueError(f"Raw SPAD height/width must be even for Bayer unexpand, got {(raw_h, raw_w)}")
 
-        packed_nch = int(getattr(self, "qnn_packed_nch", 3) or 3)
+        packed_nch = int(getattr(self, "spad_packed_nch", 3) or 3)
         frame_ll = []
         t_index_ll = None
         for b in range(bsz):
             photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
-            recons = self.integrator.process_photon_cube(photon_cube, clear_states=True)
-            frames = self._qnn_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
+            recons = self.preprocessor.process_photon_cube(photon_cube, clear_states=True)
+            frames = self._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
             frame_ll.append(frames)
 
             if t_index_ll is None:
-                subsampling = int(getattr(self.integrator, "subsampling", 1) or 1)
-                t_index_ll = self._qnn_recon_t_indices(int(photon_cube.shape[2]), subsampling, int(frames.shape[0]))
+                if hasattr(self.preprocessor, "recon_t_indices"):
+                    t_index_ll = list(self.preprocessor.recon_t_indices(int(photon_cube.shape[2]), int(frames.shape[0])))
+                else:
+                    subsampling = int(getattr(self.preprocessor, "subsampling", 1) or 1)
+                    t_index_ll = self._spad_recon_t_indices(int(photon_cube.shape[2]), subsampling, int(frames.shape[0]))
 
         frame_counts = {frames.shape[0] for frames in frame_ll}
         if len(frame_counts) != 1:
             raise ValueError(f"All batch items must produce the same number of reconstructed frames, got {frame_counts}")
 
         frames_t_b_c_h_w = torch.stack(frame_ll, dim=1)
-        self.qnn_batch_size = int(bsz)
-        self.qnn_num_frame = int(frames_t_b_c_h_w.shape[0])
-        self.qnn_t_index_ll = t_index_ll or []
-        self.qnn_last_recon_frames = frames_t_b_c_h_w.detach()
-        return frames_t_b_c_h_w, self.qnn_t_index_ll
+        self.spad_batch_size = int(bsz)
+        self.spad_num_frame = int(frames_t_b_c_h_w.shape[0])
+        self.spad_t_index_ll = t_index_ll or []
+        self.spad_last_recon_frames = frames_t_b_c_h_w.detach()
+        return frames_t_b_c_h_w, self.spad_t_index_ll
 
     @staticmethod
-    def _qnn_recon_t_indices(t_raw: int, subsampling: int, num_frames: int) -> list[int]:
+    def _spad_recon_t_indices(t_raw: int, subsampling: int, num_frames: int) -> list[int]:
         """Map each reconstructed frame to its ending raw-bin index within the chunk."""
         if num_frames <= 0 or t_raw <= 0:
             return []
@@ -773,24 +791,24 @@ class QNNPoseModel(PoseModel):
         return idx[:num_frames]
 
     @staticmethod
-    def _qnn_raw_recons_to_rgb_frames(raw_hwt, *, packed_nch: int = 3):
+    def _spad_raw_recons_to_rgb_frames(raw_hwt, *, packed_nch: int = 3):
         """Convert Bayer PPB output to ``(T, 3, H/2, W/2)`` RGB frames."""
         from ultralytics.data.spad_packed import raw_hwt_to_rgb_float
 
         return raw_hwt_to_rgb_float(raw_hwt, packed_nch=int(packed_nch))
 
     @staticmethod
-    def _qnn_flatten_temporal(x):
+    def _spad_flatten_temporal(x):
         """Flatten T,B,C,H,W feature sequences to T*B,C,H,W for standard YOLO layers."""
         if isinstance(x, list):
-            return [QNNPoseModel._qnn_flatten_temporal(v) for v in x]
+            return [SpadPoseModel._spad_flatten_temporal(v) for v in x]
         if torch.is_tensor(x) and x.ndim == 5:
             t, b, c, h, w = x.shape
             return x.permute(1, 0, 2, 3, 4).reshape(b * t, c, h, w).contiguous()
         return x
 
     @staticmethod
-    def _qnn_unflatten_temporal(x, batch_size, num_frame):
+    def _spad_unflatten_temporal(x, batch_size, num_frame):
         """Restore T,B,C,H,W after a standard 2D YOLO layer."""
         if not torch.is_tensor(x) or x.ndim != 4:
             return x
@@ -800,22 +818,19 @@ class QNNPoseModel(PoseModel):
             raise ValueError(f"Expected flattened batch {expected}, got {bt}")
         return x.reshape(batch_size, num_frame, c, h, w).permute(1, 0, 2, 3, 4).contiguous()
 
-    def _qnn_apply_ssd(self, layer_idx, x, t_index_ll):
-        """Apply one SSD block to a T,B,C,H,W temporal feature sequence."""
+    def _spad_apply_plugin(self, layer_idx, x, t_index_ll):
+        """Apply one detector plugin to a T,B,C,H,W temporal feature sequence."""
         if not torch.is_tensor(x) or x.ndim != 5:
-            raise ValueError(f"SSD after layer {layer_idx} expected T,B,C,H,W, got {type(x)}")
+            raise ValueError(f"Plugin after layer {layer_idx} expected T,B,C,H,W, got {type(x)}")
 
-        t, b, c, h, w = x.shape
-        x_flat = x.permute(0, 1, 3, 4, 2).reshape(t, b * h * w, c).contiguous()
-        out, out_t_index_ll = self.ssd_by_layer[str(layer_idx)](x_flat, t_index_ll)
+        out, out_t_index_ll = self.plugins_by_layer[str(layer_idx)](x, t_index_ll)
         out_t = out.shape[0]
-        out = out.reshape(out_t, b, h, w, c).permute(0, 1, 4, 2, 3).contiguous()
 
-        self.qnn_num_frame = int(out_t)
-        self.qnn_t_index_ll = out_t_index_ll
+        self.spad_num_frame = int(out_t)
+        self.spad_t_index_ll = out_t_index_ll
         return out, out_t_index_ll
 
-    def _qnn_visualize_temporal(self, x, module, visualize):
+    def _spad_visualize_temporal(self, x, module, visualize):
         """Visualize the first temporal slice to keep Ultralytics feature visualization compatible."""
         if torch.is_tensor(x) and x.ndim == 5:
             feature_visualization(x[0], module.type, module.i, save_dir=visualize)

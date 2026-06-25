@@ -3,10 +3,10 @@
 
 Run YOLO pose tracking on pre-rendered RGB frames stored in a numpy array.
 
-This is a simplified sibling of `det_qnns.py`:
+This is a simplified sibling of `det_spad_pose.py`:
 - Input is an RGB frames numpy file (default: frames.npy) shaped (N,H,W,3).
 - No SPAD preprocessing; runs standard Ultralytics predictor.
-- Visualization matches `det_qnns.py`/`det.py`: bbox + 21-keypoint skeleton.
+- Visualization matches `det_spad_pose.py`/`det.py`: bbox + 21-keypoint skeleton.
 
 Example
 -------
@@ -31,7 +31,7 @@ from ultralytics import YOLO
 
 
 # ----------------------------
-# Visualization (kept consistent with det_qnns.py)
+# Visualization (kept consistent with det_spad_pose.py)
 # ----------------------------
 BONE_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb

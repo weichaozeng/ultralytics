@@ -11,13 +11,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from ultralytics.data.qnn_spad_dataset import QNNSpadPoseDataset, load_visionsim_split_json
+from ultralytics.data.spad_pose_dataset import SpadPoseDataset, load_visionsim_split_json
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import PoseModel, QNNPoseModel
+from ultralytics.nn.tasks import PoseModel, SpadPoseModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, nms
 
 
-QNN_BONE_CONNECTIONS = [
+SPAD_BONE_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
     (0, 9), (9, 10), (10, 11), (11, 12),
@@ -26,12 +26,12 @@ QNN_BONE_CONNECTIONS = [
 ]
 
 
-class _QNNNoOpValidator:
-    """Placeholder validator; QNN evaluation is handled by train_qnn_pose.py callbacks."""
+class _SpadNoOpValidator:
+    """Placeholder validator; SPAD evaluation is handled by the training callbacks."""
 
     def __init__(self, args):
         self.args = copy(args)
-        self.metrics = type("QNNNoOpMetrics", (), {"keys": []})()
+        self.metrics = type("SpadNoOpMetrics", (), {"keys": []})()
 
     def __call__(self, *args, **kwargs):
         return {"fitness": 0.0}
@@ -142,56 +142,57 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         return data
 
 
-class QNNPoseTrainer(PoseTrainer):
-    """Pose trainer that builds QNNPoseModel and freezes the pretrained YOLO detector by default."""
+class SpadPoseTrainer(PoseTrainer):
+    """Pose trainer that builds SpadPoseModel and freezes the pretrained YOLO detector by default."""
 
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
-        """Initialize QNN trainer while allowing custom qnn_* args through Ultralytics cfg validation."""
+        """Initialize SPAD trainer while allowing custom SPAD args through Ultralytics cfg validation."""
         overrides = overrides or {}
-        if any(str(k).startswith("qnn_") for k in overrides):
+        custom_prefixes = ("spad_", "ppb_", "stea_", "plugin_", "ssd_", "temporal_", "spatial_")
+        if any(str(k).startswith(custom_prefixes) for k in overrides):
             cfg_dict = dict(vars(cfg)) if hasattr(cfg, "__dict__") else dict(cfg)
-            cfg_dict.update({k: v for k, v in overrides.items() if str(k).startswith("qnn_")})
+            cfg_dict.update({k: v for k, v in overrides.items() if str(k).startswith(custom_prefixes)})
             cfg = cfg_dict
         super().__init__(cfg, overrides, _callbacks)
-        self.add_callback("on_train_start", self._qnn_on_train_start)
-        self.add_callback("on_fit_epoch_end", self._qnn_on_fit_epoch_end)
+        self.add_callback("on_train_start", self._spad_on_train_start)
+        self.add_callback("on_fit_epoch_end", self._spad_on_fit_epoch_end)
 
     def get_dataset(self) -> dict[str, Any]:
-        """Return a minimal dataset dictionary for QNN SPAD training."""
-        qnn_train_json = getattr(self.args, "qnn_train_json", None)
-        qnn_test_json = getattr(self.args, "qnn_test_json", None)
-        if qnn_train_json and qnn_test_json:
+        """Return a minimal dataset dictionary for SPAD pose training."""
+        spad_train_json = getattr(self.args, "spad_train_json", None)
+        spad_test_json = getattr(self.args, "spad_test_json", None)
+        if spad_train_json and spad_test_json:
             return {
-                "train": qnn_train_json,
-                "val": qnn_test_json,
+                "train": spad_train_json,
+                "val": spad_test_json,
                 "nc": 2,
                 "names": {0: "left_hand", 1: "right_hand"},
                 "channels": 3,
                 "kpt_shape": [21, 3],
-                "qnn_train_json": qnn_train_json,
-                "qnn_test_json": qnn_test_json,
+                "spad_train_json": spad_train_json,
+                "spad_test_json": spad_test_json,
             }
         return super().get_dataset()
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
-        """Build QNN SPAD pose dataset for train/val from VisionSIM split JSON."""
-        json_path = getattr(self.args, "qnn_train_json", None) or self.data.get("qnn_train_json")
+        """Build SPAD pose dataset for train/val from VisionSIM split JSON."""
+        json_path = getattr(self.args, "spad_train_json", None) or self.data.get("spad_train_json")
         if mode != "train":
-            json_path = getattr(self.args, "qnn_test_json", None) or self.data.get("qnn_test_json")
+            json_path = getattr(self.args, "spad_test_json", None) or self.data.get("spad_test_json")
         if not json_path:
-            raise ValueError("QNNPoseTrainer requires `qnn_train_json` and `qnn_test_json` in args or data yaml.")
+            raise ValueError("SpadPoseTrainer requires `spad_train_json` and `spad_test_json` in args or data yaml.")
 
         samples = load_visionsim_split_json(json_path)
         LOGGER.info(f"Loaded {len(samples)} samples from {json_path} for mode={mode!r}")
 
-        return QNNSpadPoseDataset(
+        return SpadPoseDataset(
             samples=samples,
-            output_frames=int(getattr(self.args, "qnn_output_frames", self.data.get("qnn_output_frames", 4))),
-            spad_per_gt=int(getattr(self.args, "qnn_spad_per_gt", self.data.get("qnn_spad_per_gt", 64))),
-            spad_step=int(getattr(self.args, "qnn_subsampling", self.data.get("qnn_subsampling", 64))),
-            stride_frames=int(getattr(self.args, "qnn_stride_frames", self.data.get("qnn_stride_frames", 0))) or None,
-            image_size=int(getattr(self.args, "qnn_image_size", self.data.get("qnn_image_size", 512))),
-            packed_ch_order=getattr(self.args, "qnn_packed_ch_order", self.data.get("qnn_packed_ch_order", "RGB")),
+            output_frames=int(getattr(self.args, "spad_output_frames", self.data.get("spad_output_frames", 4))),
+            spad_bins_per_gt=int(getattr(self.args, "spad_bins_per_gt", self.data.get("spad_bins_per_gt", 64))),
+            spad_step=int(getattr(self.args, "spad_subsampling", self.data.get("spad_subsampling", 64))),
+            stride_frames=int(getattr(self.args, "spad_stride_frames", self.data.get("spad_stride_frames", 0))) or None,
+            image_size=int(getattr(self.args, "spad_image_size", self.data.get("spad_image_size", 512))),
+            packed_ch_order=getattr(self.args, "spad_packed_ch_order", self.data.get("spad_packed_ch_order", "RGB")),
         )
 
     def get_model(
@@ -199,30 +200,60 @@ class QNNPoseTrainer(PoseTrainer):
         cfg: str | Path | dict[str, Any] | None = None,
         weights: str | Path | None = None,
         verbose: bool = True,
-    ) -> QNNPoseModel:
-        """Get QNN-augmented pose model with optional pretrained detector weights."""
-        qnn_integrator_kwargs = {
-            "subsampling": int(getattr(self.args, "qnn_subsampling", getattr(self.args, "subsampling", 64))),
-            "bocpd_gamma": float(getattr(self.args, "qnn_bocpd_gamma", getattr(self.args, "bocpd_gamma", 5e-4))),
-            "normalize": bool(getattr(self.args, "qnn_normalize", True)),
-            "quantile": float(getattr(self.args, "qnn_quantile", getattr(self.args, "quantile", 1.0))),
-            "min_filter_size": int(getattr(self.args, "qnn_min_filter_size", getattr(self.args, "min_filter_size", 7))),
-        }
-        qnn_ssd_after_layers = getattr(self.args, "qnn_ssd_after_layers", None)
-        if isinstance(qnn_ssd_after_layers, str):
-            qnn_ssd_after_layers = [int(x) for x in qnn_ssd_after_layers.split(",") if x.strip()]
+    ) -> SpadPoseModel:
+        """Get SPAD pose model with optional pretrained detector weights."""
+        preprocessor_name = str(getattr(self.args, "preprocessor", "ppb")).strip().lower()
+        spad_subsampling = int(getattr(self.args, "spad_subsampling", getattr(self.args, "subsampling", 64)))
+        preprocessor_kwargs = {"subsampling": spad_subsampling}
+        if preprocessor_name == "ppb":
+            preprocessor_kwargs.update(
+                {
+                    "bocpd_gamma": float(getattr(self.args, "ppb_bocpd_gamma", getattr(self.args, "bocpd_gamma", 5e-4))),
+                    "normalize": bool(getattr(self.args, "ppb_normalize", True)),
+                    "quantile": float(getattr(self.args, "ppb_quantile", getattr(self.args, "quantile", 1.0))),
+                    "min_filter_size": int(getattr(self.args, "ppb_min_filter_size", getattr(self.args, "min_filter_size", 7))),
+                }
+            )
+        elif preprocessor_name == "stea":
+            preprocessor_kwargs.update(
+                {
+                    "fast_window": int(getattr(self.args, "stea_fast_window", 16)),
+                    "slow_window": int(getattr(self.args, "stea_slow_window", 128)),
+                    "temporal_window": int(getattr(self.args, "stea_temporal_window", 5)),
+                    "fast_tau": None if getattr(self.args, "stea_fast_tau", None) in {None, 0} else float(getattr(self.args, "stea_fast_tau")),
+                    "motion_sharpness": float(getattr(self.args, "stea_motion_sharpness", 60.0)),
+                    "motion_threshold": float(getattr(self.args, "stea_motion_threshold", 0.05)),
+                    "stable_prior": float(getattr(self.args, "stea_stable_prior", 16.0)),
+                    "normalize": bool(getattr(self.args, "stea_normalize", True)),
+                    "quantile": float(getattr(self.args, "stea_quantile", 1.0)),
+                }
+            )
+        elif preprocessor_name == "sum":
+            preprocessor_kwargs = {"subsampling": spad_subsampling}
+        else:
+            raise ValueError(f"Unsupported training preprocessor: {preprocessor_name!r}")
 
-        model = QNNPoseModel(
+        plugin_layers = getattr(self.args, "plugin_scales", None)
+        if isinstance(plugin_layers, str):
+            plugin_layers = [int(x) for x in plugin_layers.split(",") if x.strip()]
+
+        model = SpadPoseModel(
             cfg,
             nc=self.data["nc"],
             ch=self.data["channels"],
             data_kpt_shape=self.data["kpt_shape"],
             verbose=verbose,
-            qnn_enabled=bool(getattr(self.args, "qnn_enabled", True)),
-            qnn_integrator_kwargs=qnn_integrator_kwargs,
-            qnn_ssd_after_layers=qnn_ssd_after_layers,
-            qnn_ssd_state_dim=int(getattr(self.args, "qnn_ssd_state_dim", 8)),
-            qnn_ssd_head_divisor=int(getattr(self.args, "qnn_ssd_head_divisor", 4)),
+            spad_enabled=bool(getattr(self.args, "spad_enabled", True)),
+            preprocessor=preprocessor_name,
+            preprocessor_kwargs=preprocessor_kwargs,
+            plugin=str(getattr(self.args, "plugin", "temporal_ssd")),
+            plugin_layers=plugin_layers,
+            temporal_core=str(getattr(self.args, "temporal_core", "ssd")),
+            ssd_state_dim=int(getattr(self.args, "ssd_state_dim", 8)),
+            ssd_head_divisor=int(getattr(self.args, "ssd_head_divisor", 4)),
+            spatial_reduce_ratio=int(getattr(self.args, "spatial_reduce_ratio", 2)),
+            spatial_kernel_size=int(getattr(self.args, "spatial_kernel_size", 3)),
+            plugin_alpha_init=float(getattr(self.args, "plugin_alpha_init", 0.0)),
         )
         if weights:
             model.load(weights)
@@ -230,19 +261,19 @@ class QNNPoseTrainer(PoseTrainer):
         return model
 
     def set_model_attributes(self):
-        """Set pose attributes and freeze the detector graph unless the user overrides qnn_freeze_detector."""
+        """Set pose attributes and freeze the detector graph unless the user overrides freeze_detector."""
         super().set_model_attributes()
-        if bool(getattr(self.args, "qnn_freeze_detector", True)):
+        if bool(getattr(self.args, "freeze_detector", True)):
             self.args.freeze = list(range(len(self.model.model)))
-            LOGGER.info("QNNPoseTrainer: freezing pretrained YOLO detector layers; QNN modules remain trainable.")
+            LOGGER.info("SpadPoseTrainer: freezing pretrained YOLO detector layers; SPAD modules remain trainable.")
 
     def preprocess_batch(self, batch: dict) -> dict:
-        """Move QNN video batches to device without applying image-style normalization."""
+        """Move SPAD video batches to device without applying image-style normalization."""
         if "packed_nch" in batch:
             packed_nch = int(batch["packed_nch"])
-            self.model.qnn_packed_nch = packed_nch
+            self.model.spad_packed_nch = packed_nch
             if getattr(self, "ema", None) is not None and getattr(self.ema, "ema", None) is not None:
-                self.ema.ema.qnn_packed_nch = packed_nch
+                self.ema.ema.spad_packed_nch = packed_nch
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
@@ -251,31 +282,31 @@ class QNNPoseTrainer(PoseTrainer):
     def get_validator(self):
         """Return a no-op validator because standard PoseValidator expects image batches."""
         self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
-        return _QNNNoOpValidator(self.args)
+        return _SpadNoOpValidator(self.args)
 
     def validate(self):
-        """Skip built-in validation; QNN val loss/visualization runs from the training callback."""
+        """Skip built-in validation; SPAD val loss/visualization runs from the training callback."""
         fitness = -float(self.loss.detach().cpu()) if hasattr(self, "loss") else 0.0
         if not self.best_fitness or self.best_fitness < fitness:
             self.best_fitness = fitness
         return {}, fitness
 
-    def _qnn_on_train_start(self, trainer):
+    def _spad_on_train_start(self, trainer):
         """Save baseline checkpoint and visualizations before the first training epoch."""
         if RANK in {-1, 0}:
             initial_path = Path(self.save_dir) / "weights" / "initial.pt"
             initial_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"epoch": -1, "model": self.model, "train_args": vars(self.args)}, initial_path)
-        self._qnn_eval_visualize(epoch_idx=0)
+        self._spad_eval_visualize(epoch_idx=0)
 
-    def _qnn_on_fit_epoch_end(self, trainer):
-        """Run QNN test split evaluation and visualization after selected epochs."""
-        period = int(getattr(self.args, "qnn_viz_period", 1))
+    def _spad_on_fit_epoch_end(self, trainer):
+        """Run SPAD test split evaluation and visualization after selected epochs."""
+        period = int(getattr(self.args, "spad_viz_period", 1))
         if period <= 0 or (self.epoch + 1) % period != 0:
             return
-        self._qnn_eval_visualize(epoch_idx=self.epoch + 1)
+        self._spad_eval_visualize(epoch_idx=self.epoch + 1)
 
-    def _qnn_eval_visualize(self, *, epoch_idx: int):
+    def _spad_eval_visualize(self, *, epoch_idx: int):
         """Evaluate random test windows and save recon/overlay visualizations on rank 0."""
         if RANK not in {-1, 0}:
             return
@@ -284,14 +315,14 @@ class QNNPoseTrainer(PoseTrainer):
         model.eval()
 
         dataset = self.test_loader.dataset
-        max_batches = int(getattr(self.args, "qnn_eval_max_batches", -1))
+        max_batches = int(getattr(self.args, "spad_eval_max_batches", -1))
         eval_count = len(dataset) if max_batches < 0 else min(max_batches, len(dataset))
         eval_count = max(eval_count, 1)
-        generator = torch.Generator().manual_seed(int(getattr(self.args, "qnn_eval_seed", 0)) + int(epoch_idx))
+        generator = torch.Generator().manual_seed(int(getattr(self.args, "spad_eval_seed", 0)) + int(epoch_idx))
         indices = torch.randperm(len(dataset), generator=generator)[:eval_count].tolist()
         loader = DataLoader(Subset(dataset, indices), batch_size=1, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn)
 
-        save_dir = Path(self.save_dir) / "qnn_viz" / f"epoch{epoch_idx:03d}"
+        save_dir = Path(self.save_dir) / "spad_viz" / f"epoch{epoch_idx:03d}"
         save_dir.mkdir(parents=True, exist_ok=True)
 
         loss_sum_total = 0.0
@@ -300,15 +331,15 @@ class QNNPoseTrainer(PoseTrainer):
         written = []
         last_processed_count = 0
         last_target_images = 0
-        viz_batches = int(getattr(self.args, "qnn_viz_batches", 1))
-        viz_frames = int(getattr(self.args, "qnn_viz_frames", 4))
+        viz_batches = int(getattr(self.args, "spad_viz_batches", 1))
+        viz_frames = int(getattr(self.args, "spad_viz_frames", 4))
 
         with torch.no_grad():
             for batch_i, batch in enumerate(loader):
                 batch = self.preprocess_batch(batch)
                 preds = model(batch["img"])
                 loss, loss_items = model.loss(batch, preds)
-                processed = self._qnn_postprocess_pose(preds)
+                processed = self._spad_postprocess_pose(preds)
 
                 loss_sum_total += float(loss.sum().detach().cpu())
                 loss_items_cpu = loss_items.detach().cpu()
@@ -320,20 +351,20 @@ class QNNPoseTrainer(PoseTrainer):
                 if batch_i < viz_batches:
                     num_images = min(viz_frames, max(len(processed), last_target_images))
                     for si in range(num_images):
-                        canvas = self._qnn_recon_canvas(model, si)
+                        canvas = self._spad_recon_canvas(model, si)
                         cv2.imwrite(str(save_dir / f"batch{batch_i:03d}_sample{si:03d}_recon.png"), canvas)
-                        self._qnn_draw_labels(canvas, batch, si)
+                        self._spad_draw_labels(canvas, batch, si)
                         if si < len(processed):
-                            self._qnn_draw_predictions(canvas, processed[si])
+                            self._spad_draw_predictions(canvas, processed[si])
                         out_path = save_dir / f"batch{batch_i:03d}_sample{si:03d}_overlay.png"
                         ok = cv2.imwrite(str(out_path), canvas)
                         written.append(f"{out_path.name}: {'ok' if ok else 'failed'}")
 
         if seen_batches:
-            self.metrics["qnn_val/loss_sum"] = loss_sum_total / seen_batches
+            self.metrics["spad_val/loss_sum"] = loss_sum_total / seen_batches
             mean_loss_items = loss_items_total / seen_batches
             for i, value in enumerate(mean_loss_items.tolist()):
-                self.metrics[f"qnn_val/loss_{i}"] = float(value)
+                self.metrics[f"spad_val/loss_{i}"] = float(value)
         else:
             mean_loss_items = torch.zeros(5)
 
@@ -342,7 +373,7 @@ class QNNPoseTrainer(PoseTrainer):
             f.write(f"seen_batches: {seen_batches}\n")
             f.write(f"eval_max_batches: {max_batches}\n")
             f.write(f"random_indices: {indices}\n")
-            f.write(f"mean_loss_sum: {self.metrics.get('qnn_val/loss_sum', 0.0)}\n")
+            f.write(f"mean_loss_sum: {self.metrics.get('spad_val/loss_sum', 0.0)}\n")
             f.write(f"mean_loss_items: {mean_loss_items.tolist()}\n")
             f.write(f"last_processed_predictions: {last_processed_count}\n")
             f.write(f"last_target_images: {last_target_images}\n")
@@ -352,41 +383,41 @@ class QNNPoseTrainer(PoseTrainer):
         if was_training:
             model.train()
 
-    def _qnn_postprocess_pose(self, preds):
+    def _spad_postprocess_pose(self, preds):
         raw = preds[0] if isinstance(preds, (list, tuple)) and torch.is_tensor(preds[0]) else preds
         outputs = nms.non_max_suppression(
             raw,
-            float(getattr(self.args, "qnn_viz_conf", 0.25)),
-            float(getattr(self.args, "qnn_viz_iou", 0.7)),
+            float(getattr(self.args, "spad_viz_conf", 0.25)),
+            float(getattr(self.args, "spad_viz_iou", 0.7)),
             nc=self.data["nc"],
             multi_label=True,
-            max_det=int(getattr(self.args, "qnn_viz_max_det", 20)),
+            max_det=int(getattr(self.args, "spad_viz_max_det", 20)),
         )
         return [
             {"bboxes": x[:, :4], "conf": x[:, 4], "cls": x[:, 5], "keypoints": x[:, 6:].view(-1, 21, 3)}
             for x in outputs
         ]
 
-    def _qnn_recon_canvas(self, model, si: int) -> np.ndarray:
-        image_size = int(getattr(self.args, "qnn_image_size", 512))
-        frames = getattr(model, "qnn_last_recon_frames", None)
+    def _spad_recon_canvas(self, model, si: int) -> np.ndarray:
+        image_size = int(getattr(self.args, "spad_image_size", 512))
+        frames = getattr(model, "spad_last_recon_frames", None)
         if frames is None or si >= frames.shape[0]:
             return np.zeros((image_size, image_size, 3), dtype=np.uint8)
         rgb = frames[si, 0].detach().float().cpu().permute(1, 2, 0).numpy()
         rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
         return np.ascontiguousarray(rgb_u8[:, :, ::-1])
 
-    def _qnn_draw_pose(self, img: np.ndarray, keypoints: np.ndarray, color: tuple[int, int, int]):
+    def _spad_draw_pose(self, img: np.ndarray, keypoints: np.ndarray, color: tuple[int, int, int]):
         img = np.ascontiguousarray(img)
-        for s, e in QNN_BONE_CONNECTIONS:
+        for s, e in SPAD_BONE_CONNECTIONS:
             if keypoints[s, 2] > 0 and keypoints[e, 2] > 0:
                 cv2.line(img, tuple(keypoints[s, :2].astype(int)), tuple(keypoints[e, :2].astype(int)), color, 2)
         for x, y, v in keypoints:
             if v > 0:
                 cv2.circle(img, (int(x), int(y)), 3, color, -1)
 
-    def _qnn_draw_labels(self, img: np.ndarray, batch: dict[str, Any], si: int):
-        image_size = int(getattr(self.args, "qnn_image_size", 512))
+    def _spad_draw_labels(self, img: np.ndarray, batch: dict[str, Any], si: int):
+        image_size = int(getattr(self.args, "spad_image_size", 512))
         idx = batch["batch_idx"].view(-1).cpu() == si
         boxes = batch["bboxes"][idx].cpu().numpy()
         cls = batch["cls"][idx].view(-1).cpu().numpy()
@@ -396,14 +427,14 @@ class QNNPoseTrainer(PoseTrainer):
             x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
             color = (0, 0, 255) if int(cls_id) == 0 else (255, 0, 0)
             cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            self._qnn_draw_pose(img, pose * np.array([image_size, image_size, 1.0]), color)
+            self._spad_draw_pose(img, pose * np.array([image_size, image_size, 1.0]), color)
 
-    def _qnn_draw_predictions(self, img: np.ndarray, pred: dict[str, torch.Tensor]):
+    def _spad_draw_predictions(self, img: np.ndarray, pred: dict[str, torch.Tensor]):
         boxes = pred["bboxes"].detach().cpu().numpy()
         scores = pred["conf"].detach().cpu().numpy()
         cls = pred["cls"].detach().cpu().numpy()
         keypoints = pred["keypoints"].detach().cpu().numpy()
-        conf = float(getattr(self.args, "qnn_viz_conf", 0.25))
+        conf = float(getattr(self.args, "spad_viz_conf", 0.25))
         for box, score, cls_id, pose in zip(boxes, scores, cls, keypoints):
             if score < conf:
                 continue
@@ -411,4 +442,4 @@ class QNNPoseTrainer(PoseTrainer):
             x1, y1, x2, y2 = box
             cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), color, 1)
             cv2.putText(img, f"{int(cls_id)} {score:.2f}", (int(x1), int(y1) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            self._qnn_draw_pose(img, pose, color)
+            self._spad_draw_pose(img, pose, color)

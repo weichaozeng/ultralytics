@@ -3,7 +3,7 @@
 """SPAD-specific pose predictor.
 
 This module provides a drop-in replacement for Ultralytics' `PosePredictor` that lets you
-insert SPAD preprocessing (e.g., PerPixelBayesian reconstruction and/or QNN-based preprocessing)
+insert SPAD preprocessing (e.g., PerPixelBayesian reconstruction and/or learned SPAD preprocessing)
 *before* the standard YOLO preprocessing (letterbox, normalization, etc.).
 """
 
@@ -163,7 +163,7 @@ class SPADPosePredictor(PosePredictor):
                 **{k: v for k, v in self.spad_bayes_kwargs.items() if k != "normalize"},
             )
             
-            # 🚀 以防万一有人没用 det_qnns，而是传了个几万帧的整张大图进来，
+            # 🚀 以防万一有人没用 det_spad_pose，而是传了个几万帧的整张大图进来，
             # 强制保证循环的第二圈不重置
             current_clear = False 
 

@@ -1,8 +1,8 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Run QNNS pose inference on a test set and save structured predictions.
+"""Run SPAD pose inference on a test set and save structured predictions.
 
-This is the non-visualization sibling of ``det_qnns.py``. It feeds raw SPAD clips
-into a trained QNN pose checkpoint, applies the same NMS and optional tracker, and
+This is the non-visualization sibling of ``det_spad_pose.py``. It feeds raw SPAD clips
+into a trained SPAD pose checkpoint, applies the same NMS and optional tracker, and
 writes one JSON file per input sample.
 """
 
@@ -19,15 +19,17 @@ from tqdm import tqdm
 
 from ultralytics import YOLO
 
-from det_qnns import (
+from det_spad_pose import (
     _apply_tracker,
+    _build_override_preprocessor,
     _init_tracker,
     _iter_raw_video_sources_from_sample_path,
     _postprocess_pose_predictions,
-    _prepare_raw_chunk_for_qnn,
+    _prepare_raw_chunk_for_spad,
     _recon_frames_bgr,
     _resolve_device,
     _results_from_preds,
+    _set_velocity_field_on_preprocessor,
     _slice_raw_chunk,
     _trained_chunk_t,
     _video_num_bins,
@@ -140,7 +142,7 @@ def _frame_record_from_result(
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Raw SPAD test set -> trained QNNPoseModel -> JSON predictions")
+    ap = argparse.ArgumentParser(description="Raw SPAD test set -> trained SpadPoseModel -> JSON predictions")
     ap.add_argument("--in_path", type=str, required=True, help="Sample/video folder, root folder, or a .npy file")
     ap.add_argument(
         "--in_glob",
@@ -149,19 +151,44 @@ def parse_args():
         help="Optional glob when --in_path is a root folder containing many sample/video subfolders",
     )
     ap.add_argument("--test_name", type=str, default=None, help="Output test-set folder name; defaults from --in_path")
-    ap.add_argument("--ckpt", type=str, required=True, help="Trained QNN pose checkpoint")
+    ap.add_argument("--ckpt", type=str, required=True, help="Trained SPAD pose checkpoint")
     ap.add_argument("--device", type=str, default="", help="Torch device, e.g. cpu / cuda:0 / mps")
     ap.add_argument("--det_thresh", type=float, default=0.4)
     ap.add_argument("--iou", type=float, default=0.7)
     ap.add_argument("--max_det", type=int, default=20)
-    ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort"])
+    ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort", "spad_tracker"])
     ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
+    ap.add_argument(
+        "--preprocessor-override",
+        type=str,
+        default="none",
+        choices=["none", "ppb", "sum", "stea", "hyb"],
+        help="Optionally override the checkpoint's internal SPAD preprocessor at inference time.",
+    )
+    ap.add_argument("--spad-subsampling", type=int, default=320, help="Temporal subsampling used by override preprocessors.")
+    ap.add_argument("--ppb-bocpd-gamma", type=float, default=5e-4)
+    ap.add_argument("--ppb-quantile", type=float, default=1.0)
+    ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument("--stea-fast-window", type=int, default=16)
+    ap.add_argument("--stea-slow-window", type=int, default=128)
+    ap.add_argument("--stea-temporal-window", type=int, default=5)
+    ap.add_argument("--stea-fast-tau", type=float, default=6.0)
+    ap.add_argument("--stea-motion-sharpness", type=float, default=60.0)
+    ap.add_argument("--stea-motion-threshold", type=float, default=0.05)
+    ap.add_argument("--stea-stable-prior", type=float, default=16.0)
+    ap.add_argument("--stea-normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--stea-quantile", type=float, default=1.0)
+    ap.add_argument("--hyb-motion-sharpness", type=float, default=60.0)
+    ap.add_argument("--hyb-motion-threshold", type=float, default=0.05)
+    ap.add_argument("--hyb-warp-block-size", type=int, default=16)
+    ap.add_argument("--hyb-source-space", type=str, default="rgb", choices=["rgb", "raw"])
     ap.add_argument(
         "--cube_chunk_t",
         type=int,
         default=0,
-        help="If >0, split each raw video into chunks of this many bins. If 0, use the train-time QNN window length.",
+        help="If >0, split each raw video into chunks of this many bins. If 0, use the train-time SPAD window length.",
     )
     ap.add_argument("--cube_chunk_stride", type=int, default=0, help="Stride for chunking; default uses cube_chunk_t")
     ap.add_argument(
@@ -194,21 +221,27 @@ def main():
     sample_paths = _sample_paths_from_args(in_path, args.in_glob)
 
     yolo = YOLO(str(ckpt))
-    qnn_model = yolo.model
-    if not getattr(qnn_model, "qnn_enabled", False) or not hasattr(qnn_model, "integrator"):
+    spad_model = yolo.model
+    if not getattr(spad_model, "spad_enabled", False) or not hasattr(spad_model, "preprocessor"):
         raise TypeError(
-            f"Checkpoint {args.ckpt} is not a trained QNN pose model. "
-            f"Loaded type: {qnn_model.__class__.__name__}"
+            f"Checkpoint {args.ckpt} is not a trained SPAD pose model. "
+            f"Loaded type: {spad_model.__class__.__name__}"
         )
 
     device = _resolve_device(args.device)
-    qnn_model.to(device)
-    qnn_model.eval()
+    spad_model.to(device)
+    spad_model.eval()
 
     tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate)
+    override_name, override_preprocessor = _build_override_preprocessor(args)
+    if override_preprocessor is not None:
+        if override_name == "hyb" and args.tracker != "spad_tracker":
+            raise ValueError("--preprocessor-override hyb requires --tracker spad_tracker")
+        spad_model.preprocessor = override_preprocessor.to(device)
+        spad_model.preprocessor_name = override_name
     names = yolo.names
-    kpt_shape = getattr(qnn_model, "kpt_shape", (21, 3))
-    trained_chunk_t = _trained_chunk_t(qnn_model)
+    kpt_shape = getattr(spad_model, "kpt_shape", (21, 3))
+    trained_chunk_t = _trained_chunk_t(spad_model)
 
     for sample_path in sample_paths:
         sample_name = sample_path.name if sample_path.is_dir() else sample_path.stem
@@ -221,7 +254,7 @@ def main():
         global_frame_idx = 0
         sample_record: dict[str, Any] = {
             "metadata": {
-                "format": "spadhand_qnns_predictions_v1",
+                "format": "spadhand_spad_predictions_v1",
                 "ckpt": str(ckpt),
                 "test_name": test_name,
                 "sample_name": sample_name,
@@ -252,16 +285,16 @@ def main():
                 chunk_t = int(trained_chunk_t)
             else:
                 raise ValueError(
-                    "Unable to infer train-time QNN window length from checkpoint. "
+                    "Unable to infer train-time SPAD window length from checkpoint. "
                     "Pass --cube_chunk_t explicitly."
                 )
             if chunk_t <= 0:
                 raise ValueError(f"cube_chunk_t must be positive, got {chunk_t}")
 
-            subsampling = int(getattr(getattr(qnn_model, "integrator", None), "subsampling", 1) or 1)
+            subsampling = int(getattr(getattr(spad_model, "preprocessor", None), "subsampling", 1) or 1)
             if chunk_t < subsampling:
                 raise ValueError(
-                    f"cube_chunk_t={chunk_t} is shorter than integrator subsampling={subsampling}, "
+                    f"cube_chunk_t={chunk_t} is shorter than preprocessor subsampling={subsampling}, "
                     "which would produce zero reconstructed frames."
                 )
             stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
@@ -282,19 +315,16 @@ def main():
                 if bool(args.drop_tail) and (t1 - t0) < chunk_t:
                     continue
                 raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
-                raw_chunk = _prepare_raw_chunk_for_qnn(
-                    raw_chunk,
-                    chunk_t=chunk_t,
-                    tail_pad_full=bool(args.tail_pad),
-                )
+                raw_chunk = _prepare_raw_chunk_for_spad(raw_chunk, chunk_t=chunk_t, tail_pad_full=bool(args.tail_pad))
                 if raw_chunk is None:
                     continue
 
-                qnn_model.qnn_packed_nch = int(source.packed_nch)
+                spad_model.spad_packed_nch = int(source.packed_nch)
+                _set_velocity_field_on_preprocessor(spad_model.preprocessor, tracker)
 
                 with torch.inference_mode():
                     video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
-                    raw_preds = qnn_model(video_tensor)
+                    raw_preds = spad_model(video_tensor)
                     preds = _postprocess_pose_predictions(
                         raw_preds,
                         conf=args.det_thresh,
@@ -303,7 +333,7 @@ def main():
                         max_det=args.max_det,
                         kpt_shape=kpt_shape,
                     )
-                    recon_frames_bgr = _recon_frames_bgr(qnn_model, batch_index=0)
+                    recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
 
                 if device.type == "cuda":
                     torch.cuda.empty_cache()

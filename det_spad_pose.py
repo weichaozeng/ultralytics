@@ -1,10 +1,10 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""det_qnns.py
+"""det_spad_pose.py
 
-Run inference with the trained QNN pose checkpoint on SPAD raw clips.
+Run inference with a trained SPAD pose checkpoint on raw SPAD clips.
 
 Unlike the older SPAD predictor workflow, this script does not reconstruct frames in the
-predictor. Instead it feeds raw SPAD clips directly into the checkpoint's `QNNPoseModel`, which
+predictor. Instead it feeds raw SPAD clips directly into the checkpoint's `SpadPoseModel`, which
 already contains the trained `PerPixelBayesian + SSD + YOLO pose head` pipeline.
 
 Expected input formats
@@ -30,7 +30,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import cv2
 import numpy as np
@@ -45,6 +45,7 @@ from ultralytics.data.spad_packed import (
     raw_video_mean_to_rgb_u8,
 )
 from ultralytics.engine.results import Results
+from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_preprocessor
 from ultralytics.trackers.track import TRACKER_MAP
 from ultralytics.utils import IterableSimpleNamespace, YAML, nms
 from ultralytics.utils.checks import check_yaml
@@ -55,25 +56,22 @@ def _np_load(path: Path) -> np.ndarray:
     return np.load(path, mmap_mode="r")
 
 
-# ----------------------------
-# Visualization (copied from det.py)
-# ----------------------------
 BONE_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
-    (0, 5), (5, 6), (6, 7), (7, 8),  # Index
-    (0, 9), (9, 10), (10, 11), (11, 12),  # Mid
-    (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
-    (0, 17), (17, 18), (18, 19), (19, 20),  # Pinky
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    (0, 17), (17, 18), (18, 19), (19, 20),
 ]
 FINGER_COLORS = [
-    (0, 0, 255),  # Thumb - Red
-    (255, 0, 0),  # Index - Blue
-    (0, 255, 0),  # Mid - Green
-    (0, 255, 255),  # Ring - Yellow
-    (255, 0, 255),  # Pinky - magenta
+    (0, 0, 255),
+    (255, 0, 0),
+    (0, 255, 0),
+    (0, 255, 255),
+    (255, 0, 255),
 ]
-COLOR_KEYPOINT = (255, 255, 255)  # Joint - White
-COLOR_WRIST = (255, 165, 0)  # Wrist - Orange
+COLOR_KEYPOINT = (255, 255, 255)
+COLOR_WRIST = (255, 165, 0)
 
 
 def _get_finger_color(bone_index: int) -> tuple[int, int, int]:
@@ -110,7 +108,6 @@ def draw_bbox(img_bgr: np.ndarray, track_id: int, box_xyxyc: np.ndarray, handedn
 
 
 def draw_pose(img_bgr: np.ndarray, pose_kpts: np.ndarray, thresh: float = 0.5, k: int = 21) -> np.ndarray:
-    # pose_kpts: (K,3) with (x,y,conf)
     if pose_kpts.shape != (k, 3):
         raise ValueError(f"Pose shape must be ({k}, 3), but got {pose_kpts.shape}")
 
@@ -118,35 +115,20 @@ def draw_pose(img_bgr: np.ndarray, pose_kpts: np.ndarray, thresh: float = 0.5, k
         ks = pose_kpts[s]
         ke = pose_kpts[e]
         if ks[2] > thresh and ke[2] > thresh:
-            cv2.line(
-                img_bgr,
-                (int(ks[0]), int(ks[1])),
-                (int(ke[0]), int(ke[1])),
-                _get_finger_color(i),
-                3,
-            )
+            cv2.line(img_bgr, (int(ks[0]), int(ks[1])), (int(ke[0]), int(ke[1])), _get_finger_color(i), 3)
 
     for i in range(k):
         kk = pose_kpts[i]
         if kk[2] > thresh:
             center = (int(kk[0]), int(kk[1]))
-            if i == 0:
-                color, radius = COLOR_WRIST, 6
-            else:
-                color, radius = COLOR_KEYPOINT, 4
+            color, radius = (COLOR_WRIST, 6) if i == 0 else (COLOR_KEYPOINT, 4)
             cv2.circle(img_bgr, center, radius, color, -1)
 
     return img_bgr
 
 
-# ----------------------------
-# Data loading utilities
-# ----------------------------
-
-def _packed_frames_to_raw_video(
-    frames_packed: np.ndarray, *, expected_w: int = 512, ch_order: str = "RGB"
-) -> np.ndarray:
-    """Convert packed `(T,H,Wpacked,3|4)` to integrator raw video."""
+def _packed_frames_to_raw_video(frames_packed: np.ndarray, *, expected_w: int = 512, ch_order: str = "RGB") -> np.ndarray:
+    """Convert packed `(T,H,Wpacked,3|4)` to raw SPAD video."""
     return packed_frames_to_raw_video(frames_packed, expected_w=expected_w, ch_order=ch_order)
 
 
@@ -192,7 +174,6 @@ def _iter_raw_video_sources_from_sample_path(in_path: Path):
 
 
 def _video_num_bins(source: RawVideoSource) -> int:
-    """Return the raw time length of a source."""
     if source.layout in {"packed", "thwc1", "thw"}:
         return int(source.array.shape[0])
     if source.layout == "hwt":
@@ -215,7 +196,7 @@ def _slice_raw_chunk(source: RawVideoSource, t0: int, t1: int, *, packed_ch_orde
 
 
 def _pad_raw_chunk_repeat_last(raw_chunk: np.ndarray, target_t: int) -> np.ndarray:
-    """Pad a raw chunk to ``target_t`` by repeating its last frame."""
+    """Pad a raw chunk to `target_t` by repeating its last frame."""
     if raw_chunk.shape[0] >= target_t:
         return raw_chunk
     if raw_chunk.shape[0] == 0:
@@ -226,17 +207,8 @@ def _pad_raw_chunk_repeat_last(raw_chunk: np.ndarray, target_t: int) -> np.ndarr
     return np.ascontiguousarray(np.concatenate((raw_chunk, pad), axis=0))
 
 
-def _prepare_raw_chunk_for_qnn(
-    raw_chunk: np.ndarray,
-    *,
-    chunk_t: int,
-    tail_pad_full: bool,
-) -> np.ndarray | None:
-    """Prepare one raw chunk for QNN inference.
-
-    - ``tail_pad_full=True``: pad short tail chunks up to ``chunk_t``.
-    - ``tail_pad_full=False``: keep the natural tail length (PPB handles T < subsampling).
-    """
+def _prepare_raw_chunk_for_spad(raw_chunk: np.ndarray, *, chunk_t: int, tail_pad_full: bool) -> np.ndarray | None:
+    """Prepare one raw chunk for SPAD inference."""
     if raw_chunk.shape[0] == 0:
         return None
     if tail_pad_full and raw_chunk.shape[0] < chunk_t:
@@ -264,15 +236,80 @@ def _resolve_device(device_arg: str) -> torch.device:
 
 def _trained_chunk_t(model) -> int | None:
     train_args = getattr(model, "args", None)
-    output_frames = _cfg_get(train_args, "qnn_output_frames", None)
-    subsampling = getattr(getattr(model, "integrator", None), "subsampling", None)
+    output_frames = _cfg_get(train_args, "spad_output_frames", None)
+    subsampling = getattr(getattr(model, "preprocessor", None), "subsampling", None)
     if output_frames is None or subsampling is None:
         return None
     return int(output_frames) * int(subsampling)
 
 
+def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
+    name = str(getattr(args, "preprocessor_override", "none")).strip().lower()
+    if name in {"", "none"}:
+        return None, None
+
+    spad_subsampling = int(getattr(args, "spad_subsampling", 64))
+    kwargs: dict[str, Any] = {"subsampling": spad_subsampling}
+    if name == "ppb":
+        kwargs.update(
+            {
+                "bocpd_gamma": float(args.ppb_bocpd_gamma),
+                "normalize": bool(args.ppb_normalize),
+                "quantile": float(args.ppb_quantile),
+                "min_filter_size": int(args.ppb_min_filter_size),
+            }
+        )
+    elif name == "stea":
+        kwargs.update(
+            {
+                "fast_window": int(args.stea_fast_window),
+                "slow_window": int(args.stea_slow_window),
+                "temporal_window": int(args.stea_temporal_window),
+                "fast_tau": float(args.stea_fast_tau),
+                "motion_sharpness": float(args.stea_motion_sharpness),
+                "motion_threshold": float(args.stea_motion_threshold),
+                "stable_prior": float(args.stea_stable_prior),
+                "normalize": bool(args.stea_normalize),
+                "quantile": float(args.stea_quantile),
+            }
+        )
+    elif name == "hyb":
+        kwargs.update(
+            {
+                "fast_window": int(args.stea_fast_window),
+                "slow_window": int(args.stea_slow_window),
+                "temporal_window": int(args.stea_temporal_window),
+                "fast_tau": float(args.stea_fast_tau),
+                "motion_sharpness": float(args.hyb_motion_sharpness),
+                "motion_threshold": float(args.hyb_motion_threshold),
+                "stable_prior": float(args.stea_stable_prior),
+                "normalize": bool(args.stea_normalize),
+                "quantile": float(args.stea_quantile),
+                "warp_block_size": int(args.hyb_warp_block_size),
+                "source_space": str(args.hyb_source_space),
+            }
+        )
+    elif name == "sum":
+        kwargs = {"subsampling": spad_subsampling}
+    else:
+        raise ValueError(f"Unsupported --preprocessor-override: {name!r}")
+
+    return name, build_spad_preprocessor(name, kwargs=kwargs)
+
+
+def _set_velocity_field_on_preprocessor(preprocessor, tracker) -> None:
+    if preprocessor is None or not hasattr(preprocessor, "set_velocity_field"):
+        return
+    if tracker is None:
+        preprocessor.set_velocity_field(None, source_space="rgb")
+        return
+    if not hasattr(tracker, "last_velocity_field"):
+        raise TypeError("This preprocessor requires a tracker that exposes 'last_velocity_field'.")
+    preprocessor.set_velocity_field(getattr(tracker, "last_velocity_field", None), source_space="rgb")
+
+
 def _recon_frames_bgr(model, batch_index: int = 0) -> list[np.ndarray]:
-    frames = getattr(model, "qnn_last_recon_frames", None)
+    frames = getattr(model, "spad_last_recon_frames", None)
     if frames is None:
         return []
     rgb = frames[:, batch_index].detach().float().cpu().permute(0, 2, 3, 1).numpy()
@@ -281,7 +318,6 @@ def _recon_frames_bgr(model, batch_index: int = 0) -> list[np.ndarray]:
 
 
 def _resize_to_shape_bgr(img_bgr: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
-    """Resize a BGR image only when it does not already match the target H/W."""
     target_h, target_w = map(int, shape_hw)
     if img_bgr.shape[:2] == (target_h, target_w):
         return np.ascontiguousarray(img_bgr.copy())
@@ -289,13 +325,11 @@ def _resize_to_shape_bgr(img_bgr: np.ndarray, shape_hw: tuple[int, int]) -> np.n
 
 
 def _raw_sum_bgr(raw_video: np.ndarray, *, packed_nch: int) -> np.ndarray:
-    """Sum raw over time, then map to RGB using packed channel semantics."""
     rgb = raw_video_mean_to_rgb_u8(raw_video, packed_nch=int(packed_nch))
     return np.ascontiguousarray(rgb[:, :, ::-1])
 
 
 def _raw_sum_readrgb_like_bgr(raw_video: np.ndarray, *, packed_nch: int) -> np.ndarray:
-    """Mean over time, then visualize with the same packed-channel semantics as QNN input."""
     rgb = raw_video_mean_to_rgb_u8(raw_video, packed_nch=int(packed_nch))
     return np.ascontiguousarray(rgb[:, :, ::-1])
 
@@ -333,31 +367,49 @@ def _apply_tracker(result: Results, tracker) -> Results:
     return tracked
 
 
-# ----------------------------
-# Main
-# ----------------------------
-
 def main():
-    ap = argparse.ArgumentParser(description="Raw SPAD clip -> trained QNNPoseModel -> pose tracking")
+    ap = argparse.ArgumentParser(description="Raw SPAD clip -> trained SpadPoseModel -> pose tracking")
     ap.add_argument("--in_path", type=str, required=True, help="Sample/video folder, root folder, or a .npy file")
-    ap.add_argument("--in_glob", type=str, default=None,
-                    help="Optional glob (e.g. '*') when --in_path is a root folder containing many sample/video subfolders")
+    ap.add_argument("--in_glob", type=str, default=None, help="Optional glob when --in_path is a root folder containing many sample/video subfolders")
     ap.add_argument("--save_dir", type=str, required=True, help="Directory to save visualized frames")
     ap.add_argument("--ckpt", type=str, default="weights/detector.pt")
     ap.add_argument("--device", type=str, default="", help="Torch device, e.g. cpu / cuda:0 / mps")
     ap.add_argument("--det_thresh", type=float, default=0.4)
     ap.add_argument("--iou", type=float, default=0.7)
     ap.add_argument("--max_det", type=int, default=20)
-    ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort"])
+    ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort", "spad_tracker"])
     ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
-
-    # Raw clip chunking
+    ap.add_argument(
+        "--preprocessor-override",
+        type=str,
+        default="none",
+        choices=["none", "ppb", "sum", "stea", "hyb"],
+        help="Optionally override the checkpoint's internal SPAD preprocessor at inference time.",
+    )
+    ap.add_argument("--spad-subsampling", type=int, default=320, help="Temporal subsampling used by override preprocessors.")
+    ap.add_argument("--ppb-bocpd-gamma", type=float, default=5e-4)
+    ap.add_argument("--ppb-quantile", type=float, default=1.0)
+    ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument("--stea-fast-window", type=int, default=16)
+    ap.add_argument("--stea-slow-window", type=int, default=128)
+    ap.add_argument("--stea-temporal-window", type=int, default=5)
+    ap.add_argument("--stea-fast-tau", type=float, default=6.0)
+    ap.add_argument("--stea-motion-sharpness", type=float, default=60.0)
+    ap.add_argument("--stea-motion-threshold", type=float, default=0.05)
+    ap.add_argument("--stea-stable-prior", type=float, default=16.0)
+    ap.add_argument("--stea-normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--stea-quantile", type=float, default=1.0)
+    ap.add_argument("--hyb-motion-sharpness", type=float, default=60.0)
+    ap.add_argument("--hyb-motion-threshold", type=float, default=0.05)
+    ap.add_argument("--hyb-warp-block-size", type=int, default=16)
+    ap.add_argument("--hyb-source-space", type=str, default="rgb", choices=["rgb", "raw"])
     ap.add_argument(
         "--cube_chunk_t",
         type=int,
         default=0,
-        help="If >0, split each raw video into chunks of this many bins. If 0, use the train-time QNN window length when available, else full video.",
+        help="If >0, split each raw video into chunks of this many bins. If 0, use the train-time SPAD window length when available, else full video.",
     )
     ap.add_argument("--cube_chunk_stride", type=int, default=0, help="Stride for chunking; default uses cube_chunk_t (no overlap)")
     ap.add_argument(
@@ -392,20 +444,26 @@ def main():
         sample_paths = [in_path]
 
     yolo = YOLO(args.ckpt)
-    qnn_model = yolo.model
-    if not getattr(qnn_model, "qnn_enabled", False) or not hasattr(qnn_model, "integrator"):
+    spad_model = yolo.model
+    if not getattr(spad_model, "spad_enabled", False) or not hasattr(spad_model, "preprocessor"):
         raise TypeError(
-            f"Checkpoint {args.ckpt} is not a trained QNN pose model. "
-            f"Loaded type: {qnn_model.__class__.__name__}"
+            f"Checkpoint {args.ckpt} is not a trained SPAD pose model. "
+            f"Loaded type: {spad_model.__class__.__name__}"
         )
 
     device = _resolve_device(args.device)
-    qnn_model.to(device)
-    qnn_model.eval()
+    spad_model.to(device)
+    spad_model.eval()
     tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate)
+    override_name, override_preprocessor = _build_override_preprocessor(args)
+    if override_preprocessor is not None:
+        if override_name == "hyb" and args.tracker != "spad_tracker":
+            raise ValueError("--preprocessor-override hyb requires --tracker spad_tracker")
+        spad_model.preprocessor = override_preprocessor.to(device)
+        spad_model.preprocessor_name = override_name
     names = yolo.names
-    kpt_shape = getattr(qnn_model, "kpt_shape", (21, 3))
-    trained_chunk_t = _trained_chunk_t(qnn_model)
+    kpt_shape = getattr(spad_model, "kpt_shape", (21, 3))
+    trained_chunk_t = _trained_chunk_t(spad_model)
     global_frame_idx = 0
 
     for sample_path in sample_paths:
@@ -417,43 +475,40 @@ def main():
         video_iter = _iter_raw_video_sources_from_sample_path(sample_path)
 
         for video_idx, source in enumerate(tqdm(video_iter, desc=f"Processing video [{sample_name}]")):
-            T = _video_num_bins(source)
+            total_bins = _video_num_bins(source)
             if int(args.cube_chunk_t) > 0:
                 chunk_t = int(args.cube_chunk_t)
             elif trained_chunk_t is not None:
                 chunk_t = int(trained_chunk_t)
             else:
                 raise ValueError(
-                    "Unable to infer train-time QNN window length from checkpoint. "
-                    "Pass --cube_chunk_t explicitly, e.g. --cube_chunk_t 64 for qnn_output_frames=1,qnn_subsampling=64. "
-                    f"Refusing to process the full video as one chunk (T={T}), which is likely to OOM."
+                    "Unable to infer train-time SPAD window length from checkpoint. "
+                    "Pass --cube_chunk_t explicitly, e.g. --cube_chunk_t 64 for spad_output_frames=1,spad_subsampling=64. "
+                    f"Refusing to process the full video as one chunk (T={total_bins}), which is likely to OOM."
                 )
             if chunk_t <= 0:
                 raise ValueError(f"cube_chunk_t must be positive, got {chunk_t}")
-            subsampling = int(getattr(getattr(qnn_model, "integrator", None), "subsampling", 1) or 1)
+            subsampling = int(getattr(getattr(spad_model, "preprocessor", None), "subsampling", 1) or 1)
             if chunk_t < subsampling:
                 raise ValueError(
-                    f"cube_chunk_t={chunk_t} is shorter than integrator subsampling={subsampling}, "
+                    f"cube_chunk_t={chunk_t} is shorter than preprocessor subsampling={subsampling}, "
                     "which would produce zero reconstructed frames. Increase --cube_chunk_t or use the checkpoint default."
                 )
             stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t
 
-            for t0 in range(0, T, stride):
-                t1 = min(T, t0 + chunk_t)
+            for t0 in range(0, total_bins, stride):
+                t1 = min(total_bins, t0 + chunk_t)
                 raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
-                raw_chunk = _prepare_raw_chunk_for_qnn(
-                    raw_chunk,
-                    chunk_t=chunk_t,
-                    tail_pad_full=bool(args.tail_pad),
-                )
+                raw_chunk = _prepare_raw_chunk_for_spad(raw_chunk, chunk_t=chunk_t, tail_pad_full=bool(args.tail_pad))
                 if raw_chunk is None:
                     continue
 
-                qnn_model.qnn_packed_nch = int(source.packed_nch)
+                spad_model.spad_packed_nch = int(source.packed_nch)
+                _set_velocity_field_on_preprocessor(spad_model.preprocessor, tracker)
 
                 with torch.inference_mode():
                     video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
-                    raw_preds = qnn_model(video_tensor)
+                    raw_preds = spad_model(video_tensor)
                     preds = _postprocess_pose_predictions(
                         raw_preds,
                         conf=args.det_thresh,
@@ -462,7 +517,7 @@ def main():
                         max_det=args.max_det,
                         kpt_shape=kpt_shape,
                     )
-                    recon_frames_bgr = _recon_frames_bgr(qnn_model, batch_index=0)
+                    recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 results = _results_from_preds(
@@ -478,31 +533,31 @@ def main():
                     bg_bgr = _raw_sum_bgr(raw_chunk, packed_nch=source.packed_nch)
                 readrgb_bgr = _raw_sum_readrgb_like_bgr(raw_chunk, packed_nch=source.packed_nch) if bool(args.save_readrgb) else None
 
-                for i, r in enumerate(results):
-                    r = _apply_tracker(r, tracker)
+                for result in results:
+                    result = _apply_tracker(result, tracker)
                     recon = (
-                        np.ascontiguousarray(r.orig_img.copy())
-                        if getattr(r, "orig_img", None) is not None
+                        np.ascontiguousarray(result.orig_img.copy())
+                        if getattr(result, "orig_img", None) is not None
                         else np.zeros((512, 512, 3), dtype=np.uint8)
                     )
-                    if args.vis_bg == "recon" and getattr(r, "orig_img", None) is not None:
+                    if args.vis_bg == "recon" and getattr(result, "orig_img", None) is not None:
                         vis = recon.copy()
                     else:
                         vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(recon)
                     readrgb = _resize_to_shape_bgr(readrgb_bgr, vis.shape[:2]) if readrgb_bgr is not None else None
 
-                    if r.boxes is not None and len(r.boxes):
-                        track_ids = r.boxes.id
+                    if result.boxes is not None and len(result.boxes):
+                        track_ids = result.boxes.id
                         if track_ids is None:
-                            track_ids = torch.arange(len(r.boxes), device=r.boxes.data.device)
+                            track_ids = torch.arange(len(result.boxes), device=result.boxes.data.device)
                         track_id = track_ids.cpu().numpy()
-                        boxes = r.boxes.xyxy.cpu().numpy()
-                        box_confs = r.boxes.conf.cpu().numpy()
-                        handedness = r.boxes.cls.cpu().numpy()
+                        boxes = result.boxes.xyxy.cpu().numpy()
+                        box_confs = result.boxes.conf.cpu().numpy()
+                        handedness = result.boxes.cls.cpu().numpy()
 
                         poses = None
-                        if getattr(r, "keypoints", None) is not None:
-                            poses = r.keypoints.data.cpu().numpy()
+                        if getattr(result, "keypoints", None) is not None:
+                            poses = result.keypoints.data.cpu().numpy()
 
                         for j, tid in enumerate(track_id):
                             box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
