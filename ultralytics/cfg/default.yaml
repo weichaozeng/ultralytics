@@ -142,4 +142,44 @@ spad_bayes_kwargs: {} # (dict) kwargs forwarded to PerPixelBayesian/process_phot
 spad_collapse: recon # (str) how to turn cube into frames, e.g. 'recon' or other future modes
 spad_chunk_t: # (int, optional) chunk length in T for streaming large cubes
 spad_t_offset: 0 # (int) absolute T offset for causal alignment/debugging
+spad_enabled: True # (bool) enable the end-to-end SPAD pose model path
+spad_train_json: # (str, optional) VisionSIM training split json
+spad_test_json: # (str, optional) VisionSIM test split json
+spad_output_frames: 4 # (int) reconstructed output frames per training window
+spad_stride_frames: 0 # (int) sliding-window stride in GT frame units
+spad_bins_per_gt: 64 # (int) raw SPAD bins per one GT frame
+spad_image_size: 512 # (int) square image size for SPAD pose windows
+spad_packed_ch_order: RGB # (str) packed SPAD channel order used when unpacking raw windows
+spad_subsampling: 64 # (int) shared temporal downsampling factor for SPAD preprocessors and GT alignment
+spad_preprocessor: ppb # (str) detector input preprocessor: ppb, sum, stea
+spad_plugin: temporal_ssd # (str) detector-side feature plugin: none, temporal_ssd, spatial_only, spatial_temporal
+spad_plugin_scales: 16,19,22 # (str) comma-separated YOLO layer indices for detector plugins
+spad_temporal_core: ssd # (str) temporal core used by plugins
+spad_freeze_detector: True # (bool) freeze pretrained detector while training SPAD modules
+spad_eval_max_batches: -1 # (int) max test batches for SPAD eval visualization (-1 = full split)
+spad_eval_seed: 0 # (int) seed for SPAD eval sampling
+spad_viz_batches: 1 # (int) number of SPAD eval batches to visualize
+spad_viz_frames: 4 # (int) max reconstructed frames to visualize per eval batch
+spad_viz_period: 1 # (int) eval visualization period in epochs (0 disables periodic viz)
+spad_viz_conf: 0.25 # (float) confidence threshold used in SPAD eval visualization
+spad_viz_iou: 0.7 # (float) IoU threshold used in SPAD eval visualization
+spad_viz_max_det: 20 # (int) max detections per frame used in SPAD eval visualization
+ppb_bocpd_gamma: 0.0005 # (float) BOCPD hazard rate for PerPixelBayesian
+ppb_quantile: 1.0 # (float) normalization quantile for PerPixelBayesian
+ppb_normalize: True # (bool) normalize PerPixelBayesian reconstructions
+ppb_min_filter_size: 7 # (int) odd min-filter size for PerPixelBayesian
+stea_fast_window: 16 # (int) fast Gamma temporal basis length for STEA
+stea_slow_window: 128 # (int) slow boxcar temporal basis length for STEA
+stea_temporal_window: 5 # (int) causal evidence blur window for STEA
+stea_fast_tau: 6.0 # (float) Gamma tau for the fast STEA basis
+stea_motion_sharpness: 60.0 # (float) motion routing sharpness for STEA
+stea_motion_threshold: 0.05 # (float) motion routing threshold for STEA
+stea_stable_prior: 16.0 # (float) stable-branch prior for STEA
+stea_normalize: True # (bool) normalize STEA reconstructions
+stea_quantile: 1.0 # (float) normalization quantile for STEA
+ssd_state_dim: 8 # (int) latent state dimension for SSD temporal blocks
+ssd_head_divisor: 4 # (int) derive SSD head dim from channels // divisor
+spad_spatial_reduce_ratio: 2 # (int) channel bottleneck ratio for spatial detector plugins
+spad_spatial_kernel_size: 3 # (int) depthwise kernel size for spatial detector plugins
+spad_plugin_alpha_init: 0.0 # (float) initial residual gate value for detector plugins
 

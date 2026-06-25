@@ -148,7 +148,7 @@ class SpadPoseTrainer(PoseTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
         """Initialize SPAD trainer while allowing custom SPAD args through Ultralytics cfg validation."""
         overrides = overrides or {}
-        custom_prefixes = ("spad_", "ppb_", "stea_", "plugin_", "ssd_", "temporal_", "spatial_")
+        custom_prefixes = ("spad_", "ppb_", "stea_", "ssd_")
         if any(str(k).startswith(custom_prefixes) for k in overrides):
             cfg_dict = dict(vars(cfg)) if hasattr(cfg, "__dict__") else dict(cfg)
             cfg_dict.update({k: v for k, v in overrides.items() if str(k).startswith(custom_prefixes)})
@@ -202,7 +202,7 @@ class SpadPoseTrainer(PoseTrainer):
         verbose: bool = True,
     ) -> SpadPoseModel:
         """Get SPAD pose model with optional pretrained detector weights."""
-        preprocessor_name = str(getattr(self.args, "preprocessor", "ppb")).strip().lower()
+        preprocessor_name = str(getattr(self.args, "spad_preprocessor", "ppb")).strip().lower()
         spad_subsampling = int(getattr(self.args, "spad_subsampling", getattr(self.args, "subsampling", 64)))
         preprocessor_kwargs = {"subsampling": spad_subsampling}
         if preprocessor_name == "ppb":
@@ -233,7 +233,7 @@ class SpadPoseTrainer(PoseTrainer):
         else:
             raise ValueError(f"Unsupported training preprocessor: {preprocessor_name!r}")
 
-        plugin_layers = getattr(self.args, "plugin_scales", None)
+        plugin_layers = getattr(self.args, "spad_plugin_scales", None)
         if isinstance(plugin_layers, str):
             plugin_layers = [int(x) for x in plugin_layers.split(",") if x.strip()]
 
@@ -246,14 +246,14 @@ class SpadPoseTrainer(PoseTrainer):
             spad_enabled=bool(getattr(self.args, "spad_enabled", True)),
             preprocessor=preprocessor_name,
             preprocessor_kwargs=preprocessor_kwargs,
-            plugin=str(getattr(self.args, "plugin", "temporal_ssd")),
+            plugin=str(getattr(self.args, "spad_plugin", "temporal_ssd")),
             plugin_layers=plugin_layers,
-            temporal_core=str(getattr(self.args, "temporal_core", "ssd")),
+            temporal_core=str(getattr(self.args, "spad_temporal_core", "ssd")),
             ssd_state_dim=int(getattr(self.args, "ssd_state_dim", 8)),
             ssd_head_divisor=int(getattr(self.args, "ssd_head_divisor", 4)),
-            spatial_reduce_ratio=int(getattr(self.args, "spatial_reduce_ratio", 2)),
-            spatial_kernel_size=int(getattr(self.args, "spatial_kernel_size", 3)),
-            plugin_alpha_init=float(getattr(self.args, "plugin_alpha_init", 0.0)),
+            spatial_reduce_ratio=int(getattr(self.args, "spad_spatial_reduce_ratio", 2)),
+            spatial_kernel_size=int(getattr(self.args, "spad_spatial_kernel_size", 3)),
+            plugin_alpha_init=float(getattr(self.args, "spad_plugin_alpha_init", 0.0)),
         )
         if weights:
             model.load(weights)
@@ -261,9 +261,9 @@ class SpadPoseTrainer(PoseTrainer):
         return model
 
     def set_model_attributes(self):
-        """Set pose attributes and freeze the detector graph unless the user overrides freeze_detector."""
+        """Set pose attributes and freeze the detector graph unless the user overrides spad_freeze_detector."""
         super().set_model_attributes()
-        if bool(getattr(self.args, "freeze_detector", True)):
+        if bool(getattr(self.args, "spad_freeze_detector", True)):
             self.args.freeze = list(range(len(self.model.model)))
             LOGGER.info("SpadPoseTrainer: freezing pretrained YOLO detector layers; SPAD modules remain trainable.")
 
