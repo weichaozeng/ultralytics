@@ -599,11 +599,8 @@ class SpadPoseModel(PoseModel):
     the forward path by later steps.
     """
 
-    # Default detector-scale insertion points for YOLO11 pose:
-    #   16 -> P3/8
-    #   19 -> P4/16
-    #   22 -> P5/32
-    DEFAULT_PLUGIN_LAYERS = (16, 19, 22)
+    # Prefer resolving detector-scale plugin layers from the final Pose/Detect head inputs.
+    DEFAULT_PLUGIN_LAYERS = None
 
     def __init__(
         self,
@@ -634,9 +631,7 @@ class SpadPoseModel(PoseModel):
         self.preprocessor_name = str(preprocessor).strip().lower()
         self.preprocessor_kwargs = dict(preprocessor_kwargs or {})
         self.plugin_name = str(plugin).strip().lower()
-        self.plugin_layers = tuple(
-            self.DEFAULT_PLUGIN_LAYERS if plugin_layers is None else plugin_layers
-        )
+        self.plugin_layers = None if plugin_layers is None else tuple(plugin_layers)
         self.temporal_core = str(temporal_core).strip().lower()
         self.ssd_state_dim = ssd_state_dim
         self.ssd_head_divisor = ssd_head_divisor
@@ -660,6 +655,8 @@ class SpadPoseModel(PoseModel):
         from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_preprocessor
 
         self.preprocessor = build_spad_preprocessor(self.preprocessor_name, kwargs=self.preprocessor_kwargs)
+        resolved_layers = self._resolve_plugin_layers()
+        self.plugin_layers = tuple(resolved_layers)
 
         for layer_idx in self.plugin_layers:
             channels = self._layer_output_channels(layer_idx)
@@ -676,6 +673,31 @@ class SpadPoseModel(PoseModel):
                 temporal_core=self.temporal_core,
                 ssd_kwargs=self.ssd_kwargs,
             )
+
+    def _resolve_plugin_layers(self) -> tuple[int, ...]:
+        """Resolve plugin insertion layers, preferring the detector head input scales."""
+        detect_inputs = ()
+        last_layer = self.model[-1]
+        if hasattr(last_layer, "f") and isinstance(last_layer.f, (list, tuple)):
+            detect_inputs = tuple(int(x) for x in last_layer.f if isinstance(x, int) and x >= 0)
+
+        if self.plugin_layers is None:
+            if detect_inputs:
+                return detect_inputs
+            raise ValueError("Unable to infer default plugin layers from the detector head.")
+
+        requested = tuple(int(x) for x in self.plugin_layers)
+        final_idx = len(self.model) - 1
+        if detect_inputs and any(idx == final_idx for idx in requested):
+            LOGGER.warning(
+                "SPAD plugin layers %s include the final detection head (layer %d). "
+                "Using detector feature inputs %s instead.",
+                requested,
+                final_idx,
+                detect_inputs,
+            )
+            return detect_inputs
+        return requested
 
     def _layer_output_channels(self, layer_idx):
         """Best-effort channel lookup for layers that should feed an SSD block."""
