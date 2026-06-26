@@ -114,7 +114,8 @@ def parse_args():
         default=320,
         help=(
             "Shared temporal downsampling factor: (1) preprocessor raw-bin aggregation per "
-            "reconstructed frame; (2) SPAD bins between consecutive output-frame labels "
+            "reconstructed frame; (2) SPAD bins between consecutive output-frame labels; "
+            "(3) for STEA training, the serial chunk length replayed across each raw window "
             "(spad_len = output_frames * subsampling)."
         ),
     )

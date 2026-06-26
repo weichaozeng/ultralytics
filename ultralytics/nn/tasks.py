@@ -775,7 +775,7 @@ class SpadPoseModel(PoseModel):
         t_index_ll = None
         for b in range(bsz):
             photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
-            recons = self.preprocessor.process_photon_cube(photon_cube, clear_states=True)
+            recons = self._spad_process_full_window(photon_cube)
             frames = self._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
             frame_ll.append(frames)
 
@@ -796,6 +796,39 @@ class SpadPoseModel(PoseModel):
         self.spad_t_index_ll = t_index_ll or []
         self.spad_last_recon_frames = frames_t_b_c_h_w.detach()
         return frames_t_b_c_h_w, self.spad_t_index_ll
+
+    def _spad_process_full_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
+        """Process one full raw SPAD window into reconstructed frames."""
+        if str(getattr(self, "preprocessor_name", "")).strip().lower() == "stea":
+            return self._spad_process_stea_window(photon_cube)
+        return self.preprocessor.process_photon_cube(photon_cube, clear_states=True)
+
+    def _spad_process_stea_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
+        """Replay a full STEA training window chunk-by-chunk while carrying causal histories forward."""
+        if photon_cube.ndim != 3:
+            raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
+
+        subsampling = max(int(getattr(self.preprocessor, "subsampling", 1) or 1), 1)
+        t_raw = int(photon_cube.shape[-1])
+        if t_raw == 0:
+            h, w = map(int, photon_cube.shape[:2])
+            return photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
+
+        recons = []
+        first_chunk = True
+        for t0 in range(0, t_raw, subsampling):
+            chunk = photon_cube[..., t0 : min(t_raw, t0 + subsampling)]
+            chunk_recons = self.preprocessor.process_photon_cube(chunk, clear_states=first_chunk)
+            first_chunk = False
+            if chunk_recons.ndim != 3:
+                raise ValueError(f"Expected STEA reconstruction (H,W,T'), got shape={tuple(chunk_recons.shape)}")
+            if int(chunk_recons.shape[-1]) > 0:
+                recons.append(chunk_recons)
+
+        if not recons:
+            h, w = map(int, photon_cube.shape[:2])
+            return photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
+        return torch.cat(recons, dim=-1)
 
     @staticmethod
     def _spad_recon_t_indices(t_raw: int, subsampling: int, num_frames: int) -> list[int]:
