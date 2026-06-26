@@ -621,6 +621,7 @@ class SpadPoseModel(PoseModel):
         spatial_reduce_ratio=2,
         spatial_kernel_size=3,
         plugin_alpha_init=0.0,
+        spad_bin_rate_hz=8000.0,
     ):
         """Initialize a SPAD-augmented YOLO pose model.
 
@@ -639,6 +640,10 @@ class SpadPoseModel(PoseModel):
         self.spatial_reduce_ratio = spatial_reduce_ratio
         self.spatial_kernel_size = spatial_kernel_size
         self.plugin_alpha_init = plugin_alpha_init
+        self.spad_reference_bin_rate_hz = float(spad_bin_rate_hz)
+        self.spad_current_bin_rate_hz = float(spad_bin_rate_hz)
+        self.ssd_kwargs.setdefault("reference_bin_rate_hz", self.spad_reference_bin_rate_hz)
+        self.ssd_kwargs.setdefault("current_bin_rate_hz", self.spad_current_bin_rate_hz)
         self.spad_packed_nch = 3
 
         super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
@@ -673,6 +678,37 @@ class SpadPoseModel(PoseModel):
                 temporal_core=self.temporal_core,
                 ssd_kwargs=self.ssd_kwargs,
             )
+        self.set_spad_bin_rate_hz(
+            current_bin_rate_hz=self.spad_current_bin_rate_hz,
+            reference_bin_rate_hz=self.spad_reference_bin_rate_hz,
+        )
+
+    def set_spad_bin_rate_hz(
+        self,
+        *,
+        current_bin_rate_hz: float | None = None,
+        reference_bin_rate_hz: float | None = None,
+    ) -> None:
+        """Update the detector-side temporal time base while preserving current behavior at the reference rate."""
+        if reference_bin_rate_hz is not None:
+            reference_bin_rate_hz = float(reference_bin_rate_hz)
+            if reference_bin_rate_hz <= 0:
+                raise ValueError(f"reference_bin_rate_hz must be positive, got {reference_bin_rate_hz}")
+            self.spad_reference_bin_rate_hz = reference_bin_rate_hz
+        if current_bin_rate_hz is None:
+            current_bin_rate_hz = self.spad_reference_bin_rate_hz
+        current_bin_rate_hz = float(current_bin_rate_hz)
+        if current_bin_rate_hz <= 0:
+            raise ValueError(f"current_bin_rate_hz must be positive, got {current_bin_rate_hz}")
+        self.spad_current_bin_rate_hz = current_bin_rate_hz
+        self.ssd_kwargs["reference_bin_rate_hz"] = self.spad_reference_bin_rate_hz
+        self.ssd_kwargs["current_bin_rate_hz"] = self.spad_current_bin_rate_hz
+        for plugin in self.plugins_by_layer.values():
+            if hasattr(plugin, "set_bin_rate_hz"):
+                plugin.set_bin_rate_hz(
+                    current_bin_rate_hz=self.spad_current_bin_rate_hz,
+                    reference_bin_rate_hz=self.spad_reference_bin_rate_hz,
+                )
 
     def _resolve_plugin_layers(self) -> tuple[int, ...]:
         """Resolve plugin insertion layers, preferring the detector head input scales."""

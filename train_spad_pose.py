@@ -120,6 +120,15 @@ def parse_args():
         ),
     )
     ap.add_argument(
+        "--spad-bin-rate-hz",
+        type=float,
+        default=8000.0,
+        help=(
+            "Reference raw-bin frequency used to normalize detector-side SSD time deltas. "
+            "The default 8000 Hz preserves current training-time time_scale behavior."
+        ),
+    )
+    ap.add_argument(
         "--ppb-bocpd-gamma",
         type=float,
         default=5e-4,
@@ -279,6 +288,8 @@ def _validate_args(ap: argparse.ArgumentParser, args: argparse.Namespace) -> Non
         ap.error(f"--ppb-min-filter-size must be odd, got {args.ppb_min_filter_size}")
     if args.spatial_kernel_size % 2 == 0:
         ap.error(f"--spatial-kernel-size must be odd, got {args.spatial_kernel_size}")
+    if float(args.spad_bin_rate_hz) <= 0:
+        ap.error(f"--spad-bin-rate-hz must be positive, got {args.spad_bin_rate_hz}")
 
 
 def _ensure_ddp_pythonpath() -> None:
@@ -304,6 +315,7 @@ def main():
             "spad_image_size": args.imgsz,
             "spad_packed_ch_order": args.spad_packed_ch_order,
             "spad_subsampling": args.spad_subsampling,
+            "spad_bin_rate_hz": args.spad_bin_rate_hz,
             "spad_preprocessor": args.preprocessor,
             "ppb_bocpd_gamma": args.ppb_bocpd_gamma,
             "ppb_quantile": args.ppb_quantile,

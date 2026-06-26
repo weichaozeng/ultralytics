@@ -151,6 +151,7 @@ spad_bins_per_gt: 64 # (int) raw SPAD bins per one GT frame
 spad_image_size: 512 # (int) square image size for SPAD pose windows
 spad_packed_ch_order: RGB # (str) packed SPAD channel order used when unpacking raw windows
 spad_subsampling: 64 # (int) shared temporal downsampling factor for SPAD preprocessors and GT alignment
+spad_bin_rate_hz: 8000.0 # (float) reference raw-bin frequency used to normalize detector-side SSD time deltas
 spad_preprocessor: ppb # (str) detector input preprocessor: ppb, sum, stea
 spad_plugin: temporal_ssd # (str) detector-side feature plugin: none, temporal_ssd, spatial_only, spatial_temporal
 spad_plugin_scales: 16,19,22 # (str) comma-separated YOLO layer indices for detector plugins

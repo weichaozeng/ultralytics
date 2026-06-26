@@ -132,6 +132,8 @@ class SSD(nn.Module):
         a_init_range=(1, 16),
         delta_min: float = 5e-5,
         delta_max: float = 5e-3,
+        reference_bin_rate_hz: float = 8000.0,
+        current_bin_rate_hz: float | None = None,
     ):
         super().__init__()
 
@@ -142,6 +144,14 @@ class SSD(nn.Module):
         self.num_heads = num_heads
         self.chunk_size = chunk_size
         self.subsampling = subsampling
+        self.reference_bin_rate_hz = float(reference_bin_rate_hz)
+        self.current_bin_rate_hz = float(
+            current_bin_rate_hz if current_bin_rate_hz is not None else reference_bin_rate_hz
+        )
+        if self.reference_bin_rate_hz <= 0:
+            raise ValueError(f"reference_bin_rate_hz must be positive, got {self.reference_bin_rate_hz}")
+        if self.current_bin_rate_hz <= 0:
+            raise ValueError(f"current_bin_rate_hz must be positive, got {self.current_bin_rate_hz}")
 
         # Refers to semi-separable matrix casting, but we'll call it parallel_scan for API uniformity
         self.parallel_mode = parallel_mode
@@ -176,6 +186,25 @@ class SSD(nn.Module):
 
         self.hidden_state = 0.0
         self.t_prev = 0.0
+
+    def set_bin_rate_hz(
+        self,
+        *,
+        current_bin_rate_hz: float | None = None,
+        reference_bin_rate_hz: float | None = None,
+    ) -> None:
+        """Update the raw-bin rates used to scale detector-side temporal deltas."""
+        if reference_bin_rate_hz is not None:
+            reference_bin_rate_hz = float(reference_bin_rate_hz)
+            if reference_bin_rate_hz <= 0:
+                raise ValueError(f"reference_bin_rate_hz must be positive, got {reference_bin_rate_hz}")
+            self.reference_bin_rate_hz = reference_bin_rate_hz
+        if current_bin_rate_hz is None:
+            current_bin_rate_hz = self.reference_bin_rate_hz
+        current_bin_rate_hz = float(current_bin_rate_hz)
+        if current_bin_rate_hz <= 0:
+            raise ValueError(f"current_bin_rate_hz must be positive, got {current_bin_rate_hz}")
+        self.current_bin_rate_hz = current_bin_rate_hz
 
     def clear_hidden_state(self):
         """Reset state for online/streaming operation."""
@@ -446,9 +475,11 @@ class SSD(nn.Module):
 
         # Continuous-time parameterization
         device = in_vector_ll.device
-        time_scale = torch.diff(torch.tensor(t_index_ll), prepend=torch.zeros(1)).to(
-            device
+        time_scale = torch.diff(
+            torch.tensor(t_index_ll, device=device, dtype=dt_ll.dtype),
+            prepend=torch.zeros(1, device=device, dtype=dt_ll.dtype),
         )
+        time_scale = time_scale * (self.reference_bin_rate_hz / self.current_bin_rate_hz)
         time_scale = rearrange(time_scale, "seq_len -> seq_len 1 1")
 
         log_scalarA_bar_ll, vecB_bar_ll = self.zoh_discretize(

@@ -47,6 +47,18 @@ class TemporalSSDPlugin(nn.Module):
 
         self.core = SSD(in_dim=in_dim, state_dim=state_dim, head_dim=head_dim, **dict(ssd_kwargs or {}))
 
+    def set_bin_rate_hz(
+        self,
+        *,
+        current_bin_rate_hz: float | None = None,
+        reference_bin_rate_hz: float | None = None,
+    ) -> None:
+        """Update the detector-side SSD time base for runtime frequency changes."""
+        self.core.set_bin_rate_hz(
+            current_bin_rate_hz=current_bin_rate_hz,
+            reference_bin_rate_hz=reference_bin_rate_hz,
+        )
+
     def forward(self, x: torch.Tensor, t_index_ll: list[int]):
         if not torch.is_tensor(x) or x.ndim != 5:
             raise ValueError(f"TemporalSSDPlugin expected T,B,C,H,W tensor, got {type(x)}")
@@ -110,6 +122,18 @@ class SpatialTemporalPlugin(nn.Module):
             state_dim=state_dim,
             head_dim=_compatible_head_dim(hidden_dim, head_dim),
             ssd_kwargs=ssd_kwargs,
+        )
+
+    def set_bin_rate_hz(
+        self,
+        *,
+        current_bin_rate_hz: float | None = None,
+        reference_bin_rate_hz: float | None = None,
+    ) -> None:
+        """Update the temporal SSD time base while leaving the spatial adapter untouched."""
+        self.temporal.set_bin_rate_hz(
+            current_bin_rate_hz=current_bin_rate_hz,
+            reference_bin_rate_hz=reference_bin_rate_hz,
         )
 
     def forward(self, x: torch.Tensor, t_index_ll: list[int]):

@@ -22,6 +22,7 @@ from ultralytics import YOLO
 from det_spad_pose import (
     _apply_tracker,
     _build_override_preprocessor,
+    _configure_model_spad_bin_rate,
     _init_tracker,
     _iter_raw_video_sources_from_sample_path,
     _postprocess_pose_predictions,
@@ -160,6 +161,15 @@ def parse_args():
     ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument(
+        "--spad-bin-rate-hz",
+        type=float,
+        default=8000.0,
+        help=(
+            "Raw-bin frequency of the current inference input. Detector-side SSD time deltas "
+            "are scaled relative to the checkpoint's training reference frequency."
+        ),
+    )
+    ap.add_argument(
         "--preprocessor-override",
         type=str,
         default="none",
@@ -231,6 +241,7 @@ def main():
     device = _resolve_device(args.device)
     spad_model.to(device)
     spad_model.eval()
+    _configure_model_spad_bin_rate(spad_model, current_bin_rate_hz=float(args.spad_bin_rate_hz))
 
     tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate)
     override_name, override_preprocessor = _build_override_preprocessor(args)

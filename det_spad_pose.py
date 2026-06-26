@@ -243,6 +243,37 @@ def _trained_chunk_t(model) -> int | None:
     return int(output_frames) * int(subsampling)
 
 
+def _reference_bin_rate_hz(model) -> float:
+    if hasattr(model, "spad_reference_bin_rate_hz"):
+        return float(getattr(model, "spad_reference_bin_rate_hz"))
+    train_args = getattr(model, "args", None)
+    return float(_cfg_get(train_args, "spad_bin_rate_hz", 8000.0))
+
+
+def _configure_model_spad_bin_rate(model, *, current_bin_rate_hz: float) -> None:
+    current_bin_rate_hz = float(current_bin_rate_hz)
+    if current_bin_rate_hz <= 0:
+        raise ValueError(f"spad_bin_rate_hz must be positive, got {current_bin_rate_hz}")
+    reference_bin_rate_hz = _reference_bin_rate_hz(model)
+    if hasattr(model, "set_spad_bin_rate_hz"):
+        model.set_spad_bin_rate_hz(
+            current_bin_rate_hz=current_bin_rate_hz,
+            reference_bin_rate_hz=reference_bin_rate_hz,
+        )
+        return
+    setattr(model, "spad_reference_bin_rate_hz", reference_bin_rate_hz)
+    setattr(model, "spad_current_bin_rate_hz", current_bin_rate_hz)
+    plugins = getattr(model, "plugins_by_layer", None)
+    if plugins is None:
+        return
+    for plugin in plugins.values():
+        if hasattr(plugin, "set_bin_rate_hz"):
+            plugin.set_bin_rate_hz(
+                current_bin_rate_hz=current_bin_rate_hz,
+                reference_bin_rate_hz=reference_bin_rate_hz,
+            )
+
+
 def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
     name = str(getattr(args, "preprocessor_override", "none")).strip().lower()
     if name in {"", "none"}:
@@ -381,6 +412,15 @@ def main():
     ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument(
+        "--spad-bin-rate-hz",
+        type=float,
+        default=8000.0,
+        help=(
+            "Raw-bin frequency of the current inference input. Detector-side SSD time deltas "
+            "are scaled relative to the checkpoint's training reference frequency."
+        ),
+    )
+    ap.add_argument(
         "--preprocessor-override",
         type=str,
         default="none",
@@ -454,6 +494,7 @@ def main():
     device = _resolve_device(args.device)
     spad_model.to(device)
     spad_model.eval()
+    _configure_model_spad_bin_rate(spad_model, current_bin_rate_hz=float(args.spad_bin_rate_hz))
     tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate)
     override_name, override_preprocessor = _build_override_preprocessor(args)
     if override_preprocessor is not None:

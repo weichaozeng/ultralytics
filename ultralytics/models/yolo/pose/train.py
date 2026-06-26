@@ -204,6 +204,7 @@ class SpadPoseTrainer(PoseTrainer):
         """Get SPAD pose model with optional pretrained detector weights."""
         preprocessor_name = str(getattr(self.args, "spad_preprocessor", "ppb")).strip().lower()
         spad_subsampling = int(getattr(self.args, "spad_subsampling", getattr(self.args, "subsampling", 64)))
+        spad_bin_rate_hz = float(getattr(self.args, "spad_bin_rate_hz", 8000.0))
         preprocessor_kwargs = {"subsampling": spad_subsampling}
         if preprocessor_name == "ppb":
             preprocessor_kwargs.update(
@@ -254,6 +255,7 @@ class SpadPoseTrainer(PoseTrainer):
             spatial_reduce_ratio=int(getattr(self.args, "spad_spatial_reduce_ratio", 2)),
             spatial_kernel_size=int(getattr(self.args, "spad_spatial_kernel_size", 3)),
             plugin_alpha_init=float(getattr(self.args, "spad_plugin_alpha_init", 0.0)),
+            spad_bin_rate_hz=spad_bin_rate_hz,
         )
         if weights:
             model.load(weights)
