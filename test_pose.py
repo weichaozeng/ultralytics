@@ -182,9 +182,9 @@ def parse_args():
         "--tail_pad",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Pad final short chunk to cube_chunk_t; with --no-tail_pad, run short tails at natural length.",
+        help="Deprecated: final chunks shorter than cube_chunk_t are always dropped.",
     )
-    ap.add_argument("--drop_tail", action="store_true", help="Drop the final chunk when it has fewer than cube_chunk_t bins.")
+    ap.add_argument("--drop_tail", action="store_true", help="Deprecated: final chunks shorter than cube_chunk_t are always dropped.")
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=5e-4)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
@@ -314,8 +314,8 @@ def main():
                 "tracker": args.tracker,
                 "frame_rate": int(args.frame_rate),
                 "packed_ch_order": args.packed_ch_order,
-                "tail_pad": bool(args.tail_pad),
-                "drop_tail": bool(args.drop_tail),
+                "tail_pad": False,
+                "drop_tail": True,
                 "vis_mode": str(args.vis),
                 "spad_output_frames": int(args.spad_output_frames),
                 "spad_subsampling": int(args.spad_subsampling),
@@ -351,10 +351,10 @@ def main():
 
             for chunk_idx, t0 in enumerate(range(0, total_bins, stride)):
                 t1 = min(total_bins, t0 + chunk_t)
-                if bool(args.drop_tail) and (t1 - t0) < chunk_t:
+                if (t1 - t0) < chunk_t:
                     continue
                 raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
-                raw_chunk = _prepare_raw_chunk_for_spad(raw_chunk, chunk_t=chunk_t, tail_pad_full=bool(args.tail_pad))
+                raw_chunk = _prepare_raw_chunk_for_spad(raw_chunk, chunk_t=chunk_t, tail_pad_full=False)
                 if raw_chunk is None:
                     continue
 
