@@ -209,6 +209,64 @@ def _stitch_panels(panels: list[np.ndarray], labels: list[str], gap: int = 6) ->
     return out
 
 
+def _select_time_indices(length: int, max_slices: int) -> list[int]:
+    if length <= 0:
+        return []
+    max_slices = max(int(max_slices), 1)
+    if length <= max_slices:
+        return list(range(length))
+    return sorted(set(np.linspace(0, length - 1, num=max_slices).round().astype(int).tolist()))
+
+
+def _panel_from_map(
+    score_map: np.ndarray,
+    *,
+    display_hw: tuple[int, int],
+    cmap_id: int,
+    mode: str,
+    vmax: float,
+    vmin: float = 0.0,
+) -> np.ndarray:
+    disp = _resize_map_to_display(score_map, display_hw)
+    if mode == "heatmap":
+        return _value_to_heatmap(disp, cmap_id, vmax=vmax)
+    if mode == "gray":
+        return _value_to_gray_bgr(disp, vmin=vmin, vmax=vmax)
+    raise ValueError(f"Unsupported panel mode: {mode}")
+
+
+def _temporal_strip(
+    volume_hwt: np.ndarray,
+    *,
+    display_hw: tuple[int, int],
+    cmap_id: int,
+    label_prefix: str,
+    mode: str,
+    vmax: float,
+    vmin: float = 0.0,
+    max_slices: int,
+) -> np.ndarray | None:
+    if volume_hwt.ndim != 3 or int(volume_hwt.shape[-1]) <= 0:
+        return None
+    panels = []
+    labels = []
+    for ti in _select_time_indices(int(volume_hwt.shape[-1]), max_slices):
+        panels.append(
+            _panel_from_map(
+                volume_hwt[..., ti],
+                display_hw=display_hw,
+                cmap_id=cmap_id,
+                mode=mode,
+                vmax=vmax,
+                vmin=vmin,
+            )
+        )
+        labels.append(f"{label_prefix}[t={ti}]")
+    if not panels:
+        return None
+    return _stitch_panels(panels, labels)
+
+
 def _process_chunk_with_full_debug(
     stea: SpatioTemporalEvidenceAccumulation,
     raw: torch.Tensor,
@@ -245,18 +303,27 @@ def _save_visuals(
     motion_sharpness: float,
     motion_threshold: float,
     blend_const: float,
+    temporal_slices: int,
 ) -> None:
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
     display_hw = recon_bgr.shape[:2]
 
+    p_motion_hwt = motion_debug["p_motion"].detach().float().cpu().numpy()
     route_weight_hwt = motion_debug["route_weight"].detach().float().cpu().numpy()
+    valid_weight_hwt = motion_debug["valid_weight"].detach().float().cpu().numpy()
+    k_raw_hwt = motion_debug["k_raw"].detach().float().cpu().numpy()
     k_smoothed_hwt = motion_debug["k_smoothed"].detach().float().cpu().numpy()
+    future_gain_hwt = np.clip(route_weight_hwt - p_motion_hwt, 0.0, 1.0)
     maps = {
+        "k_raw": motion_debug["k_raw"][..., -1].detach().float().cpu().numpy(),
         "k_smoothed": motion_debug["k_smoothed_last"].detach().float().cpu().numpy(),
         "k_smoothed_peak": k_smoothed_hwt.max(axis=-1),
-        "route_weight_raw": motion_debug["route_weight_raw_last"].detach().float().cpu().numpy(),
+        "p_motion": motion_debug["p_motion_last"].detach().float().cpu().numpy(),
         "future_motion": motion_debug["future_motion_last"].detach().float().cpu().numpy(),
+        "future_minus_p": future_gain_hwt[..., -1],
+        "p_motion_peak": p_motion_hwt.max(axis=-1),
         "route_weight_peak": route_weight_hwt.max(axis=-1),
+        "valid_weight": motion_debug["valid_weight_last"].detach().float().cpu().numpy(),
         "valid_weight_sum": motion_debug["stable_support"].detach().float().cpu().numpy() / max(
             float(motion_debug["valid_weight"].shape[-1]), 1.0
         ),
@@ -266,19 +333,101 @@ def _save_visuals(
         "w_mean": motion_debug["w_mean"].detach().float().cpu().numpy(),
         "fused": motion_debug["fused_last"].detach().float().cpu().numpy(),
     }
-    k_vmax_scale = _resolve_vmax(maps["k_smoothed"], fixed_vmax=score_vmax, percentile=score_percentile)
+    k_vmax_scale = _resolve_vmax(k_smoothed_hwt, fixed_vmax=score_vmax, percentile=score_percentile)
 
     score_panels = []
     score_labels = []
     for label, score_map in maps.items():
-        disp = _resize_map_to_display(score_map, display_hw)
-        if label in {"k_smoothed", "k_smoothed_peak"}:
-            panel = _value_to_heatmap(disp, cmap_id, vmax=k_vmax_scale)
+        if label in {"k_raw", "k_smoothed", "k_smoothed_peak"}:
+            panel = _panel_from_map(
+                score_map,
+                display_hw=display_hw,
+                cmap_id=cmap_id,
+                mode="heatmap",
+                vmax=k_vmax_scale,
+            )
         else:
-            panel = _value_to_gray_bgr(disp, vmin=0.0, vmax=1.0)
+            panel = _panel_from_map(
+                score_map,
+                display_hw=display_hw,
+                cmap_id=cmap_id,
+                mode="gray",
+                vmax=1.0,
+            )
         score_panels.append(panel)
         score_labels.append(label)
     cv2.imwrite(str(out_dir / f"{stem}_stea_scores.png"), _stitch_panels(score_panels, score_labels))
+
+    temporal_rows = []
+    temporal_rows.append(
+        _temporal_strip(
+            k_smoothed_hwt,
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="k_smoothed",
+            mode="heatmap",
+            vmax=k_vmax_scale,
+            max_slices=temporal_slices,
+        )
+    )
+    temporal_rows.append(
+        _temporal_strip(
+            p_motion_hwt,
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="p_motion",
+            mode="gray",
+            vmax=1.0,
+            max_slices=temporal_slices,
+        )
+    )
+    temporal_rows.append(
+        _temporal_strip(
+            route_weight_hwt,
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="future_motion",
+            mode="gray",
+            vmax=1.0,
+            max_slices=temporal_slices,
+        )
+    )
+    temporal_rows.append(
+        _temporal_strip(
+            future_gain_hwt,
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="future_minus_p",
+            mode="gray",
+            vmax=1.0,
+            max_slices=temporal_slices,
+        )
+    )
+    temporal_rows.append(
+        _temporal_strip(
+            valid_weight_hwt,
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="valid_weight",
+            mode="gray",
+            vmax=1.0,
+            max_slices=temporal_slices,
+        )
+    )
+    temporal_rows = [row for row in temporal_rows if row is not None]
+    if temporal_rows:
+        row_w = max(row.shape[1] for row in temporal_rows)
+        padded_rows = []
+        for row in temporal_rows:
+            if row.shape[1] < row_w:
+                pad = np.full((row.shape[0], row_w - row.shape[1], 3), 24, dtype=np.uint8)
+                row = np.hstack([row, pad])
+            padded_rows.append(row)
+        sep_h = np.full((8, row_w, 3), 24, dtype=np.uint8)
+        temporal_canvas = padded_rows[0]
+        for row in padded_rows[1:]:
+            temporal_canvas = np.vstack([temporal_canvas, sep_h, row])
+        cv2.imwrite(str(out_dir / f"{stem}_stea_temporal.png"), temporal_canvas)
 
     cv2.imwrite(
         str(out_dir / f"{stem}_stea_compare.png"),
@@ -288,7 +437,8 @@ def _save_visuals(
     route_from_k = 1.0 / (
         1.0 + np.exp(-float(motion_sharpness) * (maps["k_smoothed"] - float(motion_threshold)))
     )
-    route_abs_err = np.abs(route_from_k - maps["route_weight_raw"])
+    route_abs_err = np.abs(route_from_k - maps["p_motion"])
+    future_gain_last = maps["future_minus_p"]
     stats_lines = [
         f"stem={stem}",
         f"fast_window={fast_window} slow_window={slow_window} temporal_window={temporal_window}",
@@ -296,15 +446,26 @@ def _save_visuals(
         f"motion_threshold={motion_threshold} blend_const={blend_const}",
         f"k_smoothed_vmax={k_vmax_scale:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
         "k_smoothed is causal-smoothed Bernoulli KL evidence.",
-        "route_weight visualization is fixed grayscale [0, 1] so brightness is monotonic.",
-        "route_weight_raw = P_motion = sigmoid(motion_sharpness * (k_smoothed - motion_threshold))",
+        "All grayscale routing maps use a fixed [0, 1] range so brightness is monotonic.",
+        "p_motion = sigmoid(motion_sharpness * (k_smoothed - motion_threshold))",
         "future_motion = flip(cummax(flip(P_motion)))",
+        "future_minus_p highlights where reverse-cummax expands motion support beyond the raw sigmoid map.",
         "w_mean = L / (L + blend_const), where L=sum(1-Future_Motion)",
         "k_smoothed_peak = max(k_smoothed) over all frames in the chunk",
         f"route_raw_from_k_abs_err_max={float(route_abs_err.max()):.8f} mean={float(route_abs_err.mean()):.8f}",
+        f"future_minus_p_last_max={float(future_gain_last.max()):.8f} mean={float(future_gain_last.mean()):.8f}",
         "",
     ]
     for label, values in maps.items():
+        stats_lines.extend(_percentile_summary(values, name=label, percentiles=percentiles))
+        stats_lines.append("")
+    for label, values in {
+        "k_smoothed_hwt": k_smoothed_hwt,
+        "p_motion_hwt": p_motion_hwt,
+        "future_motion_hwt": route_weight_hwt,
+        "future_minus_p_hwt": future_gain_hwt,
+        "valid_weight_hwt": valid_weight_hwt,
+    }.items():
         stats_lines.extend(_percentile_summary(values, name=label, percentiles=percentiles))
         stats_lines.append("")
     (out_dir / f"{stem}_stea_stats.txt").write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
@@ -347,6 +508,12 @@ def main() -> None:
         type=float,
         default=99.5,
         help="Percentile vmax for score heatmaps when --score_vmax=0",
+    )
+    ap.add_argument(
+        "--temporal_slices",
+        type=int,
+        default=6,
+        help="How many evenly spaced time slices to show in the temporal STEA debug sheet",
     )
     args = ap.parse_args()
 
@@ -428,6 +595,7 @@ def main() -> None:
                 motion_sharpness=float(args.stea_motion_sharpness),
                 motion_threshold=float(args.stea_motion_threshold),
                 blend_const=float(args.stea_blend_const),
+                temporal_slices=int(args.temporal_slices),
             )
             frame_idx += 1
 
