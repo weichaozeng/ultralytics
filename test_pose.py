@@ -169,13 +169,18 @@ def parse_args():
     ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort", "spad_tracker"])
     ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
-    ap.add_argument("--spad-output-frames", type=int, default=8, help="Expected reconstructed frames per evaluation window")
+    ap.add_argument(
+        "--spad-output-frames",
+        type=int,
+        default=8,
+        help="Metadata only for external-preprocessor evaluation; default runtime chunking is serial at spad_subsampling.",
+    )
     ap.add_argument("--spad-subsampling", type=int, default=320, help="Raw-bin aggregation per reconstructed frame")
     ap.add_argument(
         "--cube_chunk_t",
         type=int,
         default=0,
-        help="If >0, split each raw video into chunks of this many bins. If 0, use spad_output_frames*spad_subsampling.",
+        help="If >0, split each raw video into chunks of this many bins. If 0, default to serial online-style chunking at spad_subsampling.",
     )
     ap.add_argument("--cube_chunk_stride", type=int, default=0, help="Stride for chunking; default uses cube_chunk_t")
     ap.add_argument(
@@ -276,7 +281,7 @@ def main():
     model = YOLO(str(ckpt))
     preprocessor = _build_preprocessor(args, device)
 
-    chunk_t = int(args.cube_chunk_t) if int(args.cube_chunk_t) > 0 else int(args.spad_output_frames) * int(args.spad_subsampling)
+    chunk_t = int(args.cube_chunk_t) if int(args.cube_chunk_t) > 0 else int(args.spad_subsampling)
     if chunk_t <= 0:
         raise ValueError(f"cube_chunk_t must be positive, got {chunk_t}")
     stride = int(args.cube_chunk_stride) if int(args.cube_chunk_stride) > 0 else chunk_t

@@ -38,7 +38,6 @@ from det_spad_pose import (
     _resize_to_shape_bgr,
     _set_velocity_field_on_preprocessor,
     _slice_raw_chunk,
-    _trained_chunk_t,
     _video_num_bins,
 )
 
@@ -301,7 +300,7 @@ def parse_args():
         "--cube_chunk_t",
         type=int,
         default=0,
-        help="If >0, split each raw video into chunks of this many bins. If 0, use the train-time SPAD window length.",
+        help="If >0, split each raw video into chunks of this many bins. If 0, default to serial online-style chunking at preprocessor subsampling.",
     )
     ap.add_argument("--cube_chunk_stride", type=int, default=0, help="Stride for chunking; default uses cube_chunk_t")
     ap.add_argument(
@@ -382,8 +381,6 @@ def main():
         spad_model.preprocessor_name = override_name
     names = yolo.names
     kpt_shape = getattr(spad_model, "kpt_shape", (21, 3))
-    trained_chunk_t = _trained_chunk_t(spad_model)
-
     for sample_spec in sample_specs:
         sample_name = str(sample_spec["sample_name"])
         sample_path = Path(sample_spec["sample_path"])
@@ -433,13 +430,8 @@ def main():
             total_bins = _video_num_bins(source)
             if int(args.cube_chunk_t) > 0:
                 chunk_t = int(args.cube_chunk_t)
-            elif trained_chunk_t is not None:
-                chunk_t = int(trained_chunk_t)
             else:
-                raise ValueError(
-                    "Unable to infer train-time SPAD window length from checkpoint. "
-                    "Pass --cube_chunk_t explicitly."
-                )
+                chunk_t = int(getattr(getattr(spad_model, "preprocessor", None), "subsampling", args.spad_subsampling))
             if chunk_t <= 0:
                 raise ValueError(f"cube_chunk_t must be positive, got {chunk_t}")
 
