@@ -63,6 +63,12 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--chunk_stride", type=int, default=0, help="0 means equal to chunk_size")
     ap.add_argument("--max_bins", type=int, default=0, help="Process at most this many time bins (0 = all)")
+    ap.add_argument(
+        "--max_chunks",
+        type=int,
+        default=0,
+        help="Save at most this many output frames per sample (0 = all). When >0, chunks are evenly spaced.",
+    )
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
@@ -601,6 +607,23 @@ def _preprocess_chunk(
     return _preprocess_vel_rgb(raw_chunk, device=device, integrator=integrators["vel_rgb"], clear_states=first_chunk)
 
 
+def _chunk_start_indices(
+    n_bins: int,
+    *,
+    chunk_size: int,
+    stride: int,
+    max_chunks: int,
+) -> list[int]:
+    if int(max_chunks) > 0:
+        if n_bins <= 0:
+            return []
+        max_t0 = max(0, n_bins - int(chunk_size))
+        if int(max_chunks) == 1:
+            return [0]
+        return [int(round(i * max_t0 / (int(max_chunks) - 1))) for i in range(int(max_chunks))]
+    return list(range(0, n_bins, int(stride)))
+
+
 def main() -> None:
     args = _parse_args()
     npy = _resolve_input_npy(args.in_path)
@@ -623,6 +646,14 @@ def main() -> None:
         ch_order=str(args.packed_ch_order),
     )
     stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else int(args.chunk_size)
+    max_chunks = int(args.max_chunks)
+    chunk_starts = _chunk_start_indices(
+        n_bins,
+        chunk_size=int(args.chunk_size),
+        stride=stride,
+        max_chunks=max_chunks,
+    )
+    independent_chunks = max_chunks > 0
     device = _resolve_device(args.device)
     integrators = _build_integrators(args, device, preprocessors)
     _reset_integrator_states(integrators)
@@ -635,13 +666,14 @@ def main() -> None:
 
     print(f"Loaded {npy}")
     print(f"packed: shape={packed.shape} kind={kind} n_bins={n_bins}")
+    if max_chunks > 0:
+        print(f"max_chunks={max_chunks} (evenly spaced)")
     print(f"writing outputs to: {out_dir}")
     print(f"preprocess flips: flip_x={bool(args.flip_x)} flip_y={bool(args.flip_y)} bitorder={args.bitorder}")
 
-    first_chunk = True
     frame_idx = 0
     cube_idx = 0
-    for t0 in range(0, n_bins, stride):
+    for t0 in chunk_starts:
         t1 = min(t0 + int(args.chunk_size), n_bins)
         raw_chunk, _ = _packed_time_range_to_raw_chunk(
             packed,
@@ -663,13 +695,14 @@ def main() -> None:
         stem = f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{frame_idx:07d}"
         labels: list[str] = []
         panels: list[np.ndarray] = []
+        clear_states = independent_chunks or cube_idx == 0
         for method in preprocessors:
             frames = _preprocess_chunk(
                 method,
                 raw_chunk,
                 kind=kind,
                 device=device,
-                first_chunk=first_chunk,
+                first_chunk=clear_states,
                 integrators=integrators,
             )
             frames_bgr = _frames_tensor_to_bgr_u8(
@@ -695,7 +728,6 @@ def main() -> None:
             )
             cv2.imwrite(str(compare_dir / f"{stem}_compare_recon.png"), mosaic)
 
-        first_chunk = False
         frame_idx += 1
         cube_idx += 1
 
