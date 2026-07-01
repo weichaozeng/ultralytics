@@ -29,6 +29,8 @@ import torch
 
 from ultralytics.data.spad_packed import (
     integrate_raw_chunk_to_rgb,
+    is_packed_spad,
+    packed_frames_to_raw_video,
     raw_plane_to_photon_cube,
     sum_raw_chunk_to_rgb,
 )
@@ -60,6 +62,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--flip_y", action="store_true", help="Flip frames top-bottom before preprocessing")
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--chunk_stride", type=int, default=0, help="0 means equal to chunk_size")
+    ap.add_argument("--max_bins", type=int, default=0, help="Process at most this many time bins (0 = all)")
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
@@ -143,10 +146,15 @@ def _crop_axis(arr: np.ndarray, axis: int, size: int) -> np.ndarray:
     return arr[tuple(slices)]
 
 
-def _load_unpacked(path: Path, *, bitdim: int, expected_w: int, bitorder: str) -> np.ndarray:
+def _load_packed_mmap(path: Path) -> np.ndarray:
     arr = np.load(path, mmap_mode="r", allow_pickle=False)
     if not isinstance(arr, np.ndarray):
         raise TypeError(f"Expected ndarray in {path}, got {type(arr)}")
+    return arr
+
+
+def _load_unpacked(path: Path, *, bitdim: int, expected_w: int, bitorder: str) -> np.ndarray:
+    arr = _load_packed_mmap(path)
     axis = _normalize_axis(int(bitdim), int(arr.ndim))
     unpacked = np.unpackbits(arr, axis=axis, bitorder=bitorder)
     unpacked = _crop_axis(unpacked, axis=axis, size=int(expected_w))
@@ -178,6 +186,84 @@ def _apply_spatial_preprocess_ops(
     if flip_y:
         out = np.flip(out, axis=1)
     return np.ascontiguousarray(out)
+
+
+def _apply_spatial_preprocess_ops_raw(
+    raw_chunk: np.ndarray,
+    *,
+    flip_x: bool,
+    flip_y: bool,
+) -> np.ndarray:
+    out = raw_chunk
+    if flip_x:
+        out = np.flip(out, axis=2)
+    if flip_y:
+        out = np.flip(out, axis=1)
+    return np.ascontiguousarray(out)
+
+
+def _generic_packed_slice_to_raw_chunk(
+    packed_slice: np.ndarray,
+    *,
+    bitdim: int,
+    expected_w: int,
+    bitorder: str,
+    ch_order: str,
+) -> tuple[np.ndarray, str]:
+    axis = _normalize_axis(int(bitdim), int(packed_slice.ndim))
+    unpacked = np.unpackbits(packed_slice, axis=axis, bitorder=bitorder)
+    unpacked = _crop_axis(unpacked, axis=axis, size=int(expected_w))
+    unpacked = unpacked.astype(np.uint8, copy=False)
+    kind = _infer_input_kind(unpacked)
+    if kind == "single":
+        raw_chunk = _single_to_raw_video(unpacked)
+    else:
+        raw_chunk = _rgb_planes_to_raw_video(unpacked, ch_order=ch_order)
+    return raw_chunk, kind
+
+
+def _packed_time_range_to_raw_chunk(
+    packed: np.ndarray,
+    t0: int,
+    t1: int,
+    *,
+    bitdim: int,
+    expected_w: int,
+    bitorder: str,
+    ch_order: str,
+) -> tuple[np.ndarray, str]:
+    packed_slice = np.ascontiguousarray(packed[t0:t1])
+    if packed_slice.shape[0] == 0:
+        raise ValueError(f"Empty packed slice [{t0}:{t1})")
+    if is_packed_spad(packed):
+        raw_chunk = packed_frames_to_raw_video(
+            packed_slice,
+            expected_w=int(expected_w),
+            ch_order=ch_order,
+        )
+        return raw_chunk, "rgb_planes"
+    return _generic_packed_slice_to_raw_chunk(
+        packed_slice,
+        bitdim=bitdim,
+        expected_w=expected_w,
+        bitorder=bitorder,
+        ch_order=ch_order,
+    )
+
+
+def _infer_layout_from_packed(packed: np.ndarray, *, bitdim: int, expected_w: int, bitorder: str, ch_order: str) -> str:
+    if is_packed_spad(packed):
+        return "rgb_planes"
+    _, kind = _packed_time_range_to_raw_chunk(
+        packed,
+        0,
+        1,
+        bitdim=bitdim,
+        expected_w=expected_w,
+        bitorder=bitorder,
+        ch_order=ch_order,
+    )
+    return kind
 
 
 def _rgb_planes_to_raw_video(unpacked: np.ndarray, *, ch_order: str) -> np.ndarray:
@@ -525,15 +611,17 @@ def main() -> None:
     if not preprocessors:
         raise ValueError("No preprocessors selected")
 
-    unpacked = _load_unpacked(npy, bitdim=int(args.bitdim), expected_w=int(args.expected_w), bitorder=str(args.bitorder))
-    unpacked = _apply_spatial_preprocess_ops(
-        unpacked,
-        flip_x=bool(args.flip_x),
-        flip_y=bool(args.flip_y),
+    packed = _load_packed_mmap(npy)
+    n_bins = int(packed.shape[0])
+    if int(args.max_bins) > 0:
+        n_bins = min(n_bins, int(args.max_bins))
+    kind = _infer_layout_from_packed(
+        packed,
+        bitdim=int(args.bitdim),
+        expected_w=int(args.expected_w),
+        bitorder=str(args.bitorder),
+        ch_order=str(args.packed_ch_order),
     )
-    kind = _infer_input_kind(unpacked)
-    raw_video = _single_to_raw_video(unpacked) if kind == "single" else _rgb_planes_to_raw_video(unpacked, ch_order=args.packed_ch_order)
-    n_bins = int(raw_video.shape[0])
     stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else int(args.chunk_size)
     device = _resolve_device(args.device)
     integrators = _build_integrators(args, device, preprocessors)
@@ -546,8 +634,7 @@ def main() -> None:
     compare_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loaded {npy}")
-    print(f"unpacked: shape={unpacked.shape} kind={kind}")
-    print(f"raw_video: shape={raw_video.shape}")
+    print(f"packed: shape={packed.shape} kind={kind} n_bins={n_bins}")
     print(f"writing outputs to: {out_dir}")
     print(f"preprocess flips: flip_x={bool(args.flip_x)} flip_y={bool(args.flip_y)} bitorder={args.bitorder}")
 
@@ -556,7 +643,20 @@ def main() -> None:
     cube_idx = 0
     for t0 in range(0, n_bins, stride):
         t1 = min(t0 + int(args.chunk_size), n_bins)
-        raw_chunk = np.ascontiguousarray(raw_video[t0:t1])
+        raw_chunk, _ = _packed_time_range_to_raw_chunk(
+            packed,
+            t0,
+            t1,
+            bitdim=int(args.bitdim),
+            expected_w=int(args.expected_w),
+            bitorder=str(args.bitorder),
+            ch_order=str(args.packed_ch_order),
+        )
+        raw_chunk = _apply_spatial_preprocess_ops_raw(
+            raw_chunk,
+            flip_x=bool(args.flip_x),
+            flip_y=bool(args.flip_y),
+        )
         if raw_chunk.shape[0] == 0:
             continue
 
