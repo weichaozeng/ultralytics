@@ -154,6 +154,15 @@ def _process_window_with_preprocessor(
     return frames, t_indices[: int(frames.shape[0])]
 
 
+def _apply_input_gamma(frames_tchw: torch.Tensor, gamma: float) -> torch.Tensor:
+    gamma = float(gamma)
+    if gamma <= 0:
+        raise ValueError(f"--input_gamma must be positive, got {gamma}")
+    if abs(gamma - 1.0) < 1e-8:
+        return frames_tchw
+    return torch.pow(torch.clamp(frames_tchw, 0.0, 1.0), 1.0 / gamma)
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description="External SPAD preprocessor + original YOLO pose detector evaluation")
     ap.add_argument("--ckpt", type=str, required=True, help="Standard pretrained YOLO pose checkpoint")
@@ -169,6 +178,12 @@ def parse_args():
     ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort", "spad_tracker"])
     ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
+    ap.add_argument(
+        "--input_gamma",
+        type=float,
+        default=1.0,
+        help="Optional gamma for detector input after SPAD reconstruction. 1.0 disables gamma correction.",
+    )
     ap.add_argument(
         "--spad-output-frames",
         type=int,
@@ -319,6 +334,7 @@ def main():
                 "tracker": args.tracker,
                 "frame_rate": int(args.frame_rate),
                 "packed_ch_order": args.packed_ch_order,
+                "input_gamma": float(args.input_gamma),
                 "tail_pad": False,
                 "drop_tail": True,
                 "vis_mode": str(args.vis),
@@ -373,6 +389,7 @@ def main():
                         clear_states=first_chunk,
                     )
                 frames_tchw, local_t_indices = frames
+                frames_tchw = _apply_input_gamma(frames_tchw, args.input_gamma)
                 frames_bgr = [
                     np.ascontiguousarray((np.clip(frame.permute(1, 2, 0).detach().float().cpu().numpy(), 0, 1) * 255.0).astype(np.uint8)[:, :, ::-1])
                     for frame in frames_tchw
