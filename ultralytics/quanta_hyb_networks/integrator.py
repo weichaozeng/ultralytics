@@ -210,33 +210,108 @@ class HybridSpatioTemporalEvidenceAccumulation(SpatioTemporalEvidenceAccumulatio
         stable_support = valid_weight.sum(dim=-1)
         return accum / stable_support.clamp(min=self.eps)
 
+    def _uses_velocity_warp(self, photon_cube: Tensor) -> bool:
+        if self.velocity_field is None:
+            return False
+        h, w, _ = map(int, photon_cube.shape)
+        flow = self._resized_velocity_field((h // 2, w // 2), device=photon_cube.device, dtype=photon_cube.float().dtype)
+        return bool(torch.any(flow.abs() > 1e-6))
+
+    @torch.no_grad()
+    def _integrate_last_velocity(self, photon_cube: Tensor) -> Tensor:
+        """Streaming STEA integration with velocity-compensated slow branch."""
+        h, w, t = map(int, photon_cube.shape)
+        x = photon_cube.float()
+        max_photon_hist = max(self.fast_window, self.slow_window) - 1
+        max_kl_hist = self.temporal_window - 1
+
+        fast_hist = self._history_or_zeros(self.photon_history, h, w, self.fast_window - 1, x)
+        slow_hist = self._history_or_zeros(self.photon_history, h, w, self.slow_window - 1, x)
+        kl_hist = self._history_or_zeros(self.kl_history, h, w, max_kl_hist, x)
+        prefix_len = int(slow_hist.shape[-1])
+
+        flow = self._resized_velocity_field((h // 2, w // 2), device=x.device, dtype=x.dtype)
+        denom = max(int(self.chunk_size) - 1, 1)
+        support_len = prefix_len + t
+
+        diff = x.new_zeros(h, w, t + 1)
+        p_motion = x.new_zeros(h, w, t)
+        y_fast_last = x.new_zeros(h, w)
+
+        def _apply_diff_update(frame: Tensor, t_start: int, t_end: int) -> None:
+            diff[..., t_start] += frame
+            if t_end + 1 < t:
+                diff[..., t_end + 1] -= frame
+
+        for start in range(0, prefix_len, self.warp_block_size):
+            end = min(start + self.warp_block_size, prefix_len)
+            frames = slow_hist[..., start:end]
+            gaps = (support_len - 1) - torch.arange(start, end, device=x.device)
+            warped = self._warp_raw_frames_in_rgb(frames, flow, gaps, denom)
+            for local_idx, support_idx in enumerate(range(start, end)):
+                t_start = max(0, support_idx - self.slow_window + 1)
+                t_end = min(support_idx, t - 1)
+                if t_start > t_end:
+                    continue
+                _apply_diff_update(warped[..., local_idx], t_start, t_end)
+
+        for ti in range(t):
+            x_t = x[..., ti : ti + 1]
+            x_flat = x_t.reshape(h * w, 1, 1)
+
+            y_fast_t = self._causal_conv1d(x_flat, self.fast_kernel, fast_hist).reshape(h, w).clamp(
+                self.eps, 1.0 - self.eps
+            )
+            y_fast_last = y_fast_t
+
+            support_idx = prefix_len + ti
+            gap = x.new_tensor([support_len - 1 - support_idx])
+            warped = self._warp_raw_frames_in_rgb(x_t, flow, gap, denom)
+            t_start = max(0, support_idx - self.slow_window + 1)
+            t_end = min(support_idx, t - 1)
+            if t_start <= t_end:
+                _apply_diff_update(warped[..., 0], t_start, t_end)
+
+            y_slow_t = (diff[..., : ti + 1].sum(dim=-1) / float(self.slow_window)).clamp(self.eps, 1.0 - self.eps)
+
+            k_raw_t = self._bernoulli_kl(y_fast_t, y_slow_t).unsqueeze(-1)
+            k_smoothed_t = self._smooth_kl_step(k_raw_t, kl_hist)
+            p_motion[..., ti] = torch.sigmoid(self.motion_sharpness * (k_smoothed_t - self.motion_threshold))
+
+            fast_hist = self._append_temporal_history(fast_hist, x_t, self.fast_window - 1)
+            slow_hist = self._append_temporal_history(slow_hist, x_t, self.slow_window - 1)
+            kl_hist = self._append_temporal_history(kl_hist, k_raw_t, max_kl_hist)
+
+        running_max = x.new_zeros(h, w)
+        stable_num = x.new_zeros(h, w)
+        stable_den = x.new_zeros(h, w)
+        for ti in range(t - 1, -1, -1):
+            running_max = torch.maximum(running_max, p_motion[..., ti])
+            valid_weight = 1.0 - running_max
+            gap = x.new_tensor([(t - 1) - ti])
+            warped = self._warp_raw_frames_in_rgb(x[..., ti : ti + 1], flow, gap, denom)
+            stable_num += warped[..., 0] * valid_weight
+            stable_den += valid_weight
+
+        mean_stable = stable_num / stable_den.clamp(min=self.eps)
+        w_mean = stable_den / (stable_den + max(self.stable_prior, self.eps))
+        fused_last = w_mean * mean_stable + (1.0 - w_mean) * y_fast_last
+
+        if max_photon_hist > 0:
+            self.photon_history = x[..., -max_photon_hist:].detach()
+        else:
+            self.photon_history = None
+        self.kl_history = kl_hist.detach() if max_kl_hist > 0 else None
+        return fused_last.unsqueeze(-1)
+
+    @torch.no_grad()
     def _integrate_last(self, photon_cube: Tensor) -> Tensor:
         h, w, t = map(int, photon_cube.shape)
         if t == 0:
             return photon_cube.new_zeros(h, w, 0, dtype=torch.float32)
-
-        y_fast = self._fast_temporal_basis(photon_cube)
-        y_slow = self._slow_temporal_basis(photon_cube)
-        y_fast_last = y_fast[..., -1].reshape(h, w)
-
-        k_raw_flat = y_fast * torch.log(y_fast / y_slow) + (1.0 - y_fast) * torch.log((1.0 - y_fast) / (1.0 - y_slow))
-        k_raw_hwt = k_raw_flat.reshape(h, w, t)
-        k_smoothed_hwt = self._smooth_kl(k_raw_hwt)
-
-        p_motion = torch.sigmoid(self.motion_sharpness * (k_smoothed_hwt - self.motion_threshold))
-        future_motion = torch.flip(torch.flip(p_motion, dims=(-1,)).cummax(dim=-1).values, dims=(-1,))
-        valid_weight = 1.0 - future_motion
-        stable_support = valid_weight.sum(dim=-1)
-        mean_stable = self._mean_stable_tail_aligned(photon_cube, valid_weight)
-        w_mean = stable_support / (stable_support + max(self.stable_prior, self.eps))
-        fused_last = w_mean * mean_stable + (1.0 - w_mean) * y_fast_last
-        fused = fused_last.unsqueeze(-1)
-
-        max_photon_hist = max(self.fast_window, self.slow_window) - 1
-        max_kl_hist = self.temporal_window - 1
-        self.photon_history = photon_cube.float()[..., -max_photon_hist:].detach() if max_photon_hist > 0 else None
-        self.kl_history = k_raw_hwt[..., -max_kl_hist:].detach() if max_kl_hist > 0 else None
-        return fused
+        if self._uses_velocity_warp(photon_cube):
+            return self._integrate_last_velocity(photon_cube)
+        return super()._integrate_last(photon_cube)
 
     @torch.no_grad()
     def _integrate_last_with_debug(self, photon_cube: Tensor) -> tuple[Tensor, dict[str, Tensor]]:

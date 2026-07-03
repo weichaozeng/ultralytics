@@ -180,6 +180,88 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         k_5d = F.pad(k_5d, (1, 1, 1, 1, 0, 0))
         return F.conv3d(k_5d, self.stea_kernel).squeeze(0).squeeze(0).squeeze(0)
 
+    @staticmethod
+    def _append_temporal_history(history: Tensor, frame_hw1: Tensor, maxlen: int) -> Tensor:
+        if maxlen <= 0:
+            return history
+        if int(history.shape[-1]) == 0:
+            out = frame_hw1
+        else:
+            out = torch.cat([history, frame_hw1], dim=-1)
+        if int(out.shape[-1]) > maxlen:
+            out = out[..., -maxlen:]
+        return out
+
+    def _smooth_kl_step(self, k_raw_hw1: Tensor, kl_hist: Tensor) -> Tensor:
+        """Causal 3D-smoothed KL evidence for one new raw-KL frame."""
+        context = torch.cat([kl_hist, k_raw_hw1], dim=-1)[..., -self.temporal_window :]
+        k_thw = context.permute(2, 0, 1).unsqueeze(1)
+        k_5d = k_thw.unsqueeze(0).transpose(1, 2)
+        k_5d = F.pad(k_5d, (1, 1, 1, 1, 0, 0))
+        return F.conv3d(k_5d, self.stea_kernel).squeeze(0).squeeze(0).squeeze(0)
+
+    @staticmethod
+    def _bernoulli_kl(y_fast: Tensor, y_slow: Tensor) -> Tensor:
+        return y_fast * torch.log(y_fast / y_slow) + (1.0 - y_fast) * torch.log((1.0 - y_fast) / (1.0 - y_slow))
+
+    @torch.no_grad()
+    def _integrate_last(self, photon_cube: Tensor) -> Tensor:
+        """Memory-efficient streaming integration that emits only the final fused frame."""
+        h, w, t = map(int, photon_cube.shape)
+        if t == 0:
+            return photon_cube.new_zeros(h, w, 0, dtype=torch.float32)
+
+        x = photon_cube.float()
+        max_photon_hist = max(self.fast_window, self.slow_window) - 1
+        max_kl_hist = self.temporal_window - 1
+
+        fast_hist = self._history_or_zeros(self.photon_history, h, w, self.fast_window - 1, x)
+        slow_hist = self._history_or_zeros(self.photon_history, h, w, self.slow_window - 1, x)
+        kl_hist = self._history_or_zeros(self.kl_history, h, w, max_kl_hist, x)
+
+        p_motion = x.new_zeros(h, w, t)
+        y_fast_last = x.new_zeros(h, w)
+
+        for ti in range(t):
+            x_t = x[..., ti : ti + 1]
+            x_flat = x_t.reshape(h * w, 1, 1)
+
+            y_fast_t = self._causal_conv1d(x_flat, self.fast_kernel, fast_hist).reshape(h, w).clamp(
+                self.eps, 1.0 - self.eps
+            )
+            y_slow_t = self._causal_conv1d(x_flat, self.slow_kernel, slow_hist).reshape(h, w).clamp(
+                self.eps, 1.0 - self.eps
+            )
+            y_fast_last = y_fast_t
+
+            k_raw_t = self._bernoulli_kl(y_fast_t, y_slow_t).unsqueeze(-1)
+            k_smoothed_t = self._smooth_kl_step(k_raw_t, kl_hist)
+            p_motion[..., ti] = torch.sigmoid(self.motion_sharpness * (k_smoothed_t - self.motion_threshold))
+
+            fast_hist = self._append_temporal_history(fast_hist, x_t, self.fast_window - 1)
+            slow_hist = self._append_temporal_history(slow_hist, x_t, self.slow_window - 1)
+            kl_hist = self._append_temporal_history(kl_hist, k_raw_t, max_kl_hist)
+
+        running_max = x.new_zeros(h, w)
+        stable_num = x.new_zeros(h, w)
+        stable_den = x.new_zeros(h, w)
+        for ti in range(t - 1, -1, -1):
+            running_max = torch.maximum(running_max, p_motion[..., ti])
+            valid_weight = 1.0 - running_max
+            stable_num += valid_weight * x[..., ti]
+            stable_den += valid_weight
+
+        mean_stable = stable_num / stable_den.clamp(min=self.eps)
+        w_mean = stable_den / (stable_den + max(self.stable_prior, self.eps))
+        fused_last = w_mean * mean_stable + (1.0 - w_mean) * y_fast_last
+
+        if max_photon_hist > 0:
+            self.photon_history = x[..., -max_photon_hist:].detach()
+        else:
+            self.photon_history = None
+        self.kl_history = kl_hist.detach() if max_kl_hist > 0 else None
+        return fused_last.unsqueeze(-1)
+
     @torch.no_grad()
     def _integrate_last_with_debug(self, photon_cube: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         """Memory-efficient path for chunked scripts that only emit the final frame."""
@@ -330,10 +412,7 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         )
 
         self.set_cube(photon_cube)
-        if self._t <= self.subsampling:
-            fused, _ = self._integrate_last_with_debug(photon_cube)
-        else:
-            fused, _ = self._integrate_full_with_debug(photon_cube)
+        fused = self._integrate_last(photon_cube)
         recons = self._subsample_reconstruction(fused)
         if self.hot_pixel_mask is not None:
             recons = nearest_neighbor_inpaint(recons, self.hot_pixel_mask)
@@ -396,4 +475,4 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
         return recons, motion_debug
 
     def forward(self, photon_cube: Tensor) -> Tensor:
-        return self._integrate_full_with_debug(photon_cube)[0]
+        return self._integrate_last(photon_cube)
