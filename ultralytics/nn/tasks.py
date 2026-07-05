@@ -929,6 +929,146 @@ class SpadPoseModel(PoseModel):
             feature_visualization(x, module.type, module.i, save_dir=visualize)
 
 
+SpadPoseSequenceModel = SpadPoseModel
+
+
+class SpadPoseFrameModel(PoseModel):
+    """SPAD pose model that collapses each raw chunk into one detector frame plus one confidence map."""
+
+    def __init__(
+        self,
+        cfg="yolo11n-pose.yaml",
+        ch=3,
+        nc=None,
+        data_kpt_shape=(None, None),
+        verbose=True,
+        spad_enabled=True,
+        preprocessor="stea",
+        preprocessor_kwargs=None,
+        frame_adapter="ua",
+        frame_adapter_kernel_size=3,
+        frame_adapter_alpha_init=0.0,
+        spad_chunk_size: int | None = None,
+        spad_bin_rate_hz=8000.0,
+    ):
+        self.spad_enabled = spad_enabled
+        self.preprocessor_name = str(preprocessor).strip().lower()
+        self.preprocessor_kwargs = dict(preprocessor_kwargs or {})
+        self.frame_adapter_name = str(frame_adapter).strip().lower()
+        self.frame_adapter_kernel_size = int(frame_adapter_kernel_size)
+        self.frame_adapter_alpha_init = float(frame_adapter_alpha_init)
+        self.spad_chunk_size = None if spad_chunk_size is None else int(spad_chunk_size)
+        self.spad_reference_bin_rate_hz = float(spad_bin_rate_hz)
+        self.spad_current_bin_rate_hz = float(spad_bin_rate_hz)
+        self.spad_packed_nch = 3
+        self.spad_last_recon_frames = None
+        self.spad_last_confidence = None
+        self.spad_last_confidence_frames = None
+        self.spad_last_w_mean = None
+        self.spad_last_w_mean_frames = None
+        self.spad_t_index_ll = []
+
+        super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
+
+        self.preprocessor = None
+        self.frame_adapter = None
+        if self.spad_enabled:
+            self._init_spad_frame_modules()
+
+    def _init_spad_frame_modules(self):
+        """Create frame-mode SPAD preprocessor and interface adapter."""
+        from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_frame_preprocessor
+        from ultralytics.quanta_stea_networks.adapter import build_frame_adapter
+
+        self.preprocessor = build_spad_frame_preprocessor(self.preprocessor_name, kwargs=self.preprocessor_kwargs)
+        self.frame_adapter = build_frame_adapter(
+            self.frame_adapter_name,
+            in_channels=3,
+            kernel_size=self.frame_adapter_kernel_size,
+            alpha_init=self.frame_adapter_alpha_init,
+        )
+
+    def set_spad_bin_rate_hz(
+        self,
+        *,
+        current_bin_rate_hz: float | None = None,
+        reference_bin_rate_hz: float | None = None,
+    ) -> None:
+        """Track raw-bin frequency metadata for frame-mode checkpoints."""
+        if reference_bin_rate_hz is not None:
+            reference_bin_rate_hz = float(reference_bin_rate_hz)
+            if reference_bin_rate_hz <= 0:
+                raise ValueError(f"reference_bin_rate_hz must be positive, got {reference_bin_rate_hz}")
+            self.spad_reference_bin_rate_hz = reference_bin_rate_hz
+        if current_bin_rate_hz is None:
+            current_bin_rate_hz = self.spad_reference_bin_rate_hz
+        current_bin_rate_hz = float(current_bin_rate_hz)
+        if current_bin_rate_hz <= 0:
+            raise ValueError(f"current_bin_rate_hz must be positive, got {current_bin_rate_hz}")
+        self.spad_current_bin_rate_hz = current_bin_rate_hz
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """Run one-frame SPAD reconstruction, optional UA adaptation, then standard YOLO pose inference."""
+        if not self.spad_enabled or not torch.is_tensor(x) or x.ndim != 5:
+            return super()._predict_once(x, profile, visualize, embed)
+
+        frames_bchw, confidence_b1hw = self._spad_video_to_frame_batch(x)
+        self.spad_last_recon_frames = frames_bchw.detach().unsqueeze(0)
+        self.spad_last_confidence = confidence_b1hw.detach()
+        self.spad_last_confidence_frames = confidence_b1hw.detach().unsqueeze(0)
+        self.spad_last_w_mean = self.spad_last_confidence
+        self.spad_last_w_mean_frames = self.spad_last_confidence_frames
+        if self.frame_adapter is not None:
+            frames_bchw = self.frame_adapter(frames_bchw, confidence_b1hw)
+        return super()._predict_once(frames_bchw, profile, visualize, embed)
+
+    def _spad_video_to_frame_batch(self, video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert B,T,rawH,rawW,1 raw SPAD chunks into B,3,H,W detector frames plus B,1,H,W confidence maps."""
+        if self.preprocessor is None:
+            raise RuntimeError("Frame-mode SPAD preprocessor is not initialized.")
+        if video.ndim != 5:
+            raise ValueError(f"Expected B,T,rawH,rawW,1 video tensor, got shape={tuple(video.shape)}")
+
+        bsz, _, raw_h, raw_w, channels = video.shape
+        if channels != 1:
+            raise ValueError(f"SpadPoseFrameModel expects single-channel Bayer raw SPAD input, got C={channels}")
+        if raw_h % 2 != 0 or raw_w % 2 != 0:
+            raise ValueError(f"Raw SPAD height/width must be even for Bayer unexpand, got {(raw_h, raw_w)}")
+
+        packed_nch = int(getattr(self, "spad_packed_nch", 3) or 3)
+        frame_ll, confidence_ll = [], []
+        t_raw = int(video.shape[1])
+        for b in range(bsz):
+            photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
+            recons, confidence = self._spad_process_frame_window(photon_cube)
+            frames_tchw = SpadPoseModel._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
+            if int(frames_tchw.shape[0]) == 0:
+                raise ValueError("Frame-mode preprocessor produced zero frames; expected exactly one.")
+            frame_ll.append(frames_tchw[-1])
+            confidence_ll.append(confidence)
+
+        frames_bchw = torch.stack(frame_ll, dim=0)
+        confidence_b1hw = torch.stack(confidence_ll, dim=0)
+        self.spad_batch_size = int(bsz)
+        self.spad_num_frame = 1
+        self.spad_t_index_ll = [t_raw]
+        return frames_bchw, confidence_b1hw
+
+    def _spad_process_frame_window(self, photon_cube: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process one raw SPAD chunk into one reconstructed frame and one aligned confidence map."""
+        if not hasattr(self.preprocessor, "process_photon_cube_to_frame"):
+            raise TypeError(
+                f"Frame-mode preprocessor {self.preprocessor.__class__.__name__} must implement "
+                "`process_photon_cube_to_frame`."
+            )
+        recons, confidence = self.preprocessor.process_photon_cube_to_frame(photon_cube, clear_states=True)
+        if recons.ndim != 3 or int(recons.shape[-1]) != 1:
+            raise ValueError(f"Expected frame-mode reconstruction (H,W,1), got shape={tuple(recons.shape)}")
+        if confidence.ndim != 3 or int(confidence.shape[0]) != 1:
+            raise ValueError(f"Expected frame-mode confidence map (1,H,W), got shape={tuple(confidence.shape)}")
+        return recons, confidence
+
+
 class ClassificationModel(BaseModel):
     """YOLO classification model.
 

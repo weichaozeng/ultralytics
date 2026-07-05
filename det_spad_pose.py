@@ -235,7 +235,13 @@ def _resolve_device(device_arg: str) -> torch.device:
 
 
 def _trained_chunk_t(model) -> int | None:
+    model_chunk_size = getattr(model, "spad_chunk_size", None)
+    if model_chunk_size:
+        return int(model_chunk_size)
     train_args = getattr(model, "args", None)
+    chunk_size = _cfg_get(train_args, "spad_chunk_size", None)
+    if chunk_size:
+        return int(chunk_size)
     output_frames = _cfg_get(train_args, "spad_output_frames", None)
     subsampling = getattr(getattr(model, "preprocessor", None), "subsampling", None)
     if output_frames is None or subsampling is None:
@@ -343,7 +349,10 @@ def _recon_frames_bgr(model, batch_index: int = 0) -> list[np.ndarray]:
     frames = getattr(model, "spad_last_recon_frames", None)
     if frames is None:
         return []
-    rgb = frames[:, batch_index].detach().float().cpu().permute(0, 2, 3, 1).numpy()
+    if torch.is_tensor(frames) and frames.ndim == 4:
+        rgb = frames[batch_index : batch_index + 1].detach().float().cpu().permute(0, 2, 3, 1).numpy()
+    else:
+        rgb = frames[:, batch_index].detach().float().cpu().permute(0, 2, 3, 1).numpy()
     bgr = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)[:, :, :, ::-1]
     return [np.ascontiguousarray(frame) for frame in bgr]
 
@@ -530,7 +539,8 @@ def main():
             if chunk_t <= 0:
                 raise ValueError(f"cube_chunk_t must be positive, got {chunk_t}")
             subsampling = int(getattr(getattr(spad_model, "preprocessor", None), "subsampling", 1) or 1)
-            if chunk_t < subsampling:
+            requires_multiframe_chunk = not hasattr(spad_model, "frame_adapter_name")
+            if requires_multiframe_chunk and chunk_t < subsampling:
                 raise ValueError(
                     f"cube_chunk_t={chunk_t} is shorter than preprocessor subsampling={subsampling}, "
                     "which would produce zero reconstructed frames. Increase --cube_chunk_t or use the checkpoint default."

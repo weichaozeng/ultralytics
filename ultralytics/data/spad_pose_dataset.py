@@ -15,7 +15,7 @@ from ultralytics.data.spad_packed import infer_packed_nch, packed_frames_to_raw_
 
 
 @dataclass(frozen=True)
-class SpadWindow:
+class SpadPoseSequenceWindow:
     """A fixed temporal training window inside one video."""
 
     name: str
@@ -70,7 +70,7 @@ def load_visionsim_split_json(path: str | Path) -> list[dict[str, str]]:
     return records
 
 
-class SpadPoseDataset(Dataset):
+class SpadPoseSequenceDataset(Dataset):
     """Load fixed windows from packed SPAD videos and timestamp-aligned hand pose labels."""
 
     HAND_TO_CLASS = {"left_hand": 0, "right_hand": 1}
@@ -115,8 +115,8 @@ class SpadPoseDataset(Dataset):
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _build_windows(self) -> list[SpadWindow]:
-        windows: list[SpadWindow] = []
+    def _build_windows(self) -> list[SpadPoseSequenceWindow]:
+        windows: list[SpadPoseSequenceWindow] = []
         for name in self.video_names:
             ann = self.annotations[name]
             n_gt = len(ann)
@@ -128,7 +128,7 @@ class SpadPoseDataset(Dataset):
             gt_ann_path = Path(self.sample_records[name]["gt"])
             for gt_start in range(0, max_start + 1, self.stride_frames):
                 windows.append(
-                    SpadWindow(
+                    SpadPoseSequenceWindow(
                         name=name,
                         gt_ann_path=gt_ann_path,
                         spad_path=spad_path,
@@ -159,7 +159,7 @@ class SpadPoseDataset(Dataset):
             "resized_shape": (self.image_size, self.image_size),
         }
 
-    def _load_raw_window(self, window: SpadWindow) -> np.ndarray:
+    def _load_raw_window(self, window: SpadPoseSequenceWindow) -> np.ndarray:
         spad_start = window.gt_start * self.spad_bins_per_gt
         spad_len = window.output_frames * window.spad_step
         spad_end = spad_start + spad_len
@@ -173,7 +173,7 @@ class SpadPoseDataset(Dataset):
         raw = packed_frames_to_raw_video(packed, ch_order=self.packed_ch_order)
         return raw.astype(np.uint8, copy=False), packed_nch
 
-    def _labels_for_window(self, window: SpadWindow):
+    def _labels_for_window(self, window: SpadPoseSequenceWindow):
         ann = self.annotations[window.name]
         cls_ll, bbox_ll, kpt_ll, batch_idx_ll = [], [], [], []
 
@@ -262,3 +262,184 @@ class SpadPoseDataset(Dataset):
         new_batch["ori_shape"] = [b["ori_shape"] for b in batch]
         new_batch["resized_shape"] = [b["resized_shape"] for b in batch]
         return new_batch
+
+
+@dataclass(frozen=True)
+class SpadPoseFrameWindow:
+    """One raw SPAD chunk supervised only at the chunk end time."""
+
+    name: str
+    gt_ann_path: Path
+    spad_path: Path
+    gt_start: int
+    chunk_size: int
+
+
+class SpadPoseFrameDataset(Dataset):
+    """Load fixed raw chunks and supervise only the end-of-chunk pose annotation."""
+
+    HAND_TO_CLASS = SpadPoseSequenceDataset.HAND_TO_CLASS
+
+    def __init__(
+        self,
+        samples: list[dict[str, str]],
+        *,
+        chunk_size: int,
+        spad_bins_per_gt: int = 64,
+        stride_frames: int | None = None,
+        image_size: int = 512,
+        packed_ch_order: str = "RGB",
+    ):
+        if not samples:
+            raise ValueError("samples must be a non-empty list")
+
+        self.chunk_size = int(chunk_size)
+        self.spad_bins_per_gt = int(spad_bins_per_gt)
+        self.stride_frames = int(stride_frames or 1)
+        self.image_size = int(image_size)
+        self.packed_ch_order = packed_ch_order.upper()
+
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {self.chunk_size}")
+        if self.spad_bins_per_gt <= 0:
+            raise ValueError(f"spad_bins_per_gt must be > 0, got {self.spad_bins_per_gt}")
+        if self.stride_frames <= 0:
+            raise ValueError(f"stride_frames must be > 0, got {self.stride_frames}")
+
+        self.sample_records = {rec["id"]: rec for rec in samples}
+        self.video_names = sorted(self.sample_records)
+        self.annotations = {name: self._load_annotation(name) for name in self.video_names}
+        self.windows = self._build_windows()
+        if not self.windows:
+            raise RuntimeError(f"No SPAD pose frame windows found for {len(self.video_names)} samples")
+
+    def _load_annotation(self, name: str) -> dict[str, Any]:
+        path = Path(self.sample_records[name]["gt"])
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _build_windows(self) -> list[SpadPoseFrameWindow]:
+        windows: list[SpadPoseFrameWindow] = []
+        gt_offset = self.chunk_size / self.spad_bins_per_gt
+        for name in self.video_names:
+            ann = self.annotations[name]
+            n_gt = len(ann)
+            max_start = int(np.floor((n_gt - 1) - gt_offset))
+            if max_start < 0:
+                continue
+            spad_path = Path(self.sample_records[name]["spad"])
+            gt_ann_path = Path(self.sample_records[name]["gt"])
+            for gt_start in range(0, max_start + 1, self.stride_frames):
+                windows.append(
+                    SpadPoseFrameWindow(
+                        name=name,
+                        gt_ann_path=gt_ann_path,
+                        spad_path=spad_path,
+                        gt_start=gt_start,
+                        chunk_size=self.chunk_size,
+                    )
+                )
+        return windows
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str | float | int]:
+        window = self.windows[index]
+        img, packed_nch, spad_start, spad_end = self._load_raw_window(window)
+        cls, bboxes, keypoints, batch_idx, target_gt_time = self._labels_for_window(window)
+        return {
+            "img": torch.from_numpy(img),
+            "packed_nch": int(packed_nch),
+            "cls": cls,
+            "bboxes": bboxes,
+            "keypoints": keypoints,
+            "batch_idx": batch_idx,
+            "im_file": f"{window.name}:{spad_start}:{spad_end}",
+            "ori_shape": (self.image_size, self.image_size),
+            "resized_shape": (self.image_size, self.image_size),
+            "sample_name": window.name,
+            "target_gt_time": float(target_gt_time),
+            "spad_start_bin": int(spad_start),
+            "spad_end_bin": int(spad_end),
+            "chunk_size": int(window.chunk_size),
+        }
+
+    def _load_raw_window(self, window: SpadPoseFrameWindow) -> tuple[np.ndarray, int, int, int]:
+        spad_start = window.gt_start * self.spad_bins_per_gt
+        spad_end = spad_start + window.chunk_size
+
+        arr = np.load(window.spad_path, mmap_mode="r")
+        if spad_end > arr.shape[0]:
+            raise IndexError(f"SPAD slice [{spad_start}:{spad_end}] exceeds {window.spad_path} shape {arr.shape}")
+
+        packed = np.asarray(arr[spad_start:spad_end])
+        packed_nch = infer_packed_nch(arr)
+        raw = packed_frames_to_raw_video(packed, ch_order=self.packed_ch_order)
+        return raw.astype(np.uint8, copy=False), packed_nch, spad_start, spad_end
+
+    def _labels_for_window(self, window: SpadPoseFrameWindow):
+        ann = self.annotations[window.name]
+        target_gt_time = window.gt_start + (window.chunk_size / self.spad_bins_per_gt)
+        cls_ll, bbox_ll, kpt_ll = [], [], []
+
+        for hand_name, cls_id in self.HAND_TO_CLASS.items():
+            hand = self._interpolate_hand_annotation(ann, target_gt_time, hand_name)
+            if not hand:
+                continue
+            cls_ll.append([float(cls_id)])
+            bbox_ll.append(self._xyxy_to_normalized_xywh(hand["bbox"]))
+            kpt_ll.append(self._keypoints_to_normalized_xyv(hand["keypoints_2d"]))
+
+        if cls_ll:
+            cls = torch.tensor(cls_ll, dtype=torch.float32)
+            bboxes = torch.tensor(bbox_ll, dtype=torch.float32)
+            keypoints = torch.tensor(kpt_ll, dtype=torch.float32)
+            batch_idx = torch.zeros((len(cls_ll), 1), dtype=torch.float32)
+        else:
+            cls = torch.zeros((0, 1), dtype=torch.float32)
+            bboxes = torch.zeros((0, 4), dtype=torch.float32)
+            keypoints = torch.zeros((0, 21, 3), dtype=torch.float32)
+            batch_idx = torch.zeros((0, 1), dtype=torch.float32)
+        return cls, bboxes, keypoints, batch_idx, target_gt_time
+
+    def _interpolate_hand_annotation(self, ann: dict[str, Any], gt_time: float, hand_name: str):
+        return SpadPoseSequenceDataset._interpolate_hand_annotation(self, ann, gt_time, hand_name)
+
+    def _xyxy_to_normalized_xywh(self, bbox) -> list[float]:
+        return SpadPoseSequenceDataset._xyxy_to_normalized_xywh(self, bbox)
+
+    def _keypoints_to_normalized_xyv(self, keypoints) -> list[list[float]]:
+        return SpadPoseSequenceDataset._keypoints_to_normalized_xyv(self, keypoints)
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        new_batch = {}
+        new_batch["img"] = torch.stack([b["img"] for b in batch], 0)
+        new_batch["cls"] = torch.cat([b["cls"] for b in batch], 0)
+        new_batch["bboxes"] = torch.cat([b["bboxes"] for b in batch], 0)
+        new_batch["keypoints"] = torch.cat([b["keypoints"] for b in batch], 0)
+
+        batch_idx = []
+        for sample_i, b in enumerate(batch):
+            idx = b["batch_idx"].clone()
+            if idx.numel():
+                idx += float(sample_i)
+            batch_idx.append(idx)
+        new_batch["batch_idx"] = torch.cat(batch_idx, 0) if batch_idx else torch.zeros((0, 1), dtype=torch.float32)
+
+        new_batch["im_file"] = [b["im_file"] for b in batch]
+        new_batch["packed_nch"] = int(batch[0]["packed_nch"])
+        new_batch["ori_shape"] = [b["ori_shape"] for b in batch]
+        new_batch["resized_shape"] = [b["resized_shape"] for b in batch]
+        new_batch["sample_name"] = [b["sample_name"] for b in batch]
+        new_batch["target_gt_time"] = torch.tensor([b["target_gt_time"] for b in batch], dtype=torch.float32)
+        new_batch["spad_start_bin"] = torch.tensor([b["spad_start_bin"] for b in batch], dtype=torch.long)
+        new_batch["spad_end_bin"] = torch.tensor([b["spad_end_bin"] for b in batch], dtype=torch.long)
+        new_batch["chunk_size"] = torch.tensor([b["chunk_size"] for b in batch], dtype=torch.long)
+        return new_batch
+
+
+# Backward-compatible aliases while the codebase transitions to explicit Sequence/Frame naming.
+SpadWindow = SpadPoseSequenceWindow
+SpadPoseDataset = SpadPoseSequenceDataset

@@ -476,3 +476,118 @@ class SpatioTemporalEvidenceAccumulation(nn.Module):
 
     def forward(self, photon_cube: Tensor) -> Tensor:
         return self._integrate_last(photon_cube)
+
+
+class SpatioTemporalEvidenceFrame(SpatioTemporalEvidenceAccumulation):
+    """STEA variant that collapses each raw chunk into one frame plus a lightweight `w_mean` map."""
+
+    @torch.no_grad()
+    def _integrate_last_with_w_mean(self, photon_cube: Tensor) -> tuple[Tensor, Tensor]:
+        h, w, t = map(int, photon_cube.shape)
+        if t == 0:
+            empty = photon_cube.new_zeros(h, w, 0, dtype=torch.float32)
+            return empty, photon_cube.new_zeros(h, w, dtype=torch.float32)
+
+        x = photon_cube.float()
+        max_photon_hist = max(self.fast_window, self.slow_window) - 1
+        max_kl_hist = self.temporal_window - 1
+
+        fast_hist = self._history_or_zeros(self.photon_history, h, w, self.fast_window - 1, x)
+        slow_hist = self._history_or_zeros(self.photon_history, h, w, self.slow_window - 1, x)
+        kl_hist = self._history_or_zeros(self.kl_history, h, w, max_kl_hist, x)
+
+        p_motion = x.new_zeros(h, w, t)
+        y_fast_last = x.new_zeros(h, w)
+
+        for ti in range(t):
+            x_t = x[..., ti : ti + 1]
+            x_flat = x_t.reshape(h * w, 1, 1)
+
+            y_fast_t = self._causal_conv1d(x_flat, self.fast_kernel, fast_hist).reshape(h, w).clamp(
+                self.eps, 1.0 - self.eps
+            )
+            y_slow_t = self._causal_conv1d(x_flat, self.slow_kernel, slow_hist).reshape(h, w).clamp(
+                self.eps, 1.0 - self.eps
+            )
+            y_fast_last = y_fast_t
+
+            k_raw_t = self._bernoulli_kl(y_fast_t, y_slow_t).unsqueeze(-1)
+            k_smoothed_t = self._smooth_kl_step(k_raw_t, kl_hist)
+            p_motion[..., ti] = torch.sigmoid(self.motion_sharpness * (k_smoothed_t - self.motion_threshold))
+
+            fast_hist = self._append_temporal_history(fast_hist, x_t, self.fast_window - 1)
+            slow_hist = self._append_temporal_history(slow_hist, x_t, self.slow_window - 1)
+            kl_hist = self._append_temporal_history(kl_hist, k_raw_t, max_kl_hist)
+
+        running_max = x.new_zeros(h, w)
+        stable_num = x.new_zeros(h, w)
+        stable_den = x.new_zeros(h, w)
+        for ti in range(t - 1, -1, -1):
+            running_max = torch.maximum(running_max, p_motion[..., ti])
+            valid_weight = 1.0 - running_max
+            stable_num += valid_weight * x[..., ti]
+            stable_den += valid_weight
+
+        mean_stable = stable_num / stable_den.clamp(min=self.eps)
+        w_mean = stable_den / (stable_den + max(self.stable_prior, self.eps))
+        fused_last = w_mean * mean_stable + (1.0 - w_mean) * y_fast_last
+
+        if max_photon_hist > 0:
+            self.photon_history = x[..., -max_photon_hist:].detach()
+        else:
+            self.photon_history = None
+        self.kl_history = kl_hist.detach() if max_kl_hist > 0 else None
+        return fused_last.unsqueeze(-1), w_mean
+
+    @staticmethod
+    def _w_mean_to_frame_space(w_mean_hw: Tensor) -> Tensor:
+        if w_mean_hw.ndim != 2:
+            raise ValueError(f"Expected w_mean (H,W), got shape={tuple(w_mean_hw.shape)}")
+        return F.avg_pool2d(w_mean_hw.unsqueeze(0).unsqueeze(0).float(), kernel_size=2, stride=2).squeeze(0)
+
+    @torch.no_grad()
+    def process_photon_cube_to_frame(
+        self,
+        photon_cube: Tensor,
+        hot_pixel_mask: np.ndarray | None = None,
+        quantile: float | None = None,
+        normalize: bool | None = None,
+        clear_states: bool = True,
+        chunk_size: int | None = None,
+        fast_window: int | None = None,
+        slow_window: int | None = None,
+        temporal_window: int | None = None,
+        fast_tau: float | None = None,
+        motion_sharpness: float | None = None,
+        motion_threshold: float | None = None,
+        eps: float | None = None,
+        stable_prior: float | None = None,
+        **kwargs,
+    ) -> tuple[Tensor, Tensor]:
+        if clear_states:
+            self.t_absolute = 0
+            self._clear_histories()
+
+        self.update_hyperparams(
+            hot_pixel_mask=hot_pixel_mask,
+            normalize=normalize,
+            quantile=quantile,
+            chunk_size=chunk_size,
+            fast_window=fast_window,
+            slow_window=slow_window,
+            temporal_window=temporal_window,
+            fast_tau=fast_tau,
+            motion_sharpness=motion_sharpness,
+            motion_threshold=motion_threshold,
+            eps=eps,
+            stable_prior=stable_prior,
+            **kwargs,
+        )
+
+        self.set_cube(photon_cube)
+        fused, w_mean = self._integrate_last_with_w_mean(photon_cube)
+        if self.hot_pixel_mask is not None:
+            fused = nearest_neighbor_inpaint(fused, self.hot_pixel_mask)
+        fused = self.clamp_recons(fused)
+        self.t_absolute += self._t
+        return fused, self._w_mean_to_frame_space(w_mean).to(device=fused.device, dtype=fused.dtype)

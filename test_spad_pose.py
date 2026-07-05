@@ -38,6 +38,7 @@ from det_spad_pose import (
     _resize_to_shape_bgr,
     _set_velocity_field_on_preprocessor,
     _slice_raw_chunk,
+    _trained_chunk_t,
     _video_num_bins,
 )
 
@@ -431,12 +432,13 @@ def main():
             if int(args.cube_chunk_t) > 0:
                 chunk_t = int(args.cube_chunk_t)
             else:
-                chunk_t = int(getattr(getattr(spad_model, "preprocessor", None), "subsampling", args.spad_subsampling))
+                chunk_t = int(_trained_chunk_t(spad_model) or getattr(getattr(spad_model, "preprocessor", None), "subsampling", args.spad_subsampling))
             if chunk_t <= 0:
                 raise ValueError(f"cube_chunk_t must be positive, got {chunk_t}")
 
             subsampling = int(getattr(getattr(spad_model, "preprocessor", None), "subsampling", 1) or 1)
-            if chunk_t < subsampling:
+            requires_multiframe_chunk = not hasattr(spad_model, "frame_adapter_name")
+            if chunk_t < subsampling and requires_multiframe_chunk:
                 raise ValueError(
                     f"cube_chunk_t={chunk_t} is shorter than preprocessor subsampling={subsampling}, "
                     "which would produce zero reconstructed frames."

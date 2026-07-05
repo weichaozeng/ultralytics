@@ -1,0 +1,29 @@
+spad_train_mode: frame
+model: /home/zvc/Project/SPADHand/ultralytics/weights/detector.pt
+
+spad_train_json: /home/zvc/Data/visionsim/outputs/train.json
+spad_test_json: /home/zvc/Data/visionsim/outputs/test.json
+
+project: Runs/spad_pose
+name: frame_sum
+device: "0"
+epochs: 30
+batch: 1
+workers: 0
+imgsz: 512
+
+spad_chunk_size: 320
+spad_subsampling: 64
+spad_bins_per_gt: 64
+spad_stride_frames: 1
+spad_image_size: 512
+spad_packed_ch_order: RGB
+
+spad_preprocessor: sum
+
+spad_frame_adapter: ua
+spad_frame_adapter_alpha_init: 0.0
+spad_spatial_kernel_size: 3
+
+spad_bin_rate_hz: 8000.0
+spad_freeze_detector: true

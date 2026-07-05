@@ -11,9 +11,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from ultralytics.data.spad_pose_dataset import SpadPoseDataset, load_visionsim_split_json
+from ultralytics.data.spad_pose_dataset import (
+    SpadPoseDataset,
+    SpadPoseFrameDataset,
+    SpadPoseSequenceDataset,
+    load_visionsim_split_json,
+)
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import PoseModel, SpadPoseModel
+from ultralytics.nn.tasks import PoseModel, SpadPoseFrameModel, SpadPoseModel, SpadPoseSequenceModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, nms
 
 
@@ -142,7 +147,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         return data
 
 
-class SpadPoseTrainer(PoseTrainer):
+class SpadPoseSequenceTrainer(PoseTrainer):
     """Pose trainer that builds SpadPoseModel and freezes the pretrained YOLO detector by default."""
 
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
@@ -200,7 +205,7 @@ class SpadPoseTrainer(PoseTrainer):
         cfg: str | Path | dict[str, Any] | None = None,
         weights: str | Path | None = None,
         verbose: bool = True,
-    ) -> SpadPoseModel:
+    ) -> SpadPoseSequenceModel:
         """Get SPAD pose model with optional pretrained detector weights."""
         preprocessor_name = str(getattr(self.args, "spad_preprocessor", "ppb")).strip().lower()
         spad_subsampling = int(getattr(self.args, "spad_subsampling", getattr(self.args, "subsampling", 64)))
@@ -238,7 +243,7 @@ class SpadPoseTrainer(PoseTrainer):
         if isinstance(plugin_layers, str):
             plugin_layers = [int(x) for x in plugin_layers.split(",") if x.strip()]
 
-        model = SpadPoseModel(
+        model = SpadPoseSequenceModel(
             cfg,
             nc=self.data["nc"],
             ch=self.data["channels"],
@@ -267,7 +272,7 @@ class SpadPoseTrainer(PoseTrainer):
         super().set_model_attributes()
         if bool(getattr(self.args, "spad_freeze_detector", True)):
             self.args.freeze = list(range(len(self.model.model)))
-            LOGGER.info("SpadPoseTrainer: freezing pretrained YOLO detector layers; SPAD modules remain trainable.")
+            LOGGER.info("SpadPoseSequenceTrainer: freezing pretrained YOLO detector layers; SPAD modules remain trainable.")
 
     def preprocess_batch(self, batch: dict) -> dict:
         """Move SPAD video batches to device without applying image-style normalization."""
@@ -445,3 +450,107 @@ class SpadPoseTrainer(PoseTrainer):
             cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), color, 1)
             cv2.putText(img, f"{int(cls_id)} {score:.2f}", (int(x1), int(y1) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
             self._spad_draw_pose(img, pose, color)
+
+
+class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
+    """Pose trainer that collapses each raw SPAD chunk into one end-of-chunk detector frame."""
+
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+        """Build frame-mode SPAD pose dataset for train/val from VisionSIM split JSON."""
+        json_path = getattr(self.args, "spad_train_json", None) or self.data.get("spad_train_json")
+        if mode != "train":
+            json_path = getattr(self.args, "spad_test_json", None) or self.data.get("spad_test_json")
+        if not json_path:
+            raise ValueError("SpadPoseFrameTrainer requires `spad_train_json` and `spad_test_json` in args or data yaml.")
+
+        samples = load_visionsim_split_json(json_path)
+        LOGGER.info(f"Loaded {len(samples)} samples from {json_path} for mode={mode!r}")
+
+        subsampling = int(getattr(self.args, "spad_subsampling", self.data.get("spad_subsampling", 64)))
+        legacy_output_frames = int(getattr(self.args, "spad_output_frames", self.data.get("spad_output_frames", 4)))
+        chunk_size = int(getattr(self.args, "spad_chunk_size", 0)) or (legacy_output_frames * subsampling)
+
+        return SpadPoseFrameDataset(
+            samples=samples,
+            chunk_size=chunk_size,
+            spad_bins_per_gt=int(getattr(self.args, "spad_bins_per_gt", self.data.get("spad_bins_per_gt", 64))),
+            stride_frames=int(getattr(self.args, "spad_stride_frames", self.data.get("spad_stride_frames", 0))) or None,
+            image_size=int(getattr(self.args, "spad_image_size", self.data.get("spad_image_size", 512))),
+            packed_ch_order=getattr(self.args, "spad_packed_ch_order", self.data.get("spad_packed_ch_order", "RGB")),
+        )
+
+    def get_model(
+        self,
+        cfg: str | Path | dict[str, Any] | None = None,
+        weights: str | Path | None = None,
+        verbose: bool = True,
+    ) -> SpadPoseFrameModel:
+        """Get frame-mode SPAD pose model with optional UA adapter."""
+        preprocessor_name = str(getattr(self.args, "spad_preprocessor", "stea")).strip().lower()
+
+        spad_subsampling = int(getattr(self.args, "spad_subsampling", getattr(self.args, "subsampling", 64)))
+        spad_bin_rate_hz = float(getattr(self.args, "spad_bin_rate_hz", 8000.0))
+        legacy_output_frames = int(getattr(self.args, "spad_output_frames", 4))
+        chunk_size = int(getattr(self.args, "spad_chunk_size", 0)) or (legacy_output_frames * spad_subsampling)
+
+        if preprocessor_name == "ppb":
+            preprocessor_kwargs = {
+                "subsampling": spad_subsampling,
+                "bocpd_gamma": float(getattr(self.args, "ppb_bocpd_gamma", getattr(self.args, "bocpd_gamma", 5e-4))),
+                "normalize": bool(getattr(self.args, "ppb_normalize", True)),
+                "quantile": float(getattr(self.args, "ppb_quantile", getattr(self.args, "quantile", 1.0))),
+                "min_filter_size": int(getattr(self.args, "ppb_min_filter_size", getattr(self.args, "min_filter_size", 7))),
+            }
+        elif preprocessor_name == "stea":
+            preprocessor_kwargs = {
+                "subsampling": spad_subsampling,
+                "fast_window": int(getattr(self.args, "stea_fast_window", 16)),
+                "slow_window": int(getattr(self.args, "stea_slow_window", 128)),
+                "temporal_window": int(getattr(self.args, "stea_temporal_window", 5)),
+                "fast_tau": None if getattr(self.args, "stea_fast_tau", None) in {None, 0} else float(getattr(self.args, "stea_fast_tau")),
+                "motion_sharpness": float(getattr(self.args, "stea_motion_sharpness", 60.0)),
+                "motion_threshold": float(getattr(self.args, "stea_motion_threshold", 0.05)),
+                "stable_prior": float(getattr(self.args, "stea_stable_prior", 16.0)),
+                "normalize": bool(getattr(self.args, "stea_normalize", True)),
+                "quantile": float(getattr(self.args, "stea_quantile", 1.0)),
+            }
+        elif preprocessor_name == "sum":
+            preprocessor_kwargs = {"subsampling": spad_subsampling}
+        else:
+            raise ValueError(f"Unsupported frame-mode SPAD preprocessor: {preprocessor_name!r}")
+
+        model = SpadPoseFrameModel(
+            cfg,
+            nc=self.data["nc"],
+            ch=self.data["channels"],
+            data_kpt_shape=self.data["kpt_shape"],
+            verbose=verbose,
+            spad_enabled=bool(getattr(self.args, "spad_enabled", True)),
+            preprocessor=preprocessor_name,
+            preprocessor_kwargs=preprocessor_kwargs,
+            frame_adapter=str(getattr(self.args, "spad_frame_adapter", "ua")),
+            frame_adapter_kernel_size=int(getattr(self.args, "spad_spatial_kernel_size", 3)),
+            frame_adapter_alpha_init=float(
+                getattr(self.args, "spad_frame_adapter_alpha_init", getattr(self.args, "spad_plugin_alpha_init", 0.0))
+            ),
+            spad_chunk_size=chunk_size,
+            spad_bin_rate_hz=spad_bin_rate_hz,
+        )
+        if weights:
+            model.load(weights)
+        return model
+
+    def _spad_recon_canvas(self, model, si: int) -> np.ndarray:
+        """Visualize the sole reconstructed frame from each frame-mode batch item."""
+        image_size = int(getattr(self.args, "spad_image_size", 512))
+        frames = getattr(model, "spad_last_recon_frames", None)
+        if frames is None or frames.ndim != 5 or frames.shape[1] == 0:
+            return np.zeros((image_size, image_size, 3), dtype=np.uint8)
+        if si >= frames.shape[1]:
+            return np.zeros((image_size, image_size, 3), dtype=np.uint8)
+        rgb = frames[0, si].detach().float().cpu().permute(1, 2, 0).numpy()
+        rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(rgb_u8[:, :, ::-1])
+
+
+SpadPoseTrainer = SpadPoseSequenceTrainer
