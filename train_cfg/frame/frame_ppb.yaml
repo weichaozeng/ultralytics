@@ -6,7 +6,7 @@ spad_test_json: /home/zvc/Data/visionsim/outputs/test.json
 
 project: Runs/spad_pose
 name: frame_ppb
-device: "0"
+device: "1"
 epochs: 30
 batch: 24
 workers: 4
