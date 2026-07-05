@@ -109,6 +109,9 @@ class SpadPoseSequenceDataset(Dataset):
         self.windows = self._build_windows()
         if not self.windows:
             raise RuntimeError(f"No SPAD pose windows found for {len(self.video_names)} samples")
+        self.labels = self._build_ultralytics_labels()
+        self.im_files = [str(lb["im_file"]) for lb in self.labels]
+        self.ni = len(self.labels)
 
     def _load_annotation(self, name: str) -> dict[str, Any]:
         path = Path(self.sample_records[name]["gt"])
@@ -238,6 +241,24 @@ class SpadPoseSequenceDataset(Dataset):
             out.append([float(x) / self.image_size, float(y) / self.image_size, 1.0])
         return out
 
+    def _build_ultralytics_labels(self) -> list[dict[str, Any]]:
+        labels = []
+        for window in self.windows:
+            cls, bboxes, keypoints, _ = self._labels_for_window(window)
+            labels.append(
+                {
+                    "im_file": f"{window.name}:{window.gt_start}",
+                    "shape": (self.image_size, self.image_size),
+                    "cls": cls.detach().cpu().numpy(),
+                    "bboxes": bboxes.detach().cpu().numpy(),
+                    "segments": [],
+                    "keypoints": keypoints.detach().cpu().numpy(),
+                    "normalized": True,
+                    "bbox_format": "xywh",
+                }
+            )
+        return labels
+
     @staticmethod
     def collate_fn(batch: list[dict]) -> dict:
         new_batch = {}
@@ -312,6 +333,9 @@ class SpadPoseFrameDataset(Dataset):
         self.windows = self._build_windows()
         if not self.windows:
             raise RuntimeError(f"No SPAD pose frame windows found for {len(self.video_names)} samples")
+        self.labels = self._build_ultralytics_labels()
+        self.im_files = [str(lb["im_file"]) for lb in self.labels]
+        self.ni = len(self.labels)
 
     def _load_annotation(self, name: str) -> dict[str, Any]:
         path = Path(self.sample_records[name]["gt"])
@@ -411,6 +435,26 @@ class SpadPoseFrameDataset(Dataset):
 
     def _keypoints_to_normalized_xyv(self, keypoints) -> list[list[float]]:
         return SpadPoseSequenceDataset._keypoints_to_normalized_xyv(self, keypoints)
+
+    def _build_ultralytics_labels(self) -> list[dict[str, Any]]:
+        labels = []
+        for window in self.windows:
+            cls, bboxes, keypoints, _, _ = self._labels_for_window(window)
+            spad_start = window.gt_start * self.spad_bins_per_gt
+            spad_end = spad_start + window.chunk_size
+            labels.append(
+                {
+                    "im_file": f"{window.name}:{spad_start}:{spad_end}",
+                    "shape": (self.image_size, self.image_size),
+                    "cls": cls.detach().cpu().numpy(),
+                    "bboxes": bboxes.detach().cpu().numpy(),
+                    "segments": [],
+                    "keypoints": keypoints.detach().cpu().numpy(),
+                    "normalized": True,
+                    "bbox_format": "xywh",
+                }
+            )
+        return labels
 
     @staticmethod
     def collate_fn(batch: list[dict]) -> dict:
