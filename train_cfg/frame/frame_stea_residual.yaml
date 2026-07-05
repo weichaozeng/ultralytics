@@ -9,7 +9,7 @@ name: frame_stea_residual
 device: "0"
 epochs: 30
 batch: 24
-workers: 4
+workers: 0
 imgsz: 512
 
 # frame windowing
