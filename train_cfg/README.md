@@ -83,6 +83,7 @@ python train_spad_pose_frame.py --cfg train_cfg/frame/frame_stea_ua.yaml device=
 - `spad_stride_frames`
 - `spad_preprocessor`
 - `spad_frame_adapter`
+- `spad_input_gamma`
 
 ## 每个配置文件的含义
 
@@ -176,6 +177,7 @@ python train_spad_pose_frame.py --cfg train_cfg/frame/frame_stea_ua.yaml device=
 - `name`
 - `epochs`
 - `batch`
+- `spad_input_gamma`
 
 ## 推荐实验顺序
 
@@ -201,7 +203,8 @@ python train_spad_pose_frame.py --cfg train_cfg/frame/frame_stea_ua.yaml device=
 - `spad_chunk_size: 320`
 - `spad_bins_per_gt: 64`
 - `spad_stride_frames: 1`
-- `batch: 1`
+- `batch: 24`
+- `spad_input_gamma: 2.2`
 
 这里 `320` 对应：
 
@@ -228,6 +231,8 @@ python train_spad_pose_frame.py --cfg train_cfg/frame/frame_stea_ua.yaml device=
 - `spad_output_frames: 5`
 - `spad_subsampling: 64`
 - `spad_stride_frames: 5`
+- `batch: 24`
+- `spad_input_gamma: 2.2`
 
 避免一开始就同时改旧 baseline 的窗口定义。
 

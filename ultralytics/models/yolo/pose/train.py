@@ -260,6 +260,7 @@ class SpadPoseSequenceTrainer(PoseTrainer):
             spatial_reduce_ratio=int(getattr(self.args, "spad_spatial_reduce_ratio", 2)),
             spatial_kernel_size=int(getattr(self.args, "spad_spatial_kernel_size", 3)),
             plugin_alpha_init=float(getattr(self.args, "spad_plugin_alpha_init", 0.0)),
+            spad_input_gamma=float(getattr(self.args, "spad_input_gamma", getattr(self.args, "input_gamma", 1.0))),
             spad_bin_rate_hz=spad_bin_rate_hz,
         )
         if weights:
@@ -534,6 +535,7 @@ class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
                 getattr(self.args, "spad_frame_adapter_alpha_init", getattr(self.args, "spad_plugin_alpha_init", 0.0))
             ),
             spad_chunk_size=chunk_size,
+            spad_input_gamma=float(getattr(self.args, "spad_input_gamma", getattr(self.args, "input_gamma", 1.0))),
             spad_bin_rate_hz=spad_bin_rate_hz,
         )
         if weights:

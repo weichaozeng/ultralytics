@@ -621,6 +621,7 @@ class SpadPoseModel(PoseModel):
         spatial_reduce_ratio=2,
         spatial_kernel_size=3,
         plugin_alpha_init=0.0,
+        spad_input_gamma=1.0,
         spad_bin_rate_hz=8000.0,
     ):
         """Initialize a SPAD-augmented YOLO pose model.
@@ -640,6 +641,7 @@ class SpadPoseModel(PoseModel):
         self.spatial_reduce_ratio = spatial_reduce_ratio
         self.spatial_kernel_size = spatial_kernel_size
         self.plugin_alpha_init = plugin_alpha_init
+        self.spad_input_gamma = float(spad_input_gamma)
         self.spad_reference_bin_rate_hz = float(spad_bin_rate_hz)
         self.spad_current_bin_rate_hz = float(spad_bin_rate_hz)
         self.ssd_kwargs.setdefault("reference_bin_rate_hz", self.spad_reference_bin_rate_hz)
@@ -813,6 +815,7 @@ class SpadPoseModel(PoseModel):
             photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
             recons = self._spad_process_full_window(photon_cube)
             frames = self._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
+            frames = self._spad_apply_input_gamma(frames, self.spad_input_gamma)
             frame_ll.append(frames)
 
             if t_index_ll is None:
@@ -889,6 +892,15 @@ class SpadPoseModel(PoseModel):
         return raw_hwt_to_rgb_float(raw_hwt, packed_nch=int(packed_nch))
 
     @staticmethod
+    def _spad_apply_input_gamma(frames_tchw: torch.Tensor, gamma: float) -> torch.Tensor:
+        gamma = float(gamma)
+        if gamma <= 0:
+            raise ValueError(f"spad_input_gamma must be positive, got {gamma}")
+        if abs(gamma - 1.0) < 1e-8:
+            return frames_tchw
+        return torch.pow(torch.clamp(frames_tchw, 0.0, 1.0), 1.0 / gamma)
+
+    @staticmethod
     def _spad_flatten_temporal(x):
         """Flatten T,B,C,H,W feature sequences to T*B,C,H,W for standard YOLO layers."""
         if isinstance(x, list):
@@ -949,6 +961,7 @@ class SpadPoseFrameModel(PoseModel):
         frame_adapter_kernel_size=3,
         frame_adapter_alpha_init=0.0,
         spad_chunk_size: int | None = None,
+        spad_input_gamma=1.0,
         spad_bin_rate_hz=8000.0,
     ):
         self.spad_enabled = spad_enabled
@@ -958,6 +971,7 @@ class SpadPoseFrameModel(PoseModel):
         self.frame_adapter_kernel_size = int(frame_adapter_kernel_size)
         self.frame_adapter_alpha_init = float(frame_adapter_alpha_init)
         self.spad_chunk_size = None if spad_chunk_size is None else int(spad_chunk_size)
+        self.spad_input_gamma = float(spad_input_gamma)
         self.spad_reference_bin_rate_hz = float(spad_bin_rate_hz)
         self.spad_current_bin_rate_hz = float(spad_bin_rate_hz)
         self.spad_packed_nch = 3
@@ -1042,6 +1056,7 @@ class SpadPoseFrameModel(PoseModel):
             photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
             recons, confidence = self._spad_process_frame_window(photon_cube)
             frames_tchw = SpadPoseModel._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
+            frames_tchw = SpadPoseModel._spad_apply_input_gamma(frames_tchw, self.spad_input_gamma)
             if int(frames_tchw.shape[0]) == 0:
                 raise ValueError("Frame-mode preprocessor produced zero frames; expected exactly one.")
             frame_ll.append(frames_tchw[-1])

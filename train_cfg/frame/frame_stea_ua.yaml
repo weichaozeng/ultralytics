@@ -8,8 +8,8 @@ project: Runs/spad_pose
 name: frame_stea_ua
 device: "0"
 epochs: 30
-batch: 1
-workers: 0
+batch: 24
+workers: 4
 imgsz: 512
 
 # frame windowing
@@ -22,12 +22,12 @@ spad_packed_ch_order: RGB
 
 # preprocessor
 spad_preprocessor: stea
-stea_fast_window: 16
+stea_fast_window: 32
 stea_slow_window: 128
 stea_temporal_window: 5
 stea_fast_tau: 6.0
 stea_motion_sharpness: 60.0
-stea_motion_threshold: 0.05
+stea_motion_threshold: 0.07
 stea_stable_prior: 16.0
 stea_normalize: true
 stea_quantile: 1.0
@@ -38,4 +38,5 @@ spad_frame_adapter_alpha_init: 0.0
 spad_spatial_kernel_size: 3
 
 spad_bin_rate_hz: 8000.0
+spad_input_gamma: 2.2
 spad_freeze_detector: true
