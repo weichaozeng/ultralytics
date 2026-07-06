@@ -8,7 +8,7 @@ project: Runs/spad_pose
 name: frame_stea_residual
 device: "0"
 epochs: 30
-batch: 24
+batch: 10
 workers: 0
 imgsz: 512
 
