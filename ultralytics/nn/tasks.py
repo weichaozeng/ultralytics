@@ -977,6 +977,8 @@ class SpadPoseFrameModel(PoseModel):
         self.spad_reference_bin_rate_hz = float(spad_bin_rate_hz)
         self.spad_current_bin_rate_hz = float(spad_bin_rate_hz)
         self.spad_packed_nch = 3
+        self.preprocessor = None
+        self.frame_adapter = None
         self.spad_cached_confidence_batch = None
         self.spad_last_recon_frames = None
         self.spad_last_confidence = None
@@ -987,8 +989,6 @@ class SpadPoseFrameModel(PoseModel):
 
         super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
 
-        self.preprocessor = None
-        self.frame_adapter = None
         if self.spad_enabled:
             self._init_spad_frame_modules()
 
