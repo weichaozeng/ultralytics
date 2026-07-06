@@ -139,6 +139,32 @@ def test_spad_posetrack_velocity_field():
     assert tracker.last_velocity_field.shape == (512, 512, 2)
 
 
+def test_pose_track_uses_global_detection_indices():
+    """Track idx must refer to the full detection list, not the high-score subset."""
+    args = _tracker_args()
+    args.track_high_thresh = 0.5
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    img = np.zeros((512, 512, 3), np.uint8)
+
+    # det 0: low score (second stage only), det 1-2: high score
+    boxes = _FakeBoxes(
+        [[200, 200, 100, 100], [256, 256, 120, 120], [340, 280, 110, 115]],
+        [0.2, 0.9, 0.88],
+        [1, 1, 0],
+    )
+    kpts = np.stack(
+        [
+            _hand_skeleton_keypoints(200, 200),
+            _hand_skeleton_keypoints(256, 256),
+            _hand_skeleton_keypoints(340, 280),
+        ]
+    )
+    tracks = tracker.update(boxes, img, keypoints=kpts)
+    idx = tracks[:, 7].astype(int)
+    assert np.all(idx >= 0)
+    assert np.max(idx) < 3
+
+
 def test_result_layout_keypoints_roundtrip():
     args = _tracker_args()
     tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})

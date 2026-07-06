@@ -315,11 +315,20 @@ class PoseTrack(BYTETracker):
 
         return np.array([depth_to_weight[int(HAND_CHAIN_DEPTH[k])] for k in range(len(HAND_CHAIN_DEPTH))], dtype=np.float32)
 
-    def init_track(self, results, img: np.ndarray | None = None, keypoints: np.ndarray | None = None) -> list[PoseSTrack]:
+    def init_track(
+        self,
+        results,
+        img: np.ndarray | None = None,
+        keypoints: np.ndarray | None = None,
+        det_indices: np.ndarray | None = None,
+    ) -> list[PoseSTrack]:
         if len(results) == 0:
             return []
         bboxes = results.xywhr if hasattr(results, "xywhr") else results.xywh
-        bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
+        if det_indices is None:
+            det_indices = np.arange(len(bboxes))
+        det_indices = np.asarray(det_indices).reshape(-1)
+        bboxes = np.concatenate([bboxes, det_indices.reshape(-1, 1).astype(np.float32)], axis=-1)
         if keypoints is None:
             keypoints = np.zeros((len(bboxes), self.n_keypoints, self.kpt_dims), dtype=np.float32)
         return self._decorate_detections(
@@ -377,6 +386,8 @@ class PoseTrack(BYTETracker):
         removed_stracks = []
 
         scores = results.conf
+        n_dets = len(scores)
+        global_inds = np.arange(n_dets)
         remain_inds = scores >= self.args.track_high_thresh
         inds_low = scores > self.args.track_low_thresh
         inds_high = scores < self.args.track_high_thresh
@@ -387,7 +398,7 @@ class PoseTrack(BYTETracker):
         keypoints_keep = keypoints[remain_inds] if keypoints is not None and len(keypoints) else None
         keypoints_second = keypoints[inds_second] if keypoints is not None and len(keypoints) else None
 
-        detections = self.init_track(results, keypoints=keypoints_keep)
+        detections = self.init_track(results, keypoints=keypoints_keep, det_indices=global_inds[remain_inds])
         unconfirmed = []
         tracked_stracks = []
         for track in self.tracked_stracks:
@@ -411,7 +422,9 @@ class PoseTrack(BYTETracker):
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
-        detections_second = self.init_track(results_second, keypoints=keypoints_second)
+        detections_second = self.init_track(
+            results_second, keypoints=keypoints_second, det_indices=global_inds[inds_second]
+        )
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         dists = self.get_dists(r_tracked_stracks, detections_second, stage=2)
         matches, u_track, _u_detection_second = matching.linear_assignment(dists, thresh=0.5)

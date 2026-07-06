@@ -50,6 +50,12 @@ def apply_pose_tracks_to_result(result, tracks, *, n_keypoints: int = 21, kpt_di
         return result
     if is_pose_track_result(tracks, n_keypoints=n_keypoints, kpt_dims=kpt_dims):
         idx = parse_track_idx(tracks)
+        n = len(result)
+        valid = (idx >= 0) & (idx < n)
+        if not np.any(valid):
+            return result[:0]
+        idx = idx[valid]
+        tracks = tracks[valid]
         tracked = result[idx]
         device = result.boxes.data.device
         tracked.update(

@@ -3,6 +3,7 @@
 from functools import partial
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from ultralytics.utils import YAML, IterableSimpleNamespace
@@ -122,9 +123,13 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
             n_keypoints = int(getattr(tracker, "n_keypoints", 21))
             kpt_dims = int(getattr(tracker, "kpt_dims", 3))
             idx = tracks[:, 7].astype(int)
-            predictor.results[i] = result[idx]
+            valid = (idx >= 0) & (idx < len(result))
+            if not np.any(valid):
+                continue
+            idx = idx[valid]
+            tracks = tracks[valid]
             predictor.results[i] = apply_pose_tracks_to_result(
-                predictor.results[i], tracks, n_keypoints=n_keypoints, kpt_dims=kpt_dims
+                result, tracks, n_keypoints=n_keypoints, kpt_dims=kpt_dims
             )
         else:
             idx = tracks[:, -1].astype(int)

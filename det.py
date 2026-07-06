@@ -7,13 +7,16 @@ import torch
 from tqdm import tqdm
 
 if torch.cuda.is_available():
-    autocast = torch.cuda.amp.autocast
+    def autocast():
+        return torch.amp.autocast("cuda")
 else:
     class autocast:
         def __init__(self, enabled=True):
             pass
+
         def __enter__(self):
             pass
+
         def __exit__(self, *args):
             pass
 
