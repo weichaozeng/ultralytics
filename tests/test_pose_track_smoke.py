@@ -192,6 +192,16 @@ def test_bone_cosine_prefers_same_hand_layout():
     assert sim_same > sim_diff
 
 
+def test_iou_distance_accepts_ndarrays():
+    from ultralytics.trackers.utils.matching import iou_distance
+
+    a = np.array([[100, 100, 200, 200]], dtype=np.float32)
+    b = np.array([[110, 110, 210, 210], [300, 300, 400, 400]], dtype=np.float32)
+    d = iou_distance(a, b)
+    assert d.shape == (1, 2)
+    assert d[0, 0] < d[0, 1]
+
+
 def test_mark_lost_preserves_static_pose_snapshot():
     args = _tracker_args()
     tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
@@ -231,6 +241,7 @@ def test_lost_track_expires_within_short_window():
 
 
 def test_pose_nms_suppresses_duplicate_hands():
+    import torch
     from ultralytics.utils.pose_nms import is_pose_track_tracker, pose_aware_non_max_suppression
 
     assert is_pose_track_tracker("posetrack.yaml")

@@ -621,7 +621,6 @@ class PoseTrack(BYTETracker):
         activated_stracks = []
         refind_stracks = []
         lost_stracks = []
-        removed_stracks = []
 
         scores = self._det_combined_scores(results, keypoints)
         n_dets = len(scores)
