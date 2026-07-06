@@ -17,6 +17,10 @@ HAND_CHAIN_DEPTH = np.array([0, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 
 MATCH_WEIGHT_BY_DEPTH = (1.0, 1.0, 0.85, 0.70, 0.50)
 HAND_MATCH_WEIGHTS = np.array([MATCH_WEIGHT_BY_DEPTH[d] for d in HAND_CHAIN_DEPTH], dtype=np.float32)
 
+# Per-bone weights for cosine association (proximal segments dominate).
+FINGER_SEGMENT_WEIGHTS = np.array([1.0, 0.5, 0.3, 0.1], dtype=np.float32)
+BONE_MATCH_WEIGHTS = np.array([FINGER_SEGMENT_WEIGHTS[max(int(HAND_CHAIN_DEPTH[k]) - 1, 0)] for k in range(1, 21)], dtype=np.float32)
+
 
 def build_parent_idx(n_keypoints: int, parent_idx: np.ndarray | None = None) -> np.ndarray:
     """Return parent index array for ``n_keypoints`` joints."""

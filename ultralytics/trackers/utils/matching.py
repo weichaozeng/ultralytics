@@ -198,7 +198,6 @@ def pose_oks_distance(
 
     for i, track in enumerate(atracks):
         pred_xy = _track_keypoints_xy(track, use_pred_pose=use_pred_pose)
-        track_box = track.xyxy if hasattr(track, "xyxy") else track[:4]
         for j, det in enumerate(btracks):
             det_xy = _track_keypoints_xy(det, use_pred_pose=False)
             det_conf = _track_keypoints_conf(det)
@@ -216,6 +215,144 @@ def pose_oks_distance(
                 cost_matrix[i, j] = 1.0
             else:
                 cost_matrix[i, j] = 1.0 - oks
+    return cost_matrix
+
+
+def _rel_bones_from_keypoints(keypoints: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return parent-relative bone vectors (20, 2) and pair confidences (20,)."""
+    from .pose_kalman_filter import HAND_PARENT, abs_to_rel_meas
+
+    kpts = np.asarray(keypoints, dtype=np.float32)
+    rel = abs_to_rel_meas(kpts[:, :2], HAND_PARENT)
+    pair_conf = np.ones(rel.shape[0], dtype=np.float32)
+    if kpts.shape[1] > 2:
+        for i, child in enumerate(range(1, kpts.shape[0])):
+            parent = int(HAND_PARENT[child])
+            pair_conf[i] = float(min(kpts[parent, 2], kpts[child, 2]))
+    return rel, pair_conf
+
+
+def _rel_bones_from_track(
+    track,
+    *,
+    use_pred_pose: bool = True,
+    use_static: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract parent-relative bones for association from a track or detection."""
+    from .basetrack import TrackState
+
+    if (
+        use_static
+        and getattr(track, "state", None) == TrackState.Lost
+        and getattr(track, "static_pose_mean", None) is not None
+        and getattr(track, "pose_kalman_filter", None) is not None
+    ):
+        rel = track.pose_kalman_filter.get_rel_positions(track.static_pose_mean)
+        conf = getattr(track, "static_pose_pair_conf", None)
+        if conf is None:
+            conf = np.ones(rel.shape[0], dtype=np.float32)
+        return rel.astype(np.float32), np.asarray(conf, dtype=np.float32)
+
+    if use_pred_pose and getattr(track, "pose_mean", None) is not None and getattr(track, "pose_kalman_filter", None) is not None:
+        rel = track.pose_kalman_filter.get_rel_positions(track.pose_mean)
+        conf = np.ones(rel.shape[0], dtype=np.float32)
+        if getattr(track, "kpt_conf_ema", None) is not None:
+            from .pose_kalman_filter import HAND_PARENT
+
+            for i, child in enumerate(range(1, track.n_keypoints)):
+                parent = int(HAND_PARENT[child])
+                conf[i] = float(min(track.kpt_conf_ema[parent], track.kpt_conf_ema[child]))
+        return rel.astype(np.float32), conf
+
+    if hasattr(track, "keypoints"):
+        return _rel_bones_from_keypoints(track.keypoints)
+    raise AttributeError("Track object does not expose pose data for bone matching.")
+
+
+def weighted_bone_cosine_similarity(
+    track_rel: np.ndarray,
+    det_rel: np.ndarray,
+    det_pair_conf: np.ndarray,
+    *,
+    bone_weights: np.ndarray | None = None,
+    conf_thresh: float = 0.0,
+) -> float:
+    """Cosine similarity between parent-relative bone vectors with finger-depth weights."""
+    from .pose_kalman_filter import BONE_MATCH_WEIGHTS
+
+    track_rel = np.asarray(track_rel, dtype=np.float32).reshape(-1, 2)
+    det_rel = np.asarray(det_rel, dtype=np.float32).reshape(-1, 2)
+    det_pair_conf = np.asarray(det_pair_conf, dtype=np.float32).reshape(-1)
+    if bone_weights is None:
+        bone_weights = BONE_MATCH_WEIGHTS
+    else:
+        bone_weights = np.asarray(bone_weights, dtype=np.float32).reshape(-1)
+
+    n = min(track_rel.shape[0], det_rel.shape[0], det_pair_conf.shape[0], bone_weights.shape[0])
+    if n == 0:
+        return 0.0
+
+    track_rel = track_rel[:n]
+    det_rel = det_rel[:n]
+    det_pair_conf = det_pair_conf[:n]
+    bone_weights = bone_weights[:n]
+
+    visible = det_pair_conf > conf_thresh
+    if not np.any(visible):
+        return 0.0
+
+    t_unit = track_rel / (np.linalg.norm(track_rel, axis=1, keepdims=True) + 1e-6)
+    d_unit = det_rel / (np.linalg.norm(det_rel, axis=1, keepdims=True) + 1e-6)
+    d_lens = np.linalg.norm(det_rel, axis=1)
+    len_weights = np.clip(d_lens / (np.max(d_lens) * 0.5 + 1e-6), 0.1, 1.0)
+
+    cos = np.sum(t_unit * d_unit, axis=1)
+    weights = bone_weights * det_pair_conf * len_weights * visible.astype(np.float32)
+    denom = float(weights.sum())
+    if denom <= 0:
+        return 0.0
+    return float(np.clip((cos * weights).sum() / denom, -1.0, 1.0))
+
+
+def bone_cosine_distance(
+    atracks: list,
+    btracks: list,
+    *,
+    use_pred_pose: bool = True,
+    use_static: bool = False,
+    conf_thresh: float = 0.0,
+    bone_weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute cost matrix ``(1 - cosine_sim) / 2`` on parent-relative bones."""
+    cost_matrix = np.ones((len(atracks), len(btracks)), dtype=np.float32)
+    if not atracks or not btracks:
+        return cost_matrix
+
+    for i, track in enumerate(atracks):
+        track_rel, _ = _rel_bones_from_track(track, use_pred_pose=use_pred_pose, use_static=False)
+        static_rel = static_conf = None
+        if use_static and getattr(track, "static_pose_mean", None) is not None:
+            static_rel, static_conf = _rel_bones_from_track(track, use_pred_pose=True, use_static=True)
+
+        for j, det in enumerate(btracks):
+            det_rel, det_conf = _rel_bones_from_keypoints(det.keypoints) if hasattr(det, "keypoints") else _rel_bones_from_track(det, use_pred_pose=False)
+            sim = weighted_bone_cosine_similarity(
+                track_rel,
+                det_rel,
+                det_conf,
+                bone_weights=bone_weights,
+                conf_thresh=conf_thresh,
+            )
+            if static_rel is not None:
+                sim_static = weighted_bone_cosine_similarity(
+                    static_rel,
+                    det_rel,
+                    static_conf if static_conf is not None else det_conf,
+                    bone_weights=bone_weights,
+                    conf_thresh=conf_thresh,
+                )
+                sim = max(sim, sim_static)
+            cost_matrix[i, j] = (1.0 - sim) / 2.0
     return cost_matrix
 
 

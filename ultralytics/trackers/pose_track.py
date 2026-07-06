@@ -44,11 +44,24 @@ class PoseSTrack(STrack):
         self.pose_mean: np.ndarray | None = None
         self.pose_covariance: np.ndarray | None = None
         self._anchor = self.keypoints[0, :2].astype(np.float32).copy()
+        self.wrist_rel_to_box = self._encode_wrist_rel(xywh[:4], self.keypoints)
+        self.static_mean: np.ndarray | None = None
+        self.static_covariance: np.ndarray | None = None
+        self.static_pose_mean: np.ndarray | None = None
+        self.static_pose_covariance: np.ndarray | None = None
+        self.static_wrist_rel_to_box: np.ndarray | None = None
+        self.static_pose_pair_conf: np.ndarray | None = None
         self.cls_log_odds = 0.0
         self.enable_handedness = False
         self.kpt_conf_ema: np.ndarray | None = None
         self._kpt_conf_thresh = 0.3
         self._cls_learning_rate = 0.3
+
+    @staticmethod
+    def _encode_wrist_rel(xywh: np.ndarray | list[float], keypoints: np.ndarray) -> np.ndarray:
+        xywh = np.asarray(xywh[:4], dtype=np.float32)
+        scale = float(np.sqrt(xywh[2] ** 2 + xywh[3] ** 2) + 1e-6)
+        return (keypoints[0, :2].astype(np.float32) - xywh[:2]) / scale
 
     @classmethod
     def _shared_pose_kalman(cls, n_keypoints: int) -> KalmanFilterPoseChain:
@@ -65,6 +78,15 @@ class PoseSTrack(STrack):
     def pred_keypoints_xy(self) -> np.ndarray:
         if self.pose_mean is None or self.pose_kalman_filter is None:
             return self.keypoints[:, :2].astype(np.float32)
+
+        if self.state == TrackState.Lost and self.static_pose_mean is not None and self.static_mean is not None:
+            center = self.static_mean[:2].astype(np.float32)
+            wh = self.static_mean[2:4].astype(np.float32)
+            scale = float(np.sqrt(wh[0] ** 2 + wh[1] ** 2) + 1e-6)
+            anchor_off = self.static_wrist_rel_to_box
+            if anchor_off is not None:
+                anchor = center + anchor_off * scale
+                return self.pose_kalman_filter.rel_to_abs(self.static_pose_mean, anchor)
         return self.pose_kalman_filter.rel_to_abs(self.pose_mean, self.anchor)
 
     @property
@@ -167,6 +189,8 @@ class PoseSTrack(STrack):
         self.score = new_track.score
         self.idx = new_track.idx
         self.keypoints = new_track.keypoints.copy()
+        self.wrist_rel_to_box = new_track.wrist_rel_to_box.copy()
+        self._clear_static_snapshot()
 
     def update(self, new_track: PoseSTrack, frame_id: int):
         self.frame_id = frame_id
@@ -181,6 +205,31 @@ class PoseSTrack(STrack):
         self.score = new_track.score
         self.idx = new_track.idx
         self.keypoints = new_track.keypoints.copy()
+        self.wrist_rel_to_box = new_track.wrist_rel_to_box.copy()
+        self._clear_static_snapshot()
+
+    def mark_lost(self):
+        super().mark_lost()
+        if self.mean is not None:
+            self.static_mean = self.mean.copy()
+            self.static_mean[4:] = 0.0
+            self.static_covariance = self.covariance.copy()
+        if self.pose_mean is not None:
+            self.static_pose_mean = self.pose_mean.copy()
+            self.static_pose_mean[2::4] = 0.0
+            self.static_pose_mean[3::4] = 0.0
+            self.static_pose_covariance = self.pose_covariance.copy()
+            self.static_wrist_rel_to_box = self.wrist_rel_to_box.copy()
+            _, pair_conf = matching._rel_bones_from_keypoints(self.keypoints)
+            self.static_pose_pair_conf = pair_conf.copy()
+
+    def _clear_static_snapshot(self):
+        self.static_mean = None
+        self.static_covariance = None
+        self.static_pose_mean = None
+        self.static_pose_covariance = None
+        self.static_wrist_rel_to_box = None
+        self.static_pose_pair_conf = None
 
     def _visible_mask(self, kpt_conf_thresh: float) -> np.ndarray:
         if self.keypoints.shape[1] > 2:
@@ -190,6 +239,7 @@ class PoseSTrack(STrack):
     def _update_pose(self, new_track: PoseSTrack, kpt_conf_thresh: float | None = None):
         thresh = self._kpt_conf_thresh if kpt_conf_thresh is None else kpt_conf_thresh
         self._anchor = new_track.keypoints[0, :2].astype(np.float32).copy()
+        self.wrist_rel_to_box = new_track.wrist_rel_to_box.copy()
         if self.pose_kalman_filter is None:
             return
         visible = new_track._visible_mask(thresh)
@@ -286,6 +336,9 @@ class PoseTrack(BYTETracker):
         STrack.shared_kalman = KalmanFilterXYWH()
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = self.get_pose_kalmanfilter()
+        self.lost_track_max_frames = int(getattr(args, "lost_track_max_frames", 5))
+        # Short lost survival: static box growth makes long-lived lost tracks prone to false recall.
+        self.max_time_lost = self.lost_track_max_frames
         self.enable_handedness = _handedness_enabled(args, class_names)
         self._match_weights = self._resolve_match_weights(args)
         self._oks_sigma = getattr(args, "oks_sigma", 0.05)
@@ -298,6 +351,27 @@ class PoseTrack(BYTETracker):
             det._kpt_conf_thresh = self._kpt_conf_thresh
             det._cls_learning_rate = self._cls_learning_rate
         return detections
+
+    def _lost_track_age(self, track: PoseSTrack) -> int:
+        return max(int(self.frame_id) - int(track.end_frame), 0)
+
+    def _is_lost_expired(self, track: PoseSTrack) -> bool:
+        if track.state != TrackState.Lost:
+            return False
+        return self._lost_track_age(track) > self.lost_track_max_frames
+
+    def _purge_expired_lost_tracks(self) -> list[PoseSTrack]:
+        """Remove lost tracks that exceeded the short static-recall window."""
+        kept: list[PoseSTrack] = []
+        removed: list[PoseSTrack] = []
+        for track in self.lost_stracks:
+            if self._is_lost_expired(track):
+                track.mark_removed()
+                removed.append(track)
+            else:
+                kept.append(track)
+        self.lost_stracks = kept
+        return removed
 
     def get_kalmanfilter(self) -> KalmanFilterXYWH:
         return KalmanFilterXYWH()
@@ -338,18 +412,28 @@ class PoseTrack(BYTETracker):
             ]
         )
 
-    def get_dists(self, tracks: list[PoseSTrack], detections: list[PoseSTrack], stage: int = 1) -> np.ndarray:
-        alpha = float(getattr(self.args, "box_weight", 0.4))
-        beta = float(getattr(self.args, "pose_weight_second" if stage == 2 else "pose_weight", 0.6))
-        total = max(alpha + beta, 1e-6)
-        alpha, beta = alpha / total, beta / total
+    def _det_combined_scores(self, results, keypoints: np.ndarray | None) -> np.ndarray:
+        scores = np.asarray(results.conf, dtype=np.float32)
+        if keypoints is None or len(keypoints) == 0 or keypoints.shape[-1] < 3:
+            return scores
+        pose_scores = np.mean(keypoints[..., 2], axis=1).astype(np.float32)
+        box_w = float(getattr(self.args, "det_score_box_weight", 0.5))
+        return box_w * scores + (1.0 - box_w) * pose_scores
 
-        d_box = matching.iou_distance(tracks, detections)
-        proximity = float(getattr(self.args, "proximity_thresh", 0.5))
-        d_box_mask = d_box > (1.0 - proximity)
-        d_box[d_box_mask] = 1.0
+    @staticmethod
+    def _xywh_to_xyxy(xywh: np.ndarray) -> np.ndarray:
+        xywh = np.asarray(xywh, dtype=np.float32)
+        if xywh.ndim == 1:
+            xywh = xywh.reshape(1, 4)
+        xyxy = np.zeros_like(xywh)
+        xyxy[:, 0] = xywh[:, 0] - xywh[:, 2] / 2
+        xyxy[:, 1] = xywh[:, 1] - xywh[:, 3] / 2
+        xyxy[:, 2] = xywh[:, 0] + xywh[:, 2] / 2
+        xyxy[:, 3] = xywh[:, 1] + xywh[:, 3] / 2
+        return xyxy
 
-        d_pose = matching.pose_oks_distance(
+    def _pose_dissimilarity(self, tracks: list[PoseSTrack], detections: list[PoseSTrack]) -> np.ndarray:
+        d_oks = matching.pose_oks_distance(
             tracks,
             detections,
             sigmas=self._oks_sigma,
@@ -358,14 +442,167 @@ class PoseTrack(BYTETracker):
             conf_thresh=self._kpt_conf_thresh,
             pose_match_thresh=float(getattr(self.args, "pose_match_thresh", 0.0)),
         )
-        d_pose[d_box_mask] = 1.0
+        d_bone = matching.bone_cosine_distance(
+            tracks,
+            detections,
+            use_pred_pose=True,
+            use_static=True,
+            conf_thresh=self._kpt_conf_thresh,
+        )
+        metric = str(getattr(self.args, "pose_metric", "hybrid")).lower()
+        if metric == "oks":
+            return d_oks
+        if metric == "bone":
+            return d_bone
+        return np.minimum(d_oks, d_bone)
 
-        dists = alpha * d_box + beta * d_pose
+    def _refine_iou_for_track(self, track: PoseSTrack, iou_row: np.ndarray, det_xyxys: np.ndarray) -> np.ndarray:
+        if track.state != TrackState.Lost or track.static_mean is None:
+            return iou_row
+        dt = min(self._lost_track_age(track), self.lost_track_max_frames)
+        growth_rate = float(getattr(self.args, "lost_box_growth_rate", 0.02))
+        growth_max = float(getattr(self.args, "lost_box_growth_max", 1.4))
+        growth = min(1.0 + growth_rate * dt, growth_max)
+        static_xywh = track.static_mean[:4].copy()
+        static_xywh[2:4] *= growth
+        static_iou = matching.iou_distance(self._xywh_to_xyxy(static_xywh), det_xyxys)[0]
+        return np.minimum(iou_row, static_iou)
+
+    def _resolve_pose_collisions(
+        self,
+        dists: np.ndarray,
+        pose_disim: np.ndarray,
+        tracks: list[PoseSTrack],
+        *,
+        second_thresh: float,
+    ) -> np.ndarray:
+        if dists.size == 0:
+            return dists
+        out = dists.copy()
+        n_det = dists.shape[1]
+        for j in range(n_det):
+            candidates = np.where(out[:, j] < second_thresh)[0]
+            if len(candidates) <= 1:
+                continue
+            pose_vals = pose_disim[candidates, j]
+            best = float(np.min(pose_vals))
+            for k, idx in enumerate(candidates):
+                val = float(pose_vals[k])
+                own_best = j == int(np.argmin(pose_disim[idx, :]))
+                if val == best and val < 0.2:
+                    out[idx, j] = max(0.1, out[idx, j] - 0.2)
+                elif val > 0.4 and (val > best or not own_best):
+                    out[idx, j] = min(0.9, out[idx, j] + 0.2)
+        return out
+
+    def _apply_velocity_bonus(
+        self,
+        dists: np.ndarray,
+        tracks: list[PoseSTrack],
+        detections: list[PoseSTrack],
+        pose_disim: np.ndarray,
+        *,
+        first_thresh: float,
+        second_thresh: float,
+    ) -> np.ndarray:
+        if dists.size == 0:
+            return dists
+        out = dists.copy()
+        det_xywhs = np.array([d.xywh for d in detections], dtype=np.float32)
+        for j in range(out.shape[1]):
+            candidates = np.where(out[:, j] < second_thresh)[0]
+            if len(candidates) != 1:
+                continue
+            idx = int(candidates[0])
+            track = tracks[idx]
+            if track.mean is None or first_thresh > out[idx, j] or out[idx, j] >= second_thresh:
+                continue
+            velocity = track.mean[4:6]
+            speed = float(np.linalg.norm(velocity))
+            if speed <= 5.0:
+                continue
+            innovation = det_xywhs[j, :2] - track.mean[:2]
+            cos_sim = float(np.dot(innovation, velocity) / (np.linalg.norm(innovation) * speed + 1e-6))
+            if cos_sim > 0.7 and pose_disim[idx, j] < 0.75:
+                out[idx, j] = out[idx, j] - 0.3 * cos_sim
+        return out
+
+    def get_dists(self, tracks: list[PoseSTrack], detections: list[PoseSTrack], stage: int = 1) -> np.ndarray:
+        m, n = len(tracks), len(detections)
+        dists = np.ones((m, n), dtype=np.float32)
+        if m == 0 or n == 0:
+            return dists
+
+        box_w = float(getattr(self.args, "box_weight", 0.4))
+        pose_w = float(getattr(self.args, "pose_weight_second" if stage == 2 else "pose_weight", 0.6))
+        total = max(box_w + pose_w, 1e-6)
+        alpha, beta = box_w / total, pose_w / total
+
+        det_xywhs = np.array([d.xywh for d in detections], dtype=np.float32)
+        det_xyxys = np.array([d.xyxy for d in detections], dtype=np.float32)
+        iou_matrix = matching.iou_distance(tracks, detections)
+        pose_disim = self._pose_dissimilarity(tracks, detections)
+
+        box_gate = float(getattr(self.args, "box_gate_thresh", 9.488))
+        dead_line_scale = float(getattr(self.args, "dead_line_scale", 3.0))
+        pose_reliable_thresh = float(getattr(self.args, "pose_reliable_thresh", 0.25))
+        use_gating = bool(getattr(self.args, "use_maha_gating", True))
+
+        for i, track in enumerate(tracks):
+            if track.mean is None:
+                continue
+            iou_row = self._refine_iou_for_track(track, iou_matrix[i], det_xyxys)
+            pose_row = pose_disim[i]
+
+            if use_gating and track.kalman_filter is not None:
+                bbox_maha = track.kalman_filter.gating_distance(
+                    track.mean, track.covariance, det_xywhs, metric="maha"
+                )
+            else:
+                bbox_maha = np.full(n, np.inf, dtype=np.float32)
+
+            pixel_dists = np.linalg.norm(det_xywhs[:, :2] - track.mean[:2], axis=1)
+            dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * dead_line_scale
+            if track.state == TrackState.Lost and track.static_mean is not None:
+                static_pixel = np.linalg.norm(det_xywhs[:, :2] - track.static_mean[:2], axis=1)
+                static_dead = np.minimum(track.static_mean[3], det_xywhs[:, 3]) * dead_line_scale
+            else:
+                static_pixel = np.ones(n, dtype=np.float32)
+                static_dead = np.zeros(n, dtype=np.float32)
+
+            for j in range(n):
+                if pixel_dists[j] > dead_lines[j] and static_pixel[j] > static_dead[j]:
+                    continue
+                has_iou = iou_row[j] < 1.0
+                in_gate = bbox_maha[j] < box_gate
+                pose_reliable = pose_row[j] < pose_reliable_thresh
+                if not (has_iou or in_gate or pose_reliable):
+                    continue
+                if track.state == TrackState.Lost and not has_iou:
+                    continue
+                if track.state == TrackState.Lost:
+                    box_score = min(iou_row[j], max(bbox_maha[j] / box_gate, pose_row[j]))
+                else:
+                    box_score = iou_row[j]
+                dists[i, j] = alpha * box_score + beta * pose_row[j]
+
+        proximity = float(getattr(self.args, "proximity_thresh", 0.5))
+        far_mask = iou_matrix > (1.0 - proximity)
+        dists[far_mask] = 1.0
+
         if self.args.fuse_score:
             dists = matching.fuse_score(dists, detections)
         if self.enable_handedness:
             penalty = float(getattr(self.args, "cls_soft_match_penalty", 0.0))
             dists = np.minimum(1.0, dists + matching.cls_soft_match_penalty(tracks, detections, penalty=penalty))
+
+        if stage == 1:
+            first_thresh = float(getattr(self.args, "match_thresh", 0.8))
+            second_thresh = float(getattr(self.args, "second_match_thresh", 0.9))
+            dists = self._resolve_pose_collisions(dists, pose_disim, tracks, second_thresh=second_thresh)
+            dists = self._apply_velocity_bonus(
+                dists, tracks, detections, pose_disim, first_thresh=first_thresh, second_thresh=second_thresh
+            )
         return dists
 
     def multi_predict(self, tracks: list[PoseSTrack]):
@@ -380,12 +617,13 @@ class PoseTrack(BYTETracker):
     ) -> np.ndarray:
         """Update tracker with detections and optional pose keypoints shaped (N, K, C)."""
         self.frame_id += 1
+        removed_stracks = list(self._purge_expired_lost_tracks())
         activated_stracks = []
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
 
-        scores = results.conf
+        scores = self._det_combined_scores(results, keypoints)
         n_dets = len(scores)
         global_inds = np.arange(n_dets)
         remain_inds = scores >= self.args.track_high_thresh
@@ -425,11 +663,12 @@ class PoseTrack(BYTETracker):
         detections_second = self.init_track(
             results_second, keypoints=keypoints_second, det_indices=global_inds[inds_second]
         )
-        r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
-        dists = self.get_dists(r_tracked_stracks, detections_second, stage=2)
-        matches, u_track, _u_detection_second = matching.linear_assignment(dists, thresh=0.5)
+        r_strack_pool = [strack_pool[i] for i in u_track]
+        dists = self.get_dists(r_strack_pool, detections_second, stage=2)
+        second_thresh = float(getattr(self.args, "second_match_thresh", 0.9))
+        matches, u_track, _u_detection_second = matching.linear_assignment(dists, thresh=second_thresh)
         for itracked, idet in matches:
-            track = r_tracked_stracks[itracked]
+            track = r_strack_pool[itracked]
             det = detections_second[idet]
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
@@ -439,7 +678,7 @@ class PoseTrack(BYTETracker):
                 refind_stracks.append(track)
 
         for it in u_track:
-            track = r_tracked_stracks[it]
+            track = r_strack_pool[it]
             if track.state != TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
@@ -469,7 +708,7 @@ class PoseTrack(BYTETracker):
             activated_stracks.append(track)
 
         for track in self.lost_stracks:
-            if self.frame_id - track.end_frame > self.max_time_lost:
+            if self._is_lost_expired(track):
                 track.mark_removed()
                 removed_stracks.append(track)
 
@@ -479,7 +718,10 @@ class PoseTrack(BYTETracker):
         self.lost_stracks = self.sub_stracks(self.lost_stracks, self.tracked_stracks)
         self.lost_stracks.extend(lost_stracks)
         self.lost_stracks = self.sub_stracks(self.lost_stracks, self.removed_stracks)
-        self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
+        if bool(getattr(self.args, "remove_duplicate_stracks", False)):
+            self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(
+                self.tracked_stracks, self.lost_stracks
+            )
         self.removed_stracks.extend(removed_stracks)
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]

@@ -6,10 +6,11 @@ import numpy as np
 import pytest
 
 from ultralytics.utils import IterableSimpleNamespace
+from ultralytics.trackers.basetrack import TrackState
 from ultralytics.trackers.pose_track import PoseTrack
 from ultralytics.trackers.spad_pose_track import SPADPoseTrack
 from ultralytics.trackers.utils.pose_kalman_filter import KalmanFilterPoseChain, fk_abs, abs_to_rel_meas, HAND_PARENT
-from ultralytics.trackers.utils.matching import weighted_oks, pose_oks_distance
+from ultralytics.trackers.utils.matching import weighted_oks, pose_oks_distance, weighted_bone_cosine_similarity, bone_cosine_distance
 from ultralytics.trackers.utils.result_layout import pose_track_result_dim, parse_track_keypoints, apply_pose_tracks_to_result
 
 
@@ -175,6 +176,58 @@ def test_result_layout_keypoints_roundtrip():
     parsed = parse_track_keypoints(tracks, n_keypoints=21, kpt_dims=3)
     assert parsed.shape == (1, 21, 3)
     assert parsed[0, 0, 2] > 0
+
+
+def test_bone_cosine_prefers_same_hand_layout():
+    kpts_a = _hand_skeleton_keypoints(256, 256)
+    kpts_b = _hand_skeleton_keypoints(256, 256)
+    kpts_c = _hand_skeleton_keypoints(340, 280)
+    from ultralytics.trackers.utils.pose_kalman_filter import abs_to_rel_meas, HAND_PARENT
+
+    rel_a, conf_a = abs_to_rel_meas(kpts_a[:, :2], HAND_PARENT), np.full(20, 0.9, dtype=np.float32)
+    rel_b, conf_b = abs_to_rel_meas(kpts_b[:, :2], HAND_PARENT), np.full(20, 0.9, dtype=np.float32)
+    rel_c, conf_c = abs_to_rel_meas(kpts_c[:, :2], HAND_PARENT), np.full(20, 0.9, dtype=np.float32)
+    sim_same = weighted_bone_cosine_similarity(rel_a, rel_b, conf_b)
+    sim_diff = weighted_bone_cosine_similarity(rel_a, rel_c, conf_c)
+    assert sim_same > sim_diff
+
+
+def test_mark_lost_preserves_static_pose_snapshot():
+    args = _tracker_args()
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    img = np.zeros((512, 512, 3), np.uint8)
+    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
+    kpts = _hand_skeleton_keypoints(256, 256)[None]
+    tracker.update(boxes, img, keypoints=kpts)
+    track = tracker.tracked_stracks[0]
+    track.mark_lost()
+    assert track.static_pose_mean is not None
+    assert track.static_wrist_rel_to_box is not None
+    assert track.state == TrackState.Lost
+
+
+def test_lost_track_expires_within_short_window():
+    args = _tracker_args()
+    args.lost_track_max_frames = 3
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    assert tracker.max_time_lost == 3
+    img = np.zeros((512, 512, 3), np.uint8)
+    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
+    kpts = _hand_skeleton_keypoints(256, 256)[None]
+    tracker.update(boxes, img, keypoints=kpts)
+    track = tracker.tracked_stracks[0]
+    track.mark_lost()
+    tracker.lost_stracks = [track]
+    tracker.tracked_stracks = []
+    track.end_frame = tracker.frame_id
+
+    for _ in range(3):
+        tracker.update(_FakeBoxes([], [], []), img, keypoints=np.zeros((0, 21, 3), dtype=np.float32))
+        assert any(t.track_id == track.track_id for t in tracker.lost_stracks)
+
+    tracker.update(_FakeBoxes([], [], []), img, keypoints=np.zeros((0, 21, 3), dtype=np.float32))
+    assert track.track_id not in {t.track_id for t in tracker.lost_stracks}
+    assert track.state == TrackState.Removed
 
 
 def test_pose_nms_suppresses_duplicate_hands():
