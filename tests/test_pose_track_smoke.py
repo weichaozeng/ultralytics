@@ -175,3 +175,36 @@ def test_result_layout_keypoints_roundtrip():
     parsed = parse_track_keypoints(tracks, n_keypoints=21, kpt_dims=3)
     assert parsed.shape == (1, 21, 3)
     assert parsed[0, 0, 2] > 0
+
+
+def test_pose_nms_suppresses_duplicate_hands():
+    from ultralytics.utils.pose_nms import is_pose_track_tracker, pose_aware_non_max_suppression
+
+    assert is_pose_track_tracker("posetrack.yaml")
+    assert is_pose_track_tracker("spad_posetrack")
+    assert not is_pose_track_tracker("bytetrack.yaml")
+
+    # Two overlapping boxes with nearly identical pose layout; pose NMS should keep one.
+    box = torch.tensor([[100.0, 100.0, 140.0, 140.0]], dtype=torch.float32)
+    box2 = box.clone()
+    box2[:, :2] += 2.0
+    box2[:, 2:4] += 2.0
+    kpts = torch.zeros((1, 21, 3), dtype=torch.float32)
+    for j in range(21):
+        kpts[0, j, 0] = 120.0 + j * 0.5
+        kpts[0, j, 1] = 120.0 + j * 0.3
+        kpts[0, j, 2] = 0.9
+    kpts2 = kpts.clone()
+    kpts2[..., :2] += 1.0
+
+    def _pack(xyxy, conf, cls, kpt):
+        flat = kpt.reshape(-1)
+        return torch.cat([xyxy, conf, cls, flat], dim=0)
+
+    det_a = _pack(box[0], torch.tensor([0.95]), torch.tensor([1.0]), kpts[0])
+    det_b = _pack(box2[0], torch.tensor([0.90]), torch.tensor([1.0]), kpts2[0])
+    raw = torch.stack([det_a, det_b]).T.unsqueeze(0)  # (1, 69, 2) BCN
+
+    out = pose_aware_non_max_suppression(raw, conf_thres=0.25, iou_thres=0.45, nc=2, multi_label=True)
+    assert len(out) == 1
+    assert out[0].shape[0] == 1

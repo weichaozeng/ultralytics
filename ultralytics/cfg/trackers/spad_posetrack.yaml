@@ -27,6 +27,10 @@ cls_learning_rate: 0.3
 cls_init_strength: 2.0
 cls_soft_match_penalty: 0.1
 
+# Pose-aware NMS (used automatically when this tracker is selected)
+point_thres: 0.25
+bone_thres: 0.25
+
 # Velocity field export
 field_value_source: predicted
 field_sigma_scale_x: 0.35

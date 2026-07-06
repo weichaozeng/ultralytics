@@ -50,6 +50,7 @@ from ultralytics.trackers.track import TRACKER_MAP
 from ultralytics.trackers.utils.result_layout import apply_pose_tracks_to_result
 from ultralytics.utils import IterableSimpleNamespace, YAML, nms
 from ultralytics.utils.checks import check_yaml
+from ultralytics.utils.pose_nms import is_pose_track_tracker, pose_aware_non_max_suppression
 
 
 def _np_load(path: Path) -> np.ndarray:
@@ -375,9 +376,32 @@ def _raw_sum_readrgb_like_bgr(raw_video: np.ndarray, *, packed_nch: int) -> np.n
     return np.ascontiguousarray(rgb[:, :, ::-1])
 
 
-def _postprocess_pose_predictions(raw_preds, *, conf: float, iou: float, nc: int, max_det: int, kpt_shape) -> list[torch.Tensor]:
+def _postprocess_pose_predictions(
+    raw_preds,
+    *,
+    conf: float,
+    iou: float,
+    nc: int,
+    max_det: int,
+    kpt_shape,
+    use_pose_nms: bool = False,
+    point_thres: float = 0.25,
+    bone_thres: float = 0.25,
+) -> list[torch.Tensor]:
     raw = raw_preds[0] if isinstance(raw_preds, (list, tuple)) and torch.is_tensor(raw_preds[0]) else raw_preds
-    preds = nms.non_max_suppression(raw, conf, iou, nc=nc, multi_label=True, max_det=max_det)
+    if use_pose_nms:
+        preds = pose_aware_non_max_suppression(
+            raw,
+            conf,
+            iou,
+            nc=nc,
+            multi_label=True,
+            max_det=max_det,
+            point_thres=point_thres,
+            bone_thres=bone_thres,
+        )
+    else:
+        preds = nms.non_max_suppression(raw, conf, iou, nc=nc, multi_label=True, max_det=max_det)
     return [pred if pred is not None else raw.new_zeros((0, 6 + int(np.prod(kpt_shape)))) for pred in preds]
 
 
@@ -521,6 +545,10 @@ def main():
     _configure_model_spad_bin_rate(spad_model, current_bin_rate_hz=float(args.spad_bin_rate_hz))
     names = yolo.names
     tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate, class_names=names)
+    tracker_cfg = YAML.load(check_yaml(f"{args.tracker}.yaml"))
+    use_pose_nms = is_pose_track_tracker(args.tracker)
+    point_thres = float(tracker_cfg.get("point_thres", 0.25))
+    bone_thres = float(tracker_cfg.get("bone_thres", 0.25))
     override_name, override_preprocessor = _build_override_preprocessor(args)
     if override_preprocessor is not None:
         if override_name == "hyb" and args.tracker not in {"spad_tracker", "spad_posetrack"}:
@@ -582,6 +610,9 @@ def main():
                         nc=len(names),
                         max_det=args.max_det,
                         kpt_shape=kpt_shape,
+                        use_pose_nms=use_pose_nms,
+                        point_thres=point_thres,
+                        bone_thres=bone_thres,
                     )
                     recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
                 if device.type == "cuda":

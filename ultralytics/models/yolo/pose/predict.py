@@ -1,7 +1,8 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from ultralytics.models.yolo.detect.predict import DetectionPredictor
-from ultralytics.utils import DEFAULT_CFG, LOGGER, ops
+from ultralytics.utils import DEFAULT_CFG, LOGGER, nms, ops
+from ultralytics.utils.pose_nms import is_pose_track_tracker, pose_aware_non_max_suppression
 
 
 class PosePredictor(DetectionPredictor):
@@ -50,6 +51,70 @@ class PosePredictor(DetectionPredictor):
                 "Apple MPS known Pose bug. Recommend 'device=cpu' for Pose models. "
                 "See https://github.com/ultralytics/ultralytics/issues/4031."
             )
+
+    def _use_pose_nms(self) -> bool:
+        return getattr(self.args, "mode", None) == "track" and is_pose_track_tracker(getattr(self.args, "tracker", None))
+
+    def _pose_nms_thresholds(self) -> tuple[float, float]:
+        tracker = getattr(self.args, "tracker", None)
+        if not tracker:
+            return 0.25, 0.25
+        try:
+            from ultralytics.utils import YAML
+            from ultralytics.utils.checks import check_yaml
+
+            cfg = YAML.load(check_yaml(tracker))
+            return float(cfg.get("point_thres", 0.25)), float(cfg.get("bone_thres", 0.25))
+        except Exception:
+            return 0.25, 0.25
+
+    def postprocess(self, preds, img, orig_imgs, **kwargs):
+        """Post-process predictions, using pose-aware NMS when PoseTrack is active."""
+        save_feats = getattr(self, "_feats", None) is not None
+        if self._use_pose_nms():
+            point_thres, bone_thres = self._pose_nms_thresholds()
+            preds = pose_aware_non_max_suppression(
+                preds,
+                self.args.conf,
+                self.args.iou,
+                self.args.classes,
+                self.args.agnostic_nms,
+                max_det=self.args.max_det,
+                nc=len(self.model.names),
+                end2end=getattr(self.model, "end2end", False),
+                rotated=False,
+                return_idxs=save_feats,
+                point_thres=point_thres,
+                bone_thres=bone_thres,
+            )
+        else:
+            preds = nms.non_max_suppression(
+                preds,
+                self.args.conf,
+                self.args.iou,
+                self.args.classes,
+                self.args.agnostic_nms,
+                max_det=self.args.max_det,
+                nc=len(self.model.names),
+                end2end=getattr(self.model, "end2end", False),
+                rotated=False,
+                return_idxs=save_feats,
+            )
+
+        if not isinstance(orig_imgs, list):
+            orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)
+
+        if save_feats:
+            obj_feats = self.get_obj_feats(self._feats, preds[1])
+            preds = preds[0]
+
+        results = self.construct_results(preds, img, orig_imgs, **kwargs)
+
+        if save_feats:
+            for r, f in zip(results, obj_feats):
+                r.feats = f
+
+        return results
 
     def construct_result(self, pred, img, orig_img, img_path):
         """Construct the result object from the prediction, including keypoints.
