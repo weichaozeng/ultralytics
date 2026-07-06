@@ -16,6 +16,7 @@ from ultralytics.data.spad_render_cache import (
     CACHE_META_VERSION,
     render_config_fingerprint,
     sample_render_dir,
+    sibling_sample_render_dir,
 )
 
 
@@ -70,6 +71,12 @@ def load_visionsim_split_json(path: str | Path) -> list[dict[str, str]]:
         rgb = entry.get("rgb")
         if rgb:
             record["rgb"] = str(Path(rgb).resolve())
+        for key, value in entry.items():
+            if not isinstance(key, str) or not value:
+                continue
+            if key in {"stea", "sum", "ppb"} or key.startswith("render_") or key.endswith("_confidence") or key.endswith("_meta"):
+                if isinstance(value, str):
+                    record[key] = str(Path(value).resolve())
         records.append(record)
 
     return records
@@ -514,18 +521,22 @@ class SpadPoseRenderedFrameDataset(Dataset):
         self,
         samples: list[dict[str, str]],
         *,
-        render_root: str | Path,
+        render_root: str | Path | None,
+        preprocessor: str,
         image_size: int = 512,
         render_contains_confidence: bool = True,
         expected_render_config: dict[str, Any] | None = None,
+        source_render_dirname: str = "renders-spc8kHz",
     ):
         if not samples:
             raise ValueError("samples must be a non-empty list")
 
-        self.render_root = Path(render_root)
+        self.render_root = None if render_root in {None, ""} else Path(render_root)
+        self.preprocessor = str(preprocessor).strip().lower()
         self.image_size = int(image_size)
         self.render_contains_confidence = bool(render_contains_confidence)
         self.expected_render_config = dict(expected_render_config or {})
+        self.source_render_dirname = str(source_render_dirname).strip()
         self.expected_render_fingerprint = (
             render_config_fingerprint(self.expected_render_config) if self.expected_render_config else None
         )
@@ -535,7 +546,8 @@ class SpadPoseRenderedFrameDataset(Dataset):
         self.annotations = {name: self._load_annotation(name) for name in self.video_names}
         self.windows = self._build_windows()
         if not self.windows:
-            raise RuntimeError(f"No cached rendered SPAD frame windows found under {self.render_root}")
+            render_hint = self.render_root if self.render_root is not None else f"<sibling:{self.source_render_dirname}>"
+            raise RuntimeError(f"No cached rendered SPAD frame windows found under {render_hint}")
         self.labels = self._build_ultralytics_labels()
         self.im_files = [str(lb["im_file"]) for lb in self.labels]
         self.ni = len(self.labels)
@@ -548,7 +560,31 @@ class SpadPoseRenderedFrameDataset(Dataset):
             return json.load(f)
 
     def _sample_meta_paths(self, name: str) -> tuple[Path, Path, Path]:
-        render_dir = sample_render_dir(self.render_root, self.sample_records[name]["name"])
+        sample_record = self.sample_records[name]
+        sample_name = sample_record["name"]
+        explicit_frames = sample_record.get(self.preprocessor) or sample_record.get(f"render_{self.preprocessor}_frames")
+        explicit_render_dir = sample_record.get(f"render_{self.preprocessor}")
+        explicit_meta = sample_record.get(f"{self.preprocessor}_meta") or sample_record.get(f"render_{self.preprocessor}_meta")
+
+        if explicit_frames or explicit_render_dir:
+            if explicit_frames:
+                frames_path = Path(explicit_frames)
+                render_dir = frames_path.parent
+            else:
+                render_dir = Path(explicit_render_dir)
+                frames_path = render_dir / "frames.npy"
+            meta_path = Path(explicit_meta) if explicit_meta else render_dir / "meta.json"
+            return render_dir, frames_path, meta_path
+
+        if self.render_root is not None:
+            render_dir = sample_render_dir(self.render_root, sample_name)
+        else:
+            render_dir = sibling_sample_render_dir(
+                sample_record["spad"],
+                preprocessor=self.preprocessor,
+                sample_name=sample_name,
+                source_render_dirname=self.source_render_dirname,
+            )
         return render_dir, render_dir / "frames.npy", render_dir / "meta.json"
 
     def _build_windows(self) -> list[SpadPoseRenderedFrameWindow]:
@@ -611,7 +647,11 @@ class SpadPoseRenderedFrameDataset(Dataset):
         key = str(window.render_dir)
         if key in self._confidence_cache:
             return self._confidence_cache[key]
-        path = window.render_dir / "confidence.npy"
+        sample_record = self.sample_records[window.name]
+        path_str = sample_record.get(f"{self.preprocessor}_confidence") or sample_record.get(
+            f"render_{self.preprocessor}_confidence"
+        )
+        path = Path(path_str) if path_str else (window.render_dir / "confidence.npy")
         if self.render_contains_confidence and not path.is_file():
             raise FileNotFoundError(f"Cached confidence required but not found: {path}")
         conf = np.load(path, mmap_mode="r") if path.is_file() else None

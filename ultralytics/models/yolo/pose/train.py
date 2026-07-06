@@ -508,8 +508,6 @@ class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
         input_gamma = float(getattr(self.args, "spad_input_gamma", getattr(self.args, "input_gamma", 1.0)))
         if cache_mode == "rendered":
             render_root = getattr(self.args, "spad_render_root", None)
-            if not render_root:
-                raise ValueError("Rendered cache mode requires `spad_render_root`.")
             stride_frames = int(getattr(self.args, "spad_stride_frames", self.data.get("spad_stride_frames", 0))) or None
             stride_bins = chunk_size if stride_frames is None else (int(stride_frames) * int(getattr(self.args, "spad_bins_per_gt", self.data.get("spad_bins_per_gt", 64))))
             expected_config = build_render_config(
@@ -524,9 +522,11 @@ class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
             return SpadPoseRenderedFrameDataset(
                 samples=samples,
                 render_root=render_root,
+                preprocessor=preprocessor_name,
                 image_size=int(getattr(self.args, "spad_image_size", self.data.get("spad_image_size", 512))),
                 render_contains_confidence=bool(getattr(self.args, "spad_render_contains_confidence", True)),
                 expected_render_config=expected_config,
+                source_render_dirname=str(getattr(self.args, "spad_source_render_dirname", "renders-spc8kHz")),
             )
 
         return SpadPoseFrameDataset(

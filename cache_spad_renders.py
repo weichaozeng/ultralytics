@@ -21,6 +21,7 @@ from ultralytics.data.spad_render_cache import (
     build_render_config,
     render_config_fingerprint,
     sample_render_dir,
+    sibling_sample_render_dir,
 )
 from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_frame_preprocessor
 
@@ -28,7 +29,12 @@ from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_frame_pre
 def parse_args():
     ap = argparse.ArgumentParser(description="Offline cache for SPAD chunk renders.")
     ap.add_argument("--split-json", type=str, required=True, help="Path to VisionSIM split JSON.")
-    ap.add_argument("--output-root", type=str, required=True, help="Directory like renders-stea/ or renders-ppb/.")
+    ap.add_argument(
+        "--output-root",
+        type=str,
+        default="",
+        help="Optional explicit cache root. If omitted, writes beside each sample's renders-spc8kHz tree.",
+    )
     ap.add_argument("--preprocessor", type=str, choices=["sum", "ppb", "stea"], required=True)
     ap.add_argument("--chunk-size", type=int, default=320, help="Raw-bin chunk size per rendered frame.")
     ap.add_argument("--stride-bins", type=int, default=320, help="Stride in raw bins between cached chunks.")
@@ -38,6 +44,23 @@ def parse_args():
     ap.add_argument("--device", type=str, default="cuda:0", help="Torch device for preprocessing.")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite per-sample cache outputs if they exist.")
     ap.add_argument("--limit-samples", type=int, default=0, help="Optional number of samples to process for smoke tests.")
+    ap.add_argument(
+        "--update-json",
+        action="store_true",
+        help="Write explicit render cache paths back into the split JSON after caching.",
+    )
+    ap.add_argument(
+        "--json-output",
+        type=str,
+        default="",
+        help="Optional output path for the updated split JSON. Defaults to in-place update when --update-json is set.",
+    )
+    ap.add_argument(
+        "--source-render-dirname",
+        type=str,
+        default="renders-spc8kHz",
+        help="Name of the source packed-SPAD render directory used to infer sibling render roots.",
+    )
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=5e-4)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", type=str, default="true")
@@ -154,15 +177,47 @@ def _render_chunk(*, preprocessor, packed_chunk: np.ndarray, packed_nch: int, pa
     return rgb.detach().cpu().numpy().astype(np.float32, copy=False), conf.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
+def _load_split_payload(path: str | Path) -> dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict) or not isinstance(payload.get("samples"), dict):
+        raise ValueError(f"Expected split JSON with top-level 'samples' mapping: {path}")
+    return payload
+
+
+def _update_payload_entry(payload: dict[str, Any], sample: dict[str, str], *, preprocessor: str, render_dir: Path) -> None:
+    samples = payload["samples"]
+    sample_entry = samples.get(str(sample["id"]))
+    if not isinstance(sample_entry, dict):
+        raise KeyError(f"Missing sample entry for id={sample['id']!r} while updating JSON.")
+    prefix = str(preprocessor).strip().lower()
+    sample_entry[prefix] = str(render_dir / "frames.npy")
+    sample_entry[f"{prefix}_confidence"] = str(render_dir / "confidence.npy")
+    sample_entry[f"{prefix}_meta"] = str(render_dir / "meta.json")
+    # Backward-compatible explicit directory key for older cache consumers.
+    sample_entry[f"render_{prefix}"] = str(render_dir)
+    sample_entry[f"render_{prefix}_frames"] = str(render_dir / "frames.npy")
+    sample_entry[f"render_{prefix}_confidence"] = str(render_dir / "confidence.npy")
+    sample_entry[f"render_{prefix}_meta"] = str(render_dir / "meta.json")
+
+
 def _write_sample_cache(*, sample: dict[str, str], args, preprocessor, render_config: dict[str, Any], device: torch.device) -> dict[str, Any] | None:
     sample_name = str(sample["name"])
-    render_dir = sample_render_dir(args.output_root, sample_name)
+    if str(args.output_root).strip():
+        render_dir = sample_render_dir(args.output_root, sample_name)
+    else:
+        render_dir = sibling_sample_render_dir(
+            sample["spad"],
+            preprocessor=args.preprocessor,
+            sample_name=sample_name,
+            source_render_dirname=args.source_render_dirname,
+        )
     frames_path = render_dir / "frames.npy"
     confidence_path = render_dir / "confidence.npy"
     meta_path = render_dir / "meta.json"
     if not args.overwrite and frames_path.exists() and confidence_path.exists() and meta_path.exists():
         print(f"[skip] {sample_name}: cache already exists")
-        return None
+        return {"render_dir": render_dir}
 
     packed = np.load(sample["spad"], mmap_mode="r")
     n_gt = _load_annotation_len(sample["gt"])
@@ -228,6 +283,7 @@ def _write_sample_cache(*, sample: dict[str, str], args, preprocessor, render_co
         "version": CACHE_META_VERSION,
         "sample_id": str(sample["id"]),
         "sample_name": sample_name,
+        "render_dir": str(render_dir),
         "source_spad": str(sample["spad"]),
         "source_gt": str(sample["gt"]),
         "preprocessor": str(args.preprocessor).strip().lower(),
@@ -248,11 +304,13 @@ def _write_sample_cache(*, sample: dict[str, str], args, preprocessor, render_co
         f"[ok] {sample_name}: {len(chunk_records)} chunks -> {render_dir} "
         f"shape={tuple(first_frame.shape)} conf={tuple(first_conf.shape)}"
     )
+    meta["render_dir"] = str(render_dir)
     return meta
 
 
 def main():
     args = parse_args()
+    payload = _load_split_payload(args.split_json) if args.update_json else None
     samples = load_visionsim_split_json(args.split_json)
     if int(args.limit_samples) > 0:
         samples = samples[: int(args.limit_samples)]
@@ -269,8 +327,9 @@ def main():
         input_gamma=float(args.input_gamma),
         extra_kwargs=preprocessor_kwargs,
     )
-    output_root = Path(args.output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output_root) if str(args.output_root).strip() else None
+    if output_root is not None:
+        output_root.mkdir(parents=True, exist_ok=True)
 
     written = 0
     for sample in samples:
@@ -283,10 +342,25 @@ def main():
         )
         if meta is not None:
             written += 1
+            if payload is not None:
+                _update_payload_entry(
+                    payload,
+                    sample,
+                    preprocessor=args.preprocessor,
+                    render_dir=Path(meta["render_dir"]),
+                )
+
+    if payload is not None:
+        json_output = Path(args.json_output) if str(args.json_output).strip() else Path(args.split_json)
+        json_output.parent.mkdir(parents=True, exist_ok=True)
+        with json_output.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(f"Updated split JSON: {json_output}")
 
     print(
         f"Done. processed_samples={len(samples)} newly_written={written} "
-        f"fingerprint={render_config_fingerprint(render_config)} output_root={output_root}"
+        f"fingerprint={render_config_fingerprint(render_config)} "
+        f"output_root={output_root if output_root is not None else '<sibling-to-renders-spc8kHz>'}"
     )
 
 

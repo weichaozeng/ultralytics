@@ -24,6 +24,39 @@ def sample_render_dir(root: str | Path, sample_name: str) -> Path:
     return Path(root) / sanitize_render_sample_name(sample_name)
 
 
+def infer_sibling_render_root(
+    spad_path: str | Path,
+    *,
+    preprocessor: str,
+    source_render_dirname: str = "renders-spc8kHz",
+) -> Path:
+    """Infer the sibling render root beside a source packed-SPAD render tree."""
+    spad_path = Path(spad_path).resolve()
+    for parent in (spad_path.parent, *spad_path.parents):
+        if parent.name == source_render_dirname:
+            return parent.parent / f"renders-{str(preprocessor).strip().lower()}"
+    raise ValueError(
+        f"Could not locate source render directory {source_render_dirname!r} in path {spad_path}. "
+        "Pass an explicit render root instead."
+    )
+
+
+def sibling_sample_render_dir(
+    spad_path: str | Path,
+    *,
+    preprocessor: str,
+    sample_name: str,
+    source_render_dirname: str = "renders-spc8kHz",
+) -> Path:
+    """Return the per-sample sibling render cache directory beside renders-spc8kHz."""
+    root = infer_sibling_render_root(
+        spad_path,
+        preprocessor=preprocessor,
+        source_render_dirname=source_render_dirname,
+    )
+    return sample_render_dir(root, sample_name)
+
+
 def build_render_config(
     *,
     preprocessor: str,

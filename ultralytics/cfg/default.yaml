@@ -157,6 +157,7 @@ spad_input_gamma: 2.2 # (float) gamma correction applied to reconstructed detect
 spad_cache_mode: raw # (str) frame-mode detector input source: raw or rendered
 spad_render_root: # (str, optional) root directory containing cached rendered frames
 spad_render_contains_confidence: True # (bool) whether cached renders include confidence.npy for UA/residual adapters
+spad_source_render_dirname: renders-spc8kHz # (str) source render dirname used to infer sibling rendered cache roots
 spad_preprocessor: ppb # (str) detector input preprocessor: ppb, sum, stea
 spad_plugin: temporal_ssd # (str) detector-side feature plugin: none, temporal_ssd, spatial_only, spatial_temporal
 spad_frame_adapter: ua # (str) frame-mode image-space adapter: none, residual, ua
