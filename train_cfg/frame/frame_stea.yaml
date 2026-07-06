@@ -17,9 +17,10 @@ imgsz: 512
 spad_chunk_size: 320
 spad_subsampling: 64
 spad_bins_per_gt: 64
-spad_stride_frames: 1
+spad_stride_frames: 5
 spad_image_size: 512
 spad_packed_ch_order: RGB
+spad_cache_mode: auto
 
 # preprocessor
 spad_preprocessor: stea

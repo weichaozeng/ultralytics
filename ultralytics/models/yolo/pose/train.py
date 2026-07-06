@@ -462,6 +462,21 @@ class SpadPoseSequenceTrainer(PoseTrainer):
 class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
     """Pose trainer that collapses each raw SPAD chunk into one end-of-chunk detector frame."""
 
+    @staticmethod
+    def _samples_have_explicit_render(samples: list[dict[str, str]], preprocessor_name: str) -> bool:
+        key = str(preprocessor_name).strip().lower()
+        return bool(samples) and all(bool(sample.get(key)) for sample in samples)
+
+    def _resolve_frame_cache_mode(self, samples: list[dict[str, str]], preprocessor_name: str) -> str:
+        requested = str(getattr(self.args, "spad_cache_mode", "auto")).strip().lower()
+        if requested == "raw":
+            return "raw"
+        if requested == "rendered":
+            return "rendered"
+        if requested == "auto":
+            return "rendered" if self._samples_have_explicit_render(samples, preprocessor_name) else "raw"
+        raise ValueError(f"Unsupported spad_cache_mode={requested!r}; expected raw, rendered, or auto.")
+
     def _build_frame_preprocessor_kwargs(self, preprocessor_name: str, spad_subsampling: int) -> dict[str, Any]:
         preprocessor_name = str(preprocessor_name).strip().lower()
         if preprocessor_name == "ppb":
@@ -503,14 +518,15 @@ class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
         subsampling = int(getattr(self.args, "spad_subsampling", self.data.get("spad_subsampling", 64)))
         legacy_output_frames = int(getattr(self.args, "spad_output_frames", self.data.get("spad_output_frames", 4)))
         chunk_size = int(getattr(self.args, "spad_chunk_size", 0)) or (legacy_output_frames * subsampling)
-        cache_mode = str(getattr(self.args, "spad_cache_mode", "raw")).strip().lower()
         preprocessor_name = str(getattr(self.args, "spad_preprocessor", "stea")).strip().lower()
+        cache_mode = self._resolve_frame_cache_mode(samples, preprocessor_name)
         input_gamma = float(getattr(self.args, "spad_input_gamma", getattr(self.args, "input_gamma", 1.0)))
         if cache_mode == "rendered":
             render_root = getattr(self.args, "spad_render_root", None)
             stride_frames = int(getattr(self.args, "spad_stride_frames", self.data.get("spad_stride_frames", 0))) or None
             stride_bins = chunk_size if stride_frames is None else (int(stride_frames) * int(getattr(self.args, "spad_bins_per_gt", self.data.get("spad_bins_per_gt", 64))))
-            expected_config = build_render_config(
+            has_explicit_render = self._samples_have_explicit_render(samples, preprocessor_name)
+            expected_config = None if has_explicit_render else build_render_config(
                 preprocessor=preprocessor_name,
                 chunk_size=chunk_size,
                 stride_bins=stride_bins,
@@ -546,6 +562,9 @@ class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
     ) -> SpadPoseFrameModel:
         """Get frame-mode SPAD pose model with optional UA adapter."""
         preprocessor_name = str(getattr(self.args, "spad_preprocessor", "stea")).strip().lower()
+        train_json = getattr(self.args, "spad_train_json", None) or self.data.get("spad_train_json")
+        samples = load_visionsim_split_json(train_json) if train_json else []
+        resolved_cache_mode = self._resolve_frame_cache_mode(samples, preprocessor_name)
 
         spad_subsampling = int(getattr(self.args, "spad_subsampling", getattr(self.args, "subsampling", 64)))
         spad_bin_rate_hz = float(getattr(self.args, "spad_bin_rate_hz", 8000.0))
@@ -568,7 +587,7 @@ class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
                 getattr(self.args, "spad_frame_adapter_alpha_init", getattr(self.args, "spad_plugin_alpha_init", 0.0))
             ),
             spad_chunk_size=chunk_size,
-            spad_cache_mode=str(getattr(self.args, "spad_cache_mode", "raw")),
+            spad_cache_mode=resolved_cache_mode,
             spad_input_gamma=float(getattr(self.args, "spad_input_gamma", getattr(self.args, "input_gamma", 1.0))),
             spad_bin_rate_hz=spad_bin_rate_hz,
         )

@@ -553,6 +553,8 @@ class SpadPoseRenderedFrameDataset(Dataset):
         self.ni = len(self.labels)
         self._frames_cache: dict[str, np.ndarray] = {}
         self._confidence_cache: dict[str, np.ndarray | None] = {}
+        self._frames_path_cache: dict[str, Path] = {}
+        self._confidence_path_cache: dict[str, Path | None] = {}
 
     def _load_annotation(self, name: str) -> dict[str, Any]:
         path = Path(self.sample_records[name]["gt"])
@@ -610,6 +612,24 @@ class SpadPoseRenderedFrameDataset(Dataset):
                         f"Cached render fingerprint mismatch for {name!r}: expected "
                         f"{self.expected_render_fingerprint}, got {cached or '<missing>'}"
                     )
+            cached_preprocessor = str(meta.get("preprocessor", "")).strip().lower()
+            if cached_preprocessor and cached_preprocessor != self.preprocessor:
+                raise ValueError(
+                    f"Cached render preprocessor mismatch for {name!r}: expected {self.preprocessor!r}, "
+                    f"got {cached_preprocessor!r}"
+                )
+            source_gt = meta.get("source_gt")
+            if source_gt and Path(source_gt).resolve() != Path(self.sample_records[name]["gt"]).resolve():
+                raise ValueError(
+                    f"Cached render GT mismatch for {name!r}: meta points to {source_gt}, "
+                    f"sample uses {self.sample_records[name]['gt']}"
+                )
+            source_spad = meta.get("source_spad")
+            if source_spad and Path(source_spad).resolve() != Path(self.sample_records[name]["spad"]).resolve():
+                raise ValueError(
+                    f"Cached render SPAD mismatch for {name!r}: meta points to {source_spad}, "
+                    f"sample uses {self.sample_records[name]['spad']}"
+                )
 
             chunks = meta.get("chunks")
             if not isinstance(chunks, list) or not chunks:
@@ -639,7 +659,11 @@ class SpadPoseRenderedFrameDataset(Dataset):
         key = str(window.render_dir)
         frames = self._frames_cache.get(key)
         if frames is None:
-            frames = np.load(window.render_dir / "frames.npy", mmap_mode="r")
+            frames_path = self._frames_path_cache.get(key)
+            if frames_path is None:
+                frames_path = self._sample_meta_paths(window.name)[1]
+                self._frames_path_cache[key] = frames_path
+            frames = np.load(frames_path, mmap_mode="r")
             self._frames_cache[key] = frames
         return frames
 
@@ -647,11 +671,14 @@ class SpadPoseRenderedFrameDataset(Dataset):
         key = str(window.render_dir)
         if key in self._confidence_cache:
             return self._confidence_cache[key]
-        sample_record = self.sample_records[window.name]
-        path_str = sample_record.get(f"{self.preprocessor}_confidence") or sample_record.get(
-            f"render_{self.preprocessor}_confidence"
-        )
-        path = Path(path_str) if path_str else (window.render_dir / "confidence.npy")
+        path = self._confidence_path_cache.get(key)
+        if path is None:
+            sample_record = self.sample_records[window.name]
+            path_str = sample_record.get(f"{self.preprocessor}_confidence") or sample_record.get(
+                f"render_{self.preprocessor}_confidence"
+            )
+            path = Path(path_str) if path_str else (window.render_dir / "confidence.npy")
+            self._confidence_path_cache[key] = path
         if self.render_contains_confidence and not path.is_file():
             raise FileNotFoundError(f"Cached confidence required but not found: {path}")
         conf = np.load(path, mmap_mode="r") if path.is_file() else None

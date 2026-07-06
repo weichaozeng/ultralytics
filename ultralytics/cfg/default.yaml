@@ -154,7 +154,7 @@ spad_packed_ch_order: RGB # (str) packed SPAD channel order used when unpacking 
 spad_subsampling: 64 # (int) shared temporal downsampling factor for SPAD preprocessors and GT alignment
 spad_bin_rate_hz: 8000.0 # (float) reference raw-bin frequency used to normalize detector-side SSD time deltas
 spad_input_gamma: 2.2 # (float) gamma correction applied to reconstructed detector inputs
-spad_cache_mode: raw # (str) frame-mode detector input source: raw or rendered
+spad_cache_mode: auto # (str) frame-mode detector input source: auto, raw, or rendered
 spad_render_root: # (str, optional) root directory containing cached rendered frames
 spad_render_contains_confidence: True # (bool) whether cached renders include confidence.npy for UA/residual adapters
 spad_source_render_dirname: renders-spc8kHz # (str) source render dirname used to infer sibling rendered cache roots
