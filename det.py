@@ -34,6 +34,33 @@ FINGER_COLORS = [
 COLOR_KEYPOINT = (255, 255, 255) # Joint - White
 COLOR_WRIST = (255, 165, 0)      # Wrist - Orange
 
+TRACKER_CHOICES = ("bytetrack", "botsort", "spad_tracker", "posetrack", "spad_posetrack")
+IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")
+VIDEO_EXT = (".mp4", ".avi", ".mov", ".mkv", ".webm")
+
+
+def _tracker_yaml(tracker: str) -> str:
+    """Resolve tracker config yaml path for ``model.track(tracker=...)``."""
+    if tracker not in TRACKER_CHOICES:
+        raise ValueError(f"Unsupported tracker {tracker!r}; choose from {TRACKER_CHOICES}")
+    return f"{tracker}.yaml"
+
+
+def _load_video_frames(video_path: str) -> list[np.ndarray]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Failed to open video: {video_path}")
+    frames = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(frame)
+    cap.release()
+    if not frames:
+        raise ValueError(f"No frames read from video: {video_path}")
+    return frames
+
 
 def detect_track(args, model, frames):
     """按视频序列逐帧进行 Tracking"""
@@ -42,13 +69,13 @@ def detect_track(args, model, frames):
         if hasattr(model.predictor, 'trackers') and model.predictor.trackers:
             for tracker in model.predictor.trackers:
                 tracker.reset()
-                
+
+    tracker_cfg = _tracker_yaml(args.tracker)
     results = []
     for frame_cv2 in frames:
         with torch.no_grad():
             with autocast():
                 # 使用 track 代替 predict，开启 persist=True 保持帧间追踪
-                tracker_cfg = f"{args.tracker}.yaml" if args.tracker in ["bytetrack", "botsort"] else "botsort.yaml"
                 result = model.track(frame_cv2, conf=args.det_thresh, persist=True, tracker=tracker_cfg, verbose=False)[0]
                 
                 # 必须存在检测框，并且 tracker 成功分配了 id
@@ -58,9 +85,12 @@ def detect_track(args, model, frames):
                     box_confs = result.boxes.conf.cpu().numpy()
                     handedness = result.boxes.cls.cpu().numpy()
                     
-                    if hasattr(result, 'keypoints') and result.keypoints is not None:
-                        poses = result.keypoints.xy.cpu().numpy()
-                        pose_confs = result.keypoints.conf.cpu().numpy()
+                    if hasattr(result, 'keypoints') and result.keypoints is not None and len(result.keypoints):
+                        poses = result.keypoints.data.cpu().numpy()[..., :2]
+                        if result.keypoints.data.shape[-1] >= 3:
+                            pose_confs = result.keypoints.data.cpu().numpy()[..., 2]
+                        else:
+                            pose_confs = result.keypoints.conf.cpu().numpy()
                     else:
                         num_hands = len(boxes)
                         poses = np.zeros((num_hands, 21, 2))
@@ -136,81 +166,89 @@ def draw_pose(img_cv2, pose, thresh=0.5, K=21):
     return img_cv2
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Image Sequence Tracking")
-    parser.add_argument("--in_dir", type=str, default="/home/zvc/Project/SPADHand/Vis/spad_sum_100")
+    parser = argparse.ArgumentParser(description="Image sequence or RGB video tracking")
+    parser.add_argument("--in_dir", type=str, default="/home/zvc/Project/SPADHand/Vis/spad_sum_100",
+                        help="Image folder, parent of sequences, or RGB video file (.mp4, ...)")
     parser.add_argument("--save_base_dir", type=str, default="/home/zvc/Project/SPADHand/Pred")
     parser.add_argument("--det_thresh", type=float, default=0.4)
     parser.add_argument("--ckpt", type=str, default="weights/detector.pt")
-    parser.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort"])
+    parser.add_argument("--tracker", type=str, default="posetrack", choices=list(TRACKER_CHOICES))
     
     args = parser.parse_args()
     model = YOLO(args.ckpt)
 
-    img_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
-    
     if not os.path.exists(args.in_dir):
-        raise FileNotFoundError(f"Directory not found: {args.in_dir}")
-        
-    items = sorted(os.listdir(args.in_dir))
-    contains_images = any(f.lower().endswith(img_ext) for f in items)
-    
-    seq_dict = {}
-    # 获取 in_dir 的最后一级文件夹名称 (例如 "spad_rgb_sum_100" 或 "acq00002")
-    in_dir_name = os.path.basename(os.path.normpath(args.in_dir))
-    
-    if contains_images:
-        # 情况A：直接传入了底层序列，如 acq00002
-        seq_dict[""] = args.in_dir  # 用空字符串标记，表示不需要额外的子目录
+        raise FileNotFoundError(f"Input path not found: {args.in_dir}")
+
+    video_mode = False
+    # 单个 RGB 视频文件
+    if os.path.isfile(args.in_dir) and args.in_dir.lower().endswith(VIDEO_EXT):
+        video_name = os.path.splitext(os.path.basename(args.in_dir))[0]
+        frames = _load_video_frames(args.in_dir)
+        seq_dict = {video_name: None}
+        in_dir_name = video_name
+        video_mode = True
     else:
-        # 情况B：传入了父目录，如 spad_rgb_sum_100
-        for item in items:
-            item_path = os.path.join(args.in_dir, item)
-            if os.path.isdir(item_path):
-                seq_dict[item] = item_path
+        items = sorted(os.listdir(args.in_dir))
+        contains_images = any(f.lower().endswith(IMG_EXT) for f in items)
+        seq_dict = {}
+        in_dir_name = os.path.basename(os.path.normpath(args.in_dir))
+
+        if contains_images:
+            seq_dict[""] = args.in_dir
+        else:
+            for item in items:
+                item_path = os.path.join(args.in_dir, item)
+                if os.path.isdir(item_path):
+                    seq_dict[item] = item_path
 
     if not seq_dict:
         print(f"No valid image sequences found in {args.in_dir}")
         exit()
         
-    print(f"Found {len(seq_dict)} sequence(s) to process.")
+    print(f"Found {len(seq_dict)} sequence(s) to process. tracker={args.tracker}")
 
     for seq_rel_name, seq_dir in tqdm(seq_dict.items(), desc="Processing Sequences"):
-        img_files = [f for f in sorted(os.listdir(seq_dir)) if f.lower().endswith(img_ext)]
-        if not img_files:
-            continue
-            
-        frames = []
-        for img_name in img_files:
-            img_path = os.path.join(seq_dir, img_name)
-            frame = cv2.imread(img_path)
-            if frame is not None:
-                frames.append(frame)
-                
-        if not frames:
+        if video_mode:
+            seq_frames = frames
+            img_files = [f"frame_{i:06d}.jpg" for i in range(len(seq_frames))]
+        else:
+            img_files = [f for f in sorted(os.listdir(seq_dir)) if f.lower().endswith(IMG_EXT)]
+            if not img_files:
+                continue
+
+            seq_frames = []
+            for img_name in img_files:
+                img_path = os.path.join(seq_dir, img_name)
+                frame = cv2.imread(img_path)
+                if frame is not None:
+                    seq_frames.append(frame)
+
+        if not seq_frames:
             continue
 
         try:
-            results = detect_track(args, model, frames)
-            
-            # 动态构建保存路径，保留层级关系
-            if seq_rel_name == "":
-                # 对应情况A: /Pred/acq00002
+            results = detect_track(args, model, seq_frames)
+
+            if video_mode:
+                seq_save_dir = os.path.join(args.save_base_dir, in_dir_name)
+            elif seq_rel_name == "":
                 seq_save_dir = os.path.join(args.save_base_dir, in_dir_name)
             else:
-                # 对应情况B: /Pred/spad_rgb_sum_100/acq00002
                 seq_save_dir = os.path.join(args.save_base_dir, in_dir_name, seq_rel_name)
-                
+
             os.makedirs(seq_save_dir, exist_ok=True)
-            
-            for i, frame in enumerate(frames):
+
+            for i, frame in enumerate(seq_frames):
                 vis_frame = frame.copy()
                 if results[i]['has_det']:
                     for j, track_id in enumerate(results[i]['track_id']):
                         vis_frame = draw_bbox(vis_frame, track_id, results[i]['boxes'][j], results[i]['handedness'][j])
                         vis_frame = draw_pose(vis_frame, results[i]['poses'][j])
-                        
+
                 save_path = os.path.join(seq_save_dir, img_files[i])
                 cv2.imwrite(save_path, vis_frame)
-                
+
         except Exception as e:
-            print(f"Error when processing sequence {seq_dir}: {e}")
+            seq_label = seq_rel_name if video_mode else seq_dir
+            print(f"Error when processing sequence {seq_label}: {e}")
