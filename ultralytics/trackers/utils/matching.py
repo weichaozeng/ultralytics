@@ -239,7 +239,7 @@ def _rel_bones_from_track(
     use_static: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract parent-relative bones for association from a track or detection."""
-    from .basetrack import TrackState
+    from ..basetrack import TrackState
 
     if (
         use_static
