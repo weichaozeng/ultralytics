@@ -204,7 +204,7 @@ class KalmanFilterPoseChain:
             chol_factor, lower = scipy.linalg.cho_factor(projected_cov, lower=True, check_finite=False)
             kalman_gain = scipy.linalg.cho_solve(
                 (chol_factor, lower),
-                covariance[s : s + 4, s : s + 4] @ self._block_h.T,
+                (cov_block @ self._block_h.T).T,
                 check_finite=False,
             ).T
             innovation = measurement - projected_mean

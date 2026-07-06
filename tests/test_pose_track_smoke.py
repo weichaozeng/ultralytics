@@ -54,13 +54,20 @@ def _hand_skeleton_keypoints(cx: float, cy: float, scale: float = 40.0) -> np.nd
 
 
 class _FakeBoxes:
+    """Minimal Boxes-like wrapper for tracker smoke tests."""
+
     def __init__(self, xywh, conf, cls):
         self.xywh = np.asarray(xywh, dtype=np.float32)
-        self.conf = np.asarray(conf, dtype=np.float32)
-        self.cls = np.asarray(cls, dtype=np.float32)
+        if self.xywh.ndim == 1:
+            self.xywh = self.xywh[None, :]
+        self.conf = np.asarray(conf, dtype=np.float32).reshape(-1)
+        self.cls = np.asarray(cls, dtype=np.float32).reshape(-1)
 
     def __len__(self):
         return len(self.conf)
+
+    def __getitem__(self, idx):
+        return _FakeBoxes(self.xywh[idx], self.conf[idx], self.cls[idx])
 
 
 def test_pose_kalman_chain_roundtrip():
