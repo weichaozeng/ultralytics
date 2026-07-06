@@ -961,6 +961,7 @@ class SpadPoseFrameModel(PoseModel):
         frame_adapter_kernel_size=3,
         frame_adapter_alpha_init=0.0,
         spad_chunk_size: int | None = None,
+        spad_cache_mode="raw",
         spad_input_gamma=1.0,
         spad_bin_rate_hz=8000.0,
     ):
@@ -971,10 +972,12 @@ class SpadPoseFrameModel(PoseModel):
         self.frame_adapter_kernel_size = int(frame_adapter_kernel_size)
         self.frame_adapter_alpha_init = float(frame_adapter_alpha_init)
         self.spad_chunk_size = None if spad_chunk_size is None else int(spad_chunk_size)
+        self.spad_cache_mode = str(spad_cache_mode).strip().lower()
         self.spad_input_gamma = float(spad_input_gamma)
         self.spad_reference_bin_rate_hz = float(spad_bin_rate_hz)
         self.spad_current_bin_rate_hz = float(spad_bin_rate_hz)
         self.spad_packed_nch = 3
+        self.spad_cached_confidence_batch = None
         self.spad_last_recon_frames = None
         self.spad_last_confidence = None
         self.spad_last_confidence_frames = None
@@ -1023,7 +1026,21 @@ class SpadPoseFrameModel(PoseModel):
 
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
         """Run one-frame SPAD reconstruction, optional UA adaptation, then standard YOLO pose inference."""
-        if not self.spad_enabled or not torch.is_tensor(x) or x.ndim != 5:
+        if not self.spad_enabled or not torch.is_tensor(x):
+            return super()._predict_once(x, profile, visualize, embed)
+
+        if x.ndim == 4 and self.spad_cache_mode == "rendered":
+            confidence_b1hw = self._spad_cached_confidence_for_batch(x)
+            self.spad_last_recon_frames = x.detach().unsqueeze(0)
+            self.spad_last_confidence = confidence_b1hw.detach()
+            self.spad_last_confidence_frames = confidence_b1hw.detach().unsqueeze(0)
+            self.spad_last_w_mean = self.spad_last_confidence
+            self.spad_last_w_mean_frames = self.spad_last_confidence_frames
+            if self.frame_adapter is not None:
+                x = self.frame_adapter(x, confidence_b1hw)
+            return super()._predict_once(x, profile, visualize, embed)
+
+        if x.ndim != 5:
             return super()._predict_once(x, profile, visualize, embed)
 
         frames_bchw, confidence_b1hw = self._spad_video_to_frame_batch(x)
@@ -1068,6 +1085,21 @@ class SpadPoseFrameModel(PoseModel):
         self.spad_num_frame = 1
         self.spad_t_index_ll = [t_raw]
         return frames_bchw, confidence_b1hw
+
+    def _spad_cached_confidence_for_batch(self, frames_bchw: torch.Tensor) -> torch.Tensor:
+        confidence = getattr(self, "spad_cached_confidence_batch", None)
+        bsz, _, h, w = map(int, frames_bchw.shape)
+        if not torch.is_tensor(confidence):
+            return frames_bchw.new_zeros((bsz, 1, h, w))
+        if confidence.ndim == 3:
+            confidence = confidence.unsqueeze(1)
+        if confidence.ndim != 4:
+            raise ValueError(f"Expected cached confidence (B,1,H,W), got shape={tuple(confidence.shape)}")
+        if tuple(confidence.shape) != (bsz, 1, h, w):
+            raise ValueError(
+                f"Cached confidence shape mismatch: expected {(bsz, 1, h, w)}, got {tuple(confidence.shape)}"
+            )
+        return confidence
 
     def _spad_process_frame_window(self, photon_cube: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Process one raw SPAD chunk into one reconstructed frame and one aligned confidence map."""

@@ -12,6 +12,11 @@ import torch
 from torch.utils.data import Dataset
 
 from ultralytics.data.spad_packed import infer_packed_nch, packed_frames_to_raw_video
+from ultralytics.data.spad_render_cache import (
+    CACHE_META_VERSION,
+    render_config_fingerprint,
+    sample_render_dir,
+)
 
 
 @dataclass(frozen=True)
@@ -296,6 +301,22 @@ class SpadPoseFrameWindow:
     chunk_size: int
 
 
+@dataclass(frozen=True)
+class SpadPoseRenderedFrameWindow:
+    """One cached rendered frame aligned to one end-of-chunk supervision target."""
+
+    name: str
+    gt_ann_path: Path
+    render_dir: Path
+    frame_index: int
+    gt_start: int
+    target_gt_time: float
+    spad_start_bin: int
+    spad_end_bin: int
+    chunk_size: int
+    packed_nch: int
+
+
 class SpadPoseFrameDataset(Dataset):
     """Load fixed raw chunks and supervise only the end-of-chunk pose annotation."""
 
@@ -460,6 +481,236 @@ class SpadPoseFrameDataset(Dataset):
     def collate_fn(batch: list[dict]) -> dict:
         new_batch = {}
         new_batch["img"] = torch.stack([b["img"] for b in batch], 0)
+        new_batch["cls"] = torch.cat([b["cls"] for b in batch], 0)
+        new_batch["bboxes"] = torch.cat([b["bboxes"] for b in batch], 0)
+        new_batch["keypoints"] = torch.cat([b["keypoints"] for b in batch], 0)
+
+        batch_idx = []
+        for sample_i, b in enumerate(batch):
+            idx = b["batch_idx"].clone()
+            if idx.numel():
+                idx += float(sample_i)
+            batch_idx.append(idx)
+        new_batch["batch_idx"] = torch.cat(batch_idx, 0) if batch_idx else torch.zeros((0, 1), dtype=torch.float32)
+
+        new_batch["im_file"] = [b["im_file"] for b in batch]
+        new_batch["packed_nch"] = int(batch[0]["packed_nch"])
+        new_batch["ori_shape"] = [b["ori_shape"] for b in batch]
+        new_batch["resized_shape"] = [b["resized_shape"] for b in batch]
+        new_batch["sample_name"] = [b["sample_name"] for b in batch]
+        new_batch["target_gt_time"] = torch.tensor([b["target_gt_time"] for b in batch], dtype=torch.float32)
+        new_batch["spad_start_bin"] = torch.tensor([b["spad_start_bin"] for b in batch], dtype=torch.long)
+        new_batch["spad_end_bin"] = torch.tensor([b["spad_end_bin"] for b in batch], dtype=torch.long)
+        new_batch["chunk_size"] = torch.tensor([b["chunk_size"] for b in batch], dtype=torch.long)
+        return new_batch
+
+
+class SpadPoseRenderedFrameDataset(Dataset):
+    """Load cached rendered frame chunks plus optional confidence maps for frame-mode training."""
+
+    HAND_TO_CLASS = SpadPoseSequenceDataset.HAND_TO_CLASS
+
+    def __init__(
+        self,
+        samples: list[dict[str, str]],
+        *,
+        render_root: str | Path,
+        image_size: int = 512,
+        render_contains_confidence: bool = True,
+        expected_render_config: dict[str, Any] | None = None,
+    ):
+        if not samples:
+            raise ValueError("samples must be a non-empty list")
+
+        self.render_root = Path(render_root)
+        self.image_size = int(image_size)
+        self.render_contains_confidence = bool(render_contains_confidence)
+        self.expected_render_config = dict(expected_render_config or {})
+        self.expected_render_fingerprint = (
+            render_config_fingerprint(self.expected_render_config) if self.expected_render_config else None
+        )
+
+        self.sample_records = {rec["id"]: rec for rec in samples}
+        self.video_names = sorted(self.sample_records)
+        self.annotations = {name: self._load_annotation(name) for name in self.video_names}
+        self.windows = self._build_windows()
+        if not self.windows:
+            raise RuntimeError(f"No cached rendered SPAD frame windows found under {self.render_root}")
+        self.labels = self._build_ultralytics_labels()
+        self.im_files = [str(lb["im_file"]) for lb in self.labels]
+        self.ni = len(self.labels)
+        self._frames_cache: dict[str, np.ndarray] = {}
+        self._confidence_cache: dict[str, np.ndarray | None] = {}
+
+    def _load_annotation(self, name: str) -> dict[str, Any]:
+        path = Path(self.sample_records[name]["gt"])
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _sample_meta_paths(self, name: str) -> tuple[Path, Path, Path]:
+        render_dir = sample_render_dir(self.render_root, self.sample_records[name]["name"])
+        return render_dir, render_dir / "frames.npy", render_dir / "meta.json"
+
+    def _build_windows(self) -> list[SpadPoseRenderedFrameWindow]:
+        windows: list[SpadPoseRenderedFrameWindow] = []
+        for name in self.video_names:
+            render_dir, frames_path, meta_path = self._sample_meta_paths(name)
+            if not meta_path.is_file():
+                raise FileNotFoundError(f"Cached render metadata not found for {name!r}: {meta_path}")
+            if not frames_path.is_file():
+                raise FileNotFoundError(f"Cached frames not found for {name!r}: {frames_path}")
+
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            version = int(meta.get("version", -1))
+            if version != CACHE_META_VERSION:
+                raise ValueError(f"Unsupported cache meta version for {meta_path}: {version}")
+
+            if self.expected_render_fingerprint is not None:
+                cached = str(meta.get("config_fingerprint", "")).strip()
+                if cached != self.expected_render_fingerprint:
+                    raise ValueError(
+                        f"Cached render fingerprint mismatch for {name!r}: expected "
+                        f"{self.expected_render_fingerprint}, got {cached or '<missing>'}"
+                    )
+
+            chunks = meta.get("chunks")
+            if not isinstance(chunks, list) or not chunks:
+                raise ValueError(f"Cached render metadata must include non-empty chunks list: {meta_path}")
+
+            for chunk in chunks:
+                windows.append(
+                    SpadPoseRenderedFrameWindow(
+                        name=name,
+                        gt_ann_path=Path(self.sample_records[name]["gt"]),
+                        render_dir=render_dir,
+                        frame_index=int(chunk["chunk_index"]),
+                        gt_start=int(chunk["gt_start"]),
+                        target_gt_time=float(chunk["target_gt_time"]),
+                        spad_start_bin=int(chunk["spad_start_bin"]),
+                        spad_end_bin=int(chunk["spad_end_bin"]),
+                        chunk_size=int(chunk["chunk_size"]),
+                        packed_nch=int(chunk.get("packed_nch", 3)),
+                    )
+                )
+        return windows
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def _frames_array(self, window: SpadPoseRenderedFrameWindow) -> np.ndarray:
+        key = str(window.render_dir)
+        frames = self._frames_cache.get(key)
+        if frames is None:
+            frames = np.load(window.render_dir / "frames.npy", mmap_mode="r")
+            self._frames_cache[key] = frames
+        return frames
+
+    def _confidence_array(self, window: SpadPoseRenderedFrameWindow) -> np.ndarray | None:
+        key = str(window.render_dir)
+        if key in self._confidence_cache:
+            return self._confidence_cache[key]
+        path = window.render_dir / "confidence.npy"
+        if self.render_contains_confidence and not path.is_file():
+            raise FileNotFoundError(f"Cached confidence required but not found: {path}")
+        conf = np.load(path, mmap_mode="r") if path.is_file() else None
+        self._confidence_cache[key] = conf
+        return conf
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str | float | int]:
+        window = self.windows[index]
+        frame = np.array(self._frames_array(window)[window.frame_index], copy=True)
+        conf_arr = self._confidence_array(window)
+        confidence = None if conf_arr is None else np.array(conf_arr[window.frame_index], copy=True)
+        cls, bboxes, keypoints, batch_idx = self._labels_for_window(window)
+
+        img = torch.from_numpy(frame)
+        if img.dtype == torch.uint8:
+            img = img.float() / 255.0
+        else:
+            img = img.float()
+
+        if confidence is None:
+            conf_tensor = torch.zeros((1, img.shape[-2], img.shape[-1]), dtype=torch.float32)
+        else:
+            conf_tensor = torch.from_numpy(confidence).float()
+            if conf_tensor.ndim == 2:
+                conf_tensor = conf_tensor.unsqueeze(0)
+
+        return {
+            "img": img,
+            "confidence": conf_tensor,
+            "packed_nch": int(window.packed_nch),
+            "cls": cls,
+            "bboxes": bboxes,
+            "keypoints": keypoints,
+            "batch_idx": batch_idx,
+            "im_file": f"{window.name}:{window.spad_start_bin}:{window.spad_end_bin}",
+            "ori_shape": (self.image_size, self.image_size),
+            "resized_shape": (self.image_size, self.image_size),
+            "sample_name": window.name,
+            "target_gt_time": float(window.target_gt_time),
+            "spad_start_bin": int(window.spad_start_bin),
+            "spad_end_bin": int(window.spad_end_bin),
+            "chunk_size": int(window.chunk_size),
+        }
+
+    def _labels_for_window(self, window: SpadPoseRenderedFrameWindow):
+        ann = self.annotations[window.name]
+        cls_ll, bbox_ll, kpt_ll = [], [], []
+        for hand_name, cls_id in self.HAND_TO_CLASS.items():
+            hand = self._interpolate_hand_annotation(ann, window.target_gt_time, hand_name)
+            if not hand:
+                continue
+            cls_ll.append([float(cls_id)])
+            bbox_ll.append(self._xyxy_to_normalized_xywh(hand["bbox"]))
+            kpt_ll.append(self._keypoints_to_normalized_xyv(hand["keypoints_2d"]))
+
+        if cls_ll:
+            cls = torch.tensor(cls_ll, dtype=torch.float32)
+            bboxes = torch.tensor(bbox_ll, dtype=torch.float32)
+            keypoints = torch.tensor(kpt_ll, dtype=torch.float32)
+            batch_idx = torch.zeros((len(cls_ll), 1), dtype=torch.float32)
+        else:
+            cls = torch.zeros((0, 1), dtype=torch.float32)
+            bboxes = torch.zeros((0, 4), dtype=torch.float32)
+            keypoints = torch.zeros((0, 21, 3), dtype=torch.float32)
+            batch_idx = torch.zeros((0, 1), dtype=torch.float32)
+        return cls, bboxes, keypoints, batch_idx
+
+    def _interpolate_hand_annotation(self, ann: dict[str, Any], gt_time: float, hand_name: str):
+        return SpadPoseSequenceDataset._interpolate_hand_annotation(self, ann, gt_time, hand_name)
+
+    def _xyxy_to_normalized_xywh(self, bbox) -> list[float]:
+        return SpadPoseSequenceDataset._xyxy_to_normalized_xywh(self, bbox)
+
+    def _keypoints_to_normalized_xyv(self, keypoints) -> list[list[float]]:
+        return SpadPoseSequenceDataset._keypoints_to_normalized_xyv(self, keypoints)
+
+    def _build_ultralytics_labels(self) -> list[dict[str, Any]]:
+        labels = []
+        for window in self.windows:
+            cls, bboxes, keypoints, _ = self._labels_for_window(window)
+            labels.append(
+                {
+                    "im_file": f"{window.name}:{window.spad_start_bin}:{window.spad_end_bin}",
+                    "shape": (self.image_size, self.image_size),
+                    "cls": cls.detach().cpu().numpy(),
+                    "bboxes": bboxes.detach().cpu().numpy(),
+                    "segments": [],
+                    "keypoints": keypoints.detach().cpu().numpy(),
+                    "normalized": True,
+                    "bbox_format": "xywh",
+                }
+            )
+        return labels
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        new_batch = {}
+        new_batch["img"] = torch.stack([b["img"] for b in batch], 0)
+        new_batch["confidence"] = torch.stack([b["confidence"] for b in batch], 0)
         new_batch["cls"] = torch.cat([b["cls"] for b in batch], 0)
         new_batch["bboxes"] = torch.cat([b["bboxes"] for b in batch], 0)
         new_batch["keypoints"] = torch.cat([b["keypoints"] for b in batch], 0)

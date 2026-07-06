@@ -47,6 +47,7 @@ from ultralytics.data.spad_packed import (
 from ultralytics.engine.results import Results
 from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_preprocessor
 from ultralytics.trackers.track import TRACKER_MAP
+from ultralytics.trackers.utils.result_layout import apply_pose_tracks_to_result
 from ultralytics.utils import IterableSimpleNamespace, YAML, nms
 from ultralytics.utils.checks import check_yaml
 
@@ -391,13 +392,27 @@ def _results_from_preds(preds: list[torch.Tensor], recon_frames_bgr: list[np.nda
     return results
 
 
-def _init_tracker(tracker_name: str, *, frame_rate: int):
+def _init_tracker(tracker_name: str, *, frame_rate: int, class_names=None):
     cfg = IterableSimpleNamespace(**YAML.load(check_yaml(f"{tracker_name}.yaml")))
-    return TRACKER_MAP[cfg.tracker_type](args=cfg, frame_rate=frame_rate)
+    tracker_cls = TRACKER_MAP[cfg.tracker_type]
+    if cfg.tracker_type in {"posetrack", "spad_posetrack"}:
+        return tracker_cls(args=cfg, frame_rate=frame_rate, class_names=class_names)
+    return tracker_cls(args=cfg, frame_rate=frame_rate)
 
 
 def _apply_tracker(result: Results, tracker) -> Results:
     det = result.boxes.cpu().numpy()
+    keypoints = None
+    if getattr(result, "keypoints", None) is not None and len(result.keypoints):
+        keypoints = result.keypoints.data.cpu().numpy()
+    if keypoints is not None and hasattr(tracker, "n_keypoints"):
+        tracks = tracker.update(det, result.orig_img, getattr(result, "feats", None), keypoints=keypoints)
+        return apply_pose_tracks_to_result(
+            result,
+            tracks,
+            n_keypoints=int(getattr(tracker, "n_keypoints", 21)),
+            kpt_dims=int(getattr(tracker, "kpt_dims", 3)),
+        )
     tracks = tracker.update(det, result.orig_img, getattr(result, "feats", None))
     if len(tracks) == 0:
         return result
@@ -417,7 +432,7 @@ def main():
     ap.add_argument("--det_thresh", type=float, default=0.4)
     ap.add_argument("--iou", type=float, default=0.7)
     ap.add_argument("--max_det", type=int, default=20)
-    ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort", "spad_tracker"])
+    ap.add_argument("--tracker", type=str, default="spad_posetrack", choices=["bytetrack", "botsort", "spad_tracker", "posetrack", "spad_posetrack"])
     ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument(
@@ -504,14 +519,14 @@ def main():
     spad_model.to(device)
     spad_model.eval()
     _configure_model_spad_bin_rate(spad_model, current_bin_rate_hz=float(args.spad_bin_rate_hz))
-    tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate)
+    names = yolo.names
+    tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate, class_names=names)
     override_name, override_preprocessor = _build_override_preprocessor(args)
     if override_preprocessor is not None:
-        if override_name == "hyb" and args.tracker != "spad_tracker":
-            raise ValueError("--preprocessor-override hyb requires --tracker spad_tracker")
+        if override_name == "hyb" and args.tracker not in {"spad_tracker", "spad_posetrack"}:
+            raise ValueError("--preprocessor-override hyb requires --tracker spad_tracker or spad_posetrack")
         spad_model.preprocessor = override_preprocessor.to(device)
         spad_model.preprocessor_name = override_name
-    names = yolo.names
     kpt_shape = getattr(spad_model, "kpt_shape", (21, 3))
     trained_chunk_t = _trained_chunk_t(spad_model)
     global_frame_idx = 0

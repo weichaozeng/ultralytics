@@ -260,7 +260,7 @@ def parse_args():
     ap.add_argument("--det_thresh", type=float, default=0.4)
     ap.add_argument("--iou", type=float, default=0.7)
     ap.add_argument("--max_det", type=int, default=20)
-    ap.add_argument("--tracker", type=str, default="botsort", choices=["bytetrack", "botsort", "spad_tracker"])
+    ap.add_argument("--tracker", type=str, default="spad_posetrack", choices=["bytetrack", "botsort", "spad_tracker", "posetrack", "spad_posetrack"])
     ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument(
@@ -373,14 +373,14 @@ def main():
     spad_model.eval()
     _configure_model_spad_bin_rate(spad_model, current_bin_rate_hz=float(args.spad_bin_rate_hz))
 
-    tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate)
+    names = yolo.names
+    tracker = _init_tracker(args.tracker, frame_rate=args.frame_rate, class_names=names)
     override_name, override_preprocessor = _build_override_preprocessor(args)
     if override_preprocessor is not None:
-        if override_name == "hyb" and args.tracker != "spad_tracker":
-            raise ValueError("--preprocessor-override hyb requires --tracker spad_tracker")
+        if override_name == "hyb" and args.tracker not in {"spad_tracker", "spad_posetrack"}:
+            raise ValueError("--preprocessor-override hyb requires --tracker spad_tracker or spad_posetrack")
         spad_model.preprocessor = override_preprocessor.to(device)
         spad_model.preprocessor_name = override_name
-    names = yolo.names
     kpt_shape = getattr(spad_model, "kpt_shape", (21, 3))
     for sample_spec in sample_specs:
         sample_name = str(sample_spec["sample_name"])

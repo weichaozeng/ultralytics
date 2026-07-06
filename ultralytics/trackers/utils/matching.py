@@ -128,6 +128,116 @@ def embedding_distance(tracks: list, detections: list, metric: str = "cosine") -
     return cost_matrix
 
 
+def _track_keypoints_xy(track, *, use_pred_pose: bool) -> np.ndarray:
+    """Return absolute xy keypoints for a track or detection object."""
+    if use_pred_pose and hasattr(track, "pred_keypoints_xy"):
+        return np.asarray(track.pred_keypoints_xy, dtype=np.float32)
+    if hasattr(track, "keypoints"):
+        return np.asarray(track.keypoints[:, :2], dtype=np.float32)
+    raise AttributeError("Track object does not expose keypoints for pose matching.")
+
+
+def _track_keypoints_conf(track) -> np.ndarray:
+    if hasattr(track, "keypoints") and track.keypoints.shape[1] > 2:
+        return np.asarray(track.keypoints[:, 2], dtype=np.float32)
+    return np.ones((_track_keypoints_xy(track, use_pred_pose=False).shape[0],), dtype=np.float32)
+
+
+def weighted_oks(
+    pred_xy: np.ndarray,
+    det_xy: np.ndarray,
+    det_conf: np.ndarray,
+    bbox_xyxy: np.ndarray,
+    *,
+    sigmas: float | np.ndarray = 0.05,
+    match_weights: np.ndarray | None = None,
+    conf_thresh: float = 0.0,
+) -> float:
+    """Compute depth-weighted Object Keypoint Similarity between two poses."""
+    n = pred_xy.shape[0]
+    if match_weights is None:
+        match_weights = np.ones(n, dtype=np.float32)
+    else:
+        match_weights = np.asarray(match_weights, dtype=np.float32)
+    sigmas = np.asarray(sigmas, dtype=np.float64)
+    if sigmas.ndim == 0:
+        sigmas = np.full(n, float(sigmas), dtype=np.float64)
+    variances = (sigmas * 2.0) ** 2
+    area = max(float((bbox_xyxy[2] - bbox_xyxy[0]) * (bbox_xyxy[3] - bbox_xyxy[1])), 1.0)
+
+    visible = det_conf > conf_thresh
+    if not np.any(visible):
+        return 0.0
+
+    delta = pred_xy - det_xy
+    squared_dist = np.sum(delta * delta, axis=1)
+    oks_per_keypoint = np.exp(-squared_dist / variances / area / 2.0)
+    oks_per_keypoint = oks_per_keypoint * visible
+
+    weights = match_weights * visible.astype(np.float32)
+    denom = float(weights.sum())
+    if denom <= 0:
+        return 0.0
+    return float((oks_per_keypoint * weights).sum() / denom)
+
+
+def pose_oks_distance(
+    atracks: list,
+    btracks: list,
+    *,
+    sigmas: float | np.ndarray = 0.05,
+    match_weights: np.ndarray | None = None,
+    use_pred_pose: bool = True,
+    conf_thresh: float = 0.0,
+    pose_match_thresh: float = 0.0,
+) -> np.ndarray:
+    """Compute cost matrix ``1 - weighted OKS`` between track and detection poses."""
+    cost_matrix = np.ones((len(atracks), len(btracks)), dtype=np.float32)
+    if not atracks or not btracks:
+        return cost_matrix
+
+    for i, track in enumerate(atracks):
+        pred_xy = _track_keypoints_xy(track, use_pred_pose=use_pred_pose)
+        track_box = track.xyxy if hasattr(track, "xyxy") else track[:4]
+        for j, det in enumerate(btracks):
+            det_xy = _track_keypoints_xy(det, use_pred_pose=False)
+            det_conf = _track_keypoints_conf(det)
+            det_box = det.xyxy if hasattr(det, "xyxy") else det[:4]
+            oks = weighted_oks(
+                pred_xy,
+                det_xy,
+                det_conf,
+                np.asarray(det_box, dtype=np.float32),
+                sigmas=sigmas,
+                match_weights=match_weights,
+                conf_thresh=conf_thresh,
+            )
+            if pose_match_thresh > 0 and oks < pose_match_thresh:
+                cost_matrix[i, j] = 1.0
+            else:
+                cost_matrix[i, j] = 1.0 - oks
+    return cost_matrix
+
+
+def cls_soft_match_penalty(
+    tracks: list,
+    detections: list,
+    *,
+    penalty: float,
+) -> np.ndarray:
+    """Return soft penalty matrix when detection class disagrees with track belief."""
+    cost = np.zeros((len(tracks), len(detections)), dtype=np.float32)
+    if penalty <= 0 or not tracks or not detections:
+        return cost
+    for i, track in enumerate(tracks):
+        track_cls = int(round(float(getattr(track, "cls", 0))))
+        for j, det in enumerate(detections):
+            det_cls = int(round(float(getattr(det, "cls", 0))))
+            if det_cls != track_cls:
+                cost[i, j] = float(penalty)
+    return cost
+
+
 def fuse_score(cost_matrix: np.ndarray, detections: list) -> np.ndarray:
     """Fuse cost matrix with detection scores to produce a single similarity matrix.
 

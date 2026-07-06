@@ -1,0 +1,38 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# SPADPoseTrack: PoseTrack + dense velocity field export
+tracker_type: spad_posetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: true
+
+# Pose association
+n_keypoints: 21
+kpt_dims: 3
+box_weight: 0.4
+pose_weight: 0.6
+pose_weight_second: 0.3
+proximity_thresh: 0.5
+pose_match_thresh: 0.0
+kpt_conf_thresh: 0.3
+oks_sigma: 0.05
+match_weight_depth: [1.0, 1.0, 0.85, 0.70, 0.50]
+
+# Handedness belief smoothing
+handedness_filter: true
+cls_learning_rate: 0.3
+cls_init_strength: 2.0
+cls_soft_match_penalty: 0.1
+
+# Velocity field export
+field_value_source: predicted
+field_sigma_scale_x: 0.35
+field_sigma_scale_y: 0.35
+field_min_sigma: 2.0
+field_min_weight: 1.0e-4
+field_max_speed: 32.0
+field_extent: 3.0
+prediction_horizon: 1.0
