@@ -240,6 +240,28 @@ def test_lost_track_expires_within_short_window():
     assert track.state == TrackState.Removed
 
 
+def test_coast_tolerates_single_missed_frame():
+    args = _tracker_args()
+    args.coast_max_frames = 2
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    img = np.zeros((512, 512, 3), np.uint8)
+    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
+    kpts = _hand_skeleton_keypoints(256, 256)[None]
+    tracker.update(boxes, img, keypoints=kpts)
+    track_id = tracker.tracked_stracks[0].track_id
+
+    empty = _FakeBoxes([], [], [])
+    tracker.update(empty, img, keypoints=np.zeros((0, 21, 3), dtype=np.float32))
+    assert any(t.track_id == track_id and t.state == TrackState.Tracked for t in tracker.tracked_stracks)
+    assert not tracker.lost_stracks
+
+    boxes2 = _FakeBoxes([[280, 280, 120, 120]], [0.9], [1])
+    kpts2 = _hand_skeleton_keypoints(280, 280)[None]
+    out = tracker.update(boxes2, img, keypoints=kpts2)
+    assert out.shape[0] == 1
+    assert int(out[0, 4]) == track_id
+
+
 def test_pose_nms_suppresses_duplicate_hands():
     import torch
     from ultralytics.utils.pose_nms import is_pose_track_tracker, pose_aware_non_max_suppression

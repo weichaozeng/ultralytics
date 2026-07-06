@@ -13,6 +13,10 @@ remove_duplicate_stracks: false
 
 # Lost track survival (track_buffer is ignored; use this instead)
 lost_track_max_frames: 5 # short static-recall window (3-8 recommended)
+lost_pose_recall_frames: 3 # allow pose-only re-association for young lost tracks
+coast_max_frames: 2 # tolerate missed detections before marking lost
+dead_line_velocity_scale: 0.5
+velocity_bonus_min_speed: 2.0
 
 # Detection score fusion (box conf + mean keypoint conf)
 det_score_box_weight: 0.5

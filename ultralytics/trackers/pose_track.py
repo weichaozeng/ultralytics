@@ -56,6 +56,7 @@ class PoseSTrack(STrack):
         self.kpt_conf_ema: np.ndarray | None = None
         self._kpt_conf_thresh = 0.3
         self._cls_learning_rate = 0.3
+        self.time_since_update = 0
 
     @staticmethod
     def _encode_wrist_rel(xywh: np.ndarray | list[float], keypoints: np.ndarray) -> np.ndarray:
@@ -78,15 +79,6 @@ class PoseSTrack(STrack):
     def pred_keypoints_xy(self) -> np.ndarray:
         if self.pose_mean is None or self.pose_kalman_filter is None:
             return self.keypoints[:, :2].astype(np.float32)
-
-        if self.state == TrackState.Lost and self.static_pose_mean is not None and self.static_mean is not None:
-            center = self.static_mean[:2].astype(np.float32)
-            wh = self.static_mean[2:4].astype(np.float32)
-            scale = float(np.sqrt(wh[0] ** 2 + wh[1] ** 2) + 1e-6)
-            anchor_off = self.static_wrist_rel_to_box
-            if anchor_off is not None:
-                anchor = center + anchor_off * scale
-                return self.pose_kalman_filter.rel_to_abs(self.static_pose_mean, anchor)
         return self.pose_kalman_filter.rel_to_abs(self.pose_mean, self.anchor)
 
     @property
@@ -173,6 +165,7 @@ class PoseSTrack(STrack):
             self.is_activated = True
         self.frame_id = frame_id
         self.start_frame = frame_id
+        self.time_since_update = 0
 
     def re_activate(self, new_track: PoseSTrack, frame_id: int, new_id: bool = False):
         self.mean, self.covariance = self.kalman_filter.update(
@@ -190,6 +183,7 @@ class PoseSTrack(STrack):
         self.idx = new_track.idx
         self.keypoints = new_track.keypoints.copy()
         self.wrist_rel_to_box = new_track.wrist_rel_to_box.copy()
+        self.time_since_update = 0
         self._clear_static_snapshot()
 
     def update(self, new_track: PoseSTrack, frame_id: int):
@@ -206,10 +200,12 @@ class PoseSTrack(STrack):
         self.idx = new_track.idx
         self.keypoints = new_track.keypoints.copy()
         self.wrist_rel_to_box = new_track.wrist_rel_to_box.copy()
+        self.time_since_update = 0
         self._clear_static_snapshot()
 
     def mark_lost(self):
         super().mark_lost()
+        self.time_since_update = max(int(getattr(self, "time_since_update", 0)), 1)
         if self.mean is not None:
             self.static_mean = self.mean.copy()
             self.static_mean[4:] = 0.0
@@ -355,6 +351,19 @@ class PoseTrack(BYTETracker):
     def _lost_track_age(self, track: PoseSTrack) -> int:
         return max(int(self.frame_id) - int(track.end_frame), 0)
 
+    def _is_young_lost(self, track: PoseSTrack) -> bool:
+        if track.state != TrackState.Lost:
+            return False
+        recall_frames = int(getattr(self.args, "lost_pose_recall_frames", 3))
+        return self._lost_track_age(track) <= recall_frames
+
+    @staticmethod
+    def _velocity_shifted_xywh(mean: np.ndarray, steps: int, *, velocity: np.ndarray | None = None) -> np.ndarray:
+        xywh = mean[:4].astype(np.float32).copy()
+        vel = mean[4:6] if velocity is None else velocity
+        xywh[:2] += vel.astype(np.float32) * float(max(steps, 0))
+        return xywh
+
     def _is_lost_expired(self, track: PoseSTrack) -> bool:
         if track.state != TrackState.Lost:
             return False
@@ -463,10 +472,21 @@ class PoseTrack(BYTETracker):
         growth_rate = float(getattr(self.args, "lost_box_growth_rate", 0.02))
         growth_max = float(getattr(self.args, "lost_box_growth_max", 1.4))
         growth = min(1.0 + growth_rate * dt, growth_max)
+        candidates = [iou_row]
+
         static_xywh = track.static_mean[:4].copy()
         static_xywh[2:4] *= growth
-        static_iou = matching.iou_distance(self._xywh_to_xyxy(static_xywh), det_xyxys)[0]
-        return np.minimum(iou_row, static_iou)
+        candidates.append(matching.iou_distance(self._xywh_to_xyxy(static_xywh), det_xyxys)[0])
+
+        if track.mean is not None:
+            velocity = track.mean[4:6]
+            shifted = self._velocity_shifted_xywh(track.mean, dt, velocity=velocity)
+            candidates.append(matching.iou_distance(self._xywh_to_xyxy(shifted), det_xyxys)[0])
+            shifted_static = static_xywh.copy()
+            shifted_static[:2] += velocity.astype(np.float32) * float(dt)
+            candidates.append(matching.iou_distance(self._xywh_to_xyxy(shifted_static), det_xyxys)[0])
+
+        return np.minimum.reduce(candidates)
 
     def _resolve_pose_collisions(
         self,
@@ -515,16 +535,20 @@ class PoseTrack(BYTETracker):
                 continue
             idx = int(candidates[0])
             track = tracks[idx]
-            if track.mean is None or first_thresh > out[idx, j] or out[idx, j] >= second_thresh:
+            if track.mean is None:
+                continue
+            if first_thresh > out[idx, j] or out[idx, j] >= second_thresh:
                 continue
             velocity = track.mean[4:6]
             speed = float(np.linalg.norm(velocity))
-            if speed <= 5.0:
+            min_speed = float(getattr(self.args, "velocity_bonus_min_speed", 2.0))
+            if speed <= min_speed:
                 continue
             innovation = det_xywhs[j, :2] - track.mean[:2]
             cos_sim = float(np.dot(innovation, velocity) / (np.linalg.norm(innovation) * speed + 1e-6))
-            if cos_sim > 0.7 and pose_disim[idx, j] < 0.75:
-                out[idx, j] = out[idx, j] - 0.3 * cos_sim
+            pose_limit = 0.85 if self._is_young_lost(track) else 0.75
+            if cos_sim > 0.5 and pose_disim[idx, j] < pose_limit:
+                out[idx, j] = out[idx, j] - 0.35 * cos_sim
         return out
 
     def get_dists(self, tracks: list[PoseSTrack], detections: list[PoseSTrack], stage: int = 1) -> np.ndarray:
@@ -545,6 +569,7 @@ class PoseTrack(BYTETracker):
 
         box_gate = float(getattr(self.args, "box_gate_thresh", 9.488))
         dead_line_scale = float(getattr(self.args, "dead_line_scale", 3.0))
+        dead_line_velocity_scale = float(getattr(self.args, "dead_line_velocity_scale", 0.5))
         pose_reliable_thresh = float(getattr(self.args, "pose_reliable_thresh", 0.25))
         use_gating = bool(getattr(self.args, "use_maha_gating", True))
 
@@ -553,6 +578,12 @@ class PoseTrack(BYTETracker):
                 continue
             iou_row = self._refine_iou_for_track(track, iou_matrix[i], det_xyxys)
             pose_row = pose_disim[i]
+            young_lost = self._is_young_lost(track)
+            miss_age = self._lost_track_age(track) if track.state == TrackState.Lost else int(
+                getattr(track, "time_since_update", 0)
+            )
+            speed = float(np.linalg.norm(track.mean[4:6]))
+            velocity_pad = dead_line_velocity_scale * speed * max(miss_age, 1)
 
             if use_gating and track.kalman_filter is not None:
                 bbox_maha = track.kalman_filter.gating_distance(
@@ -562,10 +593,10 @@ class PoseTrack(BYTETracker):
                 bbox_maha = np.full(n, np.inf, dtype=np.float32)
 
             pixel_dists = np.linalg.norm(det_xywhs[:, :2] - track.mean[:2], axis=1)
-            dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * dead_line_scale
+            dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * dead_line_scale + velocity_pad
             if track.state == TrackState.Lost and track.static_mean is not None:
                 static_pixel = np.linalg.norm(det_xywhs[:, :2] - track.static_mean[:2], axis=1)
-                static_dead = np.minimum(track.static_mean[3], det_xywhs[:, 3]) * dead_line_scale
+                static_dead = np.minimum(track.static_mean[3], det_xywhs[:, 3]) * dead_line_scale + velocity_pad
             else:
                 static_pixel = np.ones(n, dtype=np.float32)
                 static_dead = np.zeros(n, dtype=np.float32)
@@ -578,7 +609,7 @@ class PoseTrack(BYTETracker):
                 pose_reliable = pose_row[j] < pose_reliable_thresh
                 if not (has_iou or in_gate or pose_reliable):
                     continue
-                if track.state == TrackState.Lost and not has_iou:
+                if track.state == TrackState.Lost and not has_iou and not (young_lost and pose_reliable):
                     continue
                 if track.state == TrackState.Lost:
                     box_score = min(iou_row[j], max(bbox_maha[j] / box_gate, pose_row[j]))
@@ -588,7 +619,8 @@ class PoseTrack(BYTETracker):
 
         proximity = float(getattr(self.args, "proximity_thresh", 0.5))
         far_mask = iou_matrix > (1.0 - proximity)
-        dists[far_mask] = 1.0
+        still_unmatched = dists >= 1.0 - 1e-5
+        dists[np.logical_and(far_mask, still_unmatched)] = 1.0
 
         if self.args.fuse_score:
             dists = matching.fuse_score(dists, detections)
@@ -678,9 +710,15 @@ class PoseTrack(BYTETracker):
 
         for it in u_track:
             track = r_strack_pool[it]
-            if track.state != TrackState.Lost:
+            if track.state == TrackState.Lost:
+                continue
+            track.time_since_update = int(getattr(track, "time_since_update", 0)) + 1
+            coast_max = int(getattr(self.args, "coast_max_frames", 2))
+            if track.time_since_update > coast_max:
                 track.mark_lost()
                 lost_stracks.append(track)
+            else:
+                activated_stracks.append(track)
 
         detections = [detections[i] for i in u_detection]
         dists = self.get_dists(unconfirmed, detections, stage=1)
