@@ -243,6 +243,31 @@ def test_mark_lost_sets_lost_state():
     assert track.state == TrackState.Lost
 
 
+def test_second_stage_matches_tracked_only_with_iou():
+    """Stage-2 should follow ByteTrack: Tracked-only pool and IoU matching."""
+    args = _tracker_args()
+    args.track_high_thresh = 0.5
+    args.second_match_thresh = 0.5
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    img = np.zeros((512, 512, 3), np.uint8)
+
+    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
+    kpts = _hand_skeleton_keypoints(256, 256)[None]
+    tracker.update(boxes, img, keypoints=kpts)
+    track = tracker.tracked_stracks[0]
+    track.mark_lost()
+    tracker.tracked_stracks = []
+    tracker.lost_stracks = [track]
+
+    low_boxes = _FakeBoxes([[258, 258, 120, 120]], [0.2], [1])
+    low_kpts = _hand_skeleton_keypoints(258, 258)[None]
+    tracker.update(low_boxes, img, keypoints=low_kpts)
+
+    assert not tracker.tracked_stracks
+    assert len(tracker.lost_stracks) == 1
+    assert tracker.lost_stracks[0].track_id == track.track_id
+
+
 def test_lost_track_expires_within_short_window():
     args = _tracker_args()
     args.lost_track_max_frames = 3

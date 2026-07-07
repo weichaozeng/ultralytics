@@ -7,7 +7,7 @@ track_low_thresh: 0.1
 new_track_thresh: 0.25
 track_buffer: 30
 match_thresh: 0.62
-second_match_thresh: 0.90
+second_match_thresh: 0.5
 fuse_score: true
 remove_duplicate_stracks: false
 
@@ -25,9 +25,6 @@ motion_box_weight: 0.75
 motion_speed_ref: 8.0
 motion_speed_min: 1.0
 motion_dir_weight: 0.5
-
-# Detection score fusion (box conf + mean keypoint conf)
-det_score_box_weight: 0.5
 
 # Result keypoints: detector = matched det kpts (BoTSORT-style); filtered = pose-KF output
 pose_output: detector

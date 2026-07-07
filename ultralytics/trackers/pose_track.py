@@ -471,13 +471,16 @@ class PoseTrack(BYTETracker):
             ]
         )
 
-    def _det_combined_scores(self, results, keypoints: np.ndarray | None) -> np.ndarray:
-        scores = np.asarray(results.conf, dtype=np.float32)
-        if keypoints is None or len(keypoints) == 0 or keypoints.shape[-1] < 3:
-            return scores
-        pose_scores = np.mean(keypoints[..., 2], axis=1).astype(np.float32)
-        box_w = float(getattr(self.args, "det_score_box_weight", 0.5))
-        return box_w * scores + (1.0 - box_w) * pose_scores
+    def _byte_split_scores(self, results) -> np.ndarray:
+        """BYTE high/low pools use detector box confidence only (same as BoTSORT)."""
+        return np.asarray(results.conf, dtype=np.float32)
+
+    def _iou_stage_dists(self, tracks: list[PoseSTrack], detections: list[PoseSTrack]) -> np.ndarray:
+        """ByteTrack-style stage-2 cost: IoU distance with optional detection score fusion."""
+        dists = matching.iou_distance(tracks, detections)
+        if self.args.fuse_score:
+            dists = matching.fuse_score(dists, detections)
+        return dists
 
     @staticmethod
     def _xywh_to_xyxy(xywh: np.ndarray) -> np.ndarray:
@@ -683,7 +686,7 @@ class PoseTrack(BYTETracker):
         refind_stracks = []
         lost_stracks = []
 
-        scores = self._det_combined_scores(results, keypoints)
+        scores = self._byte_split_scores(results)
         n_dets = len(scores)
         global_inds = np.arange(n_dets)
         remain_inds = scores >= self.args.track_high_thresh
@@ -723,22 +726,18 @@ class PoseTrack(BYTETracker):
         detections_second = self.init_track(
             results_second, keypoints=keypoints_second, det_indices=global_inds[inds_second]
         )
-        r_strack_pool = [strack_pool[i] for i in u_track]
-        dists = self.get_dists(r_strack_pool, detections_second, stage=2)
-        second_thresh = float(getattr(self.args, "second_match_thresh", 0.9))
+        r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+        dists = self._iou_stage_dists(r_tracked_stracks, detections_second)
+        second_thresh = float(getattr(self.args, "second_match_thresh", 0.5))
         matches, u_track, _u_detection_second = matching.linear_assignment(dists, thresh=second_thresh)
         for itracked, idet in matches:
-            track = r_strack_pool[itracked]
+            track = r_tracked_stracks[itracked]
             det = detections_second[idet]
-            if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id)
-                activated_stracks.append(track)
-            else:
-                track.re_activate(det, self.frame_id, new_id=False)
-                refind_stracks.append(track)
+            track.update(det, self.frame_id)
+            activated_stracks.append(track)
 
         for it in u_track:
-            track = r_strack_pool[it]
+            track = r_tracked_stracks[it]
             if track.state != TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
