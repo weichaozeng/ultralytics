@@ -44,6 +44,8 @@ from test_spad_pose import (
     _build_vis_frame,
     _default_test_name,
     _default_test_name_from_json,
+    _draw_bbox,
+    _draw_pose,
     _frame_record_from_result,
     _json_default,
     _model_name_from_ckpt,
@@ -479,7 +481,22 @@ def _build_cached_vis_frame(result) -> tuple[np.ndarray, np.ndarray, np.ndarray 
         if getattr(result, "orig_img", None) is not None
         else np.zeros((512, 512, 3), dtype=np.uint8)
     )
-    return recon.copy(), recon, None
+    vis = recon.copy()
+    if result.boxes is not None and len(result.boxes):
+        track_ids = result.boxes.id
+        if track_ids is None:
+            track_ids = torch.arange(len(result.boxes), device=result.boxes.data.device)
+        track_id = track_ids.cpu().numpy()
+        boxes = result.boxes.xyxy.cpu().numpy()
+        box_confs = result.boxes.conf.cpu().numpy()
+        handedness = result.boxes.cls.cpu().numpy()
+        poses = result.keypoints.data.cpu().numpy() if getattr(result, "keypoints", None) is not None else None
+        for j, tid in enumerate(track_id):
+            box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
+            vis = _draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
+            if poses is not None and j < len(poses):
+                vis = _draw_pose(vis, poses[j])
+    return vis, recon, None
 
 
 def _maybe_set_velocity_field(preprocessor, tracker) -> None:
