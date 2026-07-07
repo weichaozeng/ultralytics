@@ -55,24 +55,28 @@ class PosePredictor(DetectionPredictor):
     def _use_pose_nms(self) -> bool:
         return getattr(self.args, "mode", None) == "track" and is_pose_track_tracker(getattr(self.args, "tracker", None))
 
-    def _pose_nms_thresholds(self) -> tuple[float, float]:
+    def _pose_nms_thresholds(self) -> tuple[float, float, float]:
         tracker = getattr(self.args, "tracker", None)
         if not tracker:
-            return 0.25, 0.25
+            return 0.25, 0.25, 0.65
         try:
             from ultralytics.utils import YAML
             from ultralytics.utils.checks import check_yaml
 
             cfg = YAML.load(check_yaml(tracker))
-            return float(cfg.get("point_thres", 0.25)), float(cfg.get("bone_thres", 0.25))
+            return (
+                float(cfg.get("point_thres", 0.25)),
+                float(cfg.get("bone_thres", 0.25)),
+                float(cfg.get("ioa_thres", 0.65)),
+            )
         except Exception:
-            return 0.25, 0.25
+            return 0.25, 0.25, 0.65
 
     def postprocess(self, preds, img, orig_imgs, **kwargs):
         """Post-process predictions, using pose-aware NMS when PoseTrack is active."""
         save_feats = getattr(self, "_feats", None) is not None
         if self._use_pose_nms():
-            point_thres, bone_thres = self._pose_nms_thresholds()
+            point_thres, bone_thres, ioa_thres = self._pose_nms_thresholds()
             preds = pose_aware_non_max_suppression(
                 preds,
                 self.args.conf,
@@ -86,6 +90,7 @@ class PosePredictor(DetectionPredictor):
                 return_idxs=save_feats,
                 point_thres=point_thres,
                 bone_thres=bone_thres,
+                ioa_thres=ioa_thres,
             )
         else:
             preds = nms.non_max_suppression(

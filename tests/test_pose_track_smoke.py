@@ -240,26 +240,36 @@ def test_lost_track_expires_within_short_window():
     assert track.state == TrackState.Removed
 
 
-def test_coast_tolerates_single_missed_frame():
+def test_motion_gated_association_weights():
     args = _tracker_args()
-    args.coast_max_frames = 2
+    args.box_weight = 0.25
+    args.motion_box_weight = 0.75
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    img = np.zeros((512, 512, 3), np.uint8)
+    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
+    kpts = _hand_skeleton_keypoints(256, 256)[None]
+    tracker.update(boxes, img, keypoints=kpts)
+    track = tracker.tracked_stracks[0]
+    track._vel_history = [np.array([10.0, 0.0], dtype=np.float32), np.array([10.0, 0.0], dtype=np.float32)]
+    track.mean[4:6] = np.array([10.0, 0.0], dtype=np.float64)
+    high_box, _ = tracker._association_weights(track, stage=1)
+    track._vel_history = [np.array([0.2, 0.0], dtype=np.float32), np.array([0.3, 0.0], dtype=np.float32)]
+    track.mean[4:6] = np.array([0.2, 0.0], dtype=np.float64)
+    low_box, _ = tracker._association_weights(track, stage=1)
+    assert high_box > low_box
+
+
+def test_missed_frame_marks_lost_without_coast():
+    args = _tracker_args()
     tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
     img = np.zeros((512, 512, 3), np.uint8)
     boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
     kpts = _hand_skeleton_keypoints(256, 256)[None]
     tracker.update(boxes, img, keypoints=kpts)
     track_id = tracker.tracked_stracks[0].track_id
-
-    empty = _FakeBoxes([], [], [])
-    tracker.update(empty, img, keypoints=np.zeros((0, 21, 3), dtype=np.float32))
-    assert any(t.track_id == track_id and t.state == TrackState.Tracked for t in tracker.tracked_stracks)
-    assert not tracker.lost_stracks
-
-    boxes2 = _FakeBoxes([[280, 280, 120, 120]], [0.9], [1])
-    kpts2 = _hand_skeleton_keypoints(280, 280)[None]
-    out = tracker.update(boxes2, img, keypoints=kpts2)
-    assert out.shape[0] == 1
-    assert int(out[0, 4]) == track_id
+    tracker.update(_FakeBoxes([], [], []), img, keypoints=np.zeros((0, 21, 3), dtype=np.float32))
+    assert not any(t.track_id == track_id and t.state == TrackState.Tracked for t in tracker.tracked_stracks)
+    assert any(t.track_id == track_id and t.state == TrackState.Lost for t in tracker.lost_stracks)
 
 
 def test_pose_nms_suppresses_duplicate_hands():

@@ -56,7 +56,7 @@ class PoseSTrack(STrack):
         self.kpt_conf_ema: np.ndarray | None = None
         self._kpt_conf_thresh = 0.3
         self._cls_learning_rate = 0.3
-        self.time_since_update = 0
+        self._vel_history: list[np.ndarray] = []
 
     @staticmethod
     def _encode_wrist_rel(xywh: np.ndarray | list[float], keypoints: np.ndarray) -> np.ndarray:
@@ -165,7 +165,16 @@ class PoseSTrack(STrack):
             self.is_activated = True
         self.frame_id = frame_id
         self.start_frame = frame_id
-        self.time_since_update = 0
+        self._push_velocity_history()
+
+    def _push_velocity_history(self, max_len: int | None = None):
+        if self.mean is None:
+            return
+        if max_len is None:
+            max_len = 4
+        self._vel_history.append(self.mean[4:6].astype(np.float32).copy())
+        if len(self._vel_history) > max_len:
+            self._vel_history = self._vel_history[-max_len:]
 
     def re_activate(self, new_track: PoseSTrack, frame_id: int, new_id: bool = False):
         self.mean, self.covariance = self.kalman_filter.update(
@@ -183,7 +192,7 @@ class PoseSTrack(STrack):
         self.idx = new_track.idx
         self.keypoints = new_track.keypoints.copy()
         self.wrist_rel_to_box = new_track.wrist_rel_to_box.copy()
-        self.time_since_update = 0
+        self._push_velocity_history()
         self._clear_static_snapshot()
 
     def update(self, new_track: PoseSTrack, frame_id: int):
@@ -200,12 +209,11 @@ class PoseSTrack(STrack):
         self.idx = new_track.idx
         self.keypoints = new_track.keypoints.copy()
         self.wrist_rel_to_box = new_track.wrist_rel_to_box.copy()
-        self.time_since_update = 0
+        self._push_velocity_history()
         self._clear_static_snapshot()
 
     def mark_lost(self):
         super().mark_lost()
-        self.time_since_update = max(int(getattr(self, "time_since_update", 0)), 1)
         if self.mean is not None:
             self.static_mean = self.mean.copy()
             self.static_mean[4:] = 0.0
@@ -356,6 +364,44 @@ class PoseTrack(BYTETracker):
             return False
         recall_frames = int(getattr(self.args, "lost_pose_recall_frames", 3))
         return self._lost_track_age(track) <= recall_frames
+
+    def _motion_confidence(self, track: PoseSTrack) -> float:
+        """Higher when speed and velocity direction are both stable."""
+        if track.mean is None:
+            return 0.0
+        speed = float(np.linalg.norm(track.mean[4:6]))
+        speed_ref = float(getattr(self.args, "motion_speed_ref", 8.0))
+        min_speed = float(getattr(self.args, "motion_speed_min", 1.0))
+        if speed < min_speed:
+            speed_score = 0.5 * speed / max(min_speed, 1e-6)
+        else:
+            speed_score = min(speed / max(speed_ref, 1e-6), 1.0)
+
+        dir_score = 0.5
+        history = getattr(track, "_vel_history", [])
+        if len(history) >= 2:
+            v1 = history[-1]
+            v2 = history[-2]
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            if n1 > min_speed and n2 > min_speed:
+                cos = float(np.dot(v1, v2) / (n1 * n2 + 1e-6))
+                dir_score = (cos + 1.0) * 0.5
+
+        dir_weight = float(getattr(self.args, "motion_dir_weight", 0.5))
+        return float(np.clip(speed_score * ((1.0 - dir_weight) + dir_weight * dir_score), 0.0, 1.0))
+
+    def _association_weights(self, track: PoseSTrack, stage: int) -> tuple[float, float]:
+        """Interpolate box/pose weights from low-motion to high-motion settings."""
+        motion_conf = self._motion_confidence(track)
+        if stage == 2:
+            box_low = float(getattr(self.args, "box_weight_second", 0.35))
+        else:
+            box_low = float(getattr(self.args, "box_weight", 0.25))
+        box_high = float(getattr(self.args, "motion_box_weight", 0.75))
+        box_w = box_low + (box_high - box_low) * motion_conf
+        pose_w = 1.0 - box_w
+        return box_w, pose_w
 
     @staticmethod
     def _velocity_shifted_xywh(mean: np.ndarray, steps: int, *, velocity: np.ndarray | None = None) -> np.ndarray:
@@ -546,6 +592,8 @@ class PoseTrack(BYTETracker):
                 continue
             innovation = det_xywhs[j, :2] - track.mean[:2]
             cos_sim = float(np.dot(innovation, velocity) / (np.linalg.norm(innovation) * speed + 1e-6))
+            if self._motion_confidence(track) < 0.45:
+                continue
             pose_limit = 0.85 if self._is_young_lost(track) else 0.75
             if cos_sim > 0.5 and pose_disim[idx, j] < pose_limit:
                 out[idx, j] = out[idx, j] - 0.35 * cos_sim
@@ -557,11 +605,6 @@ class PoseTrack(BYTETracker):
         if m == 0 or n == 0:
             return dists
 
-        box_w = float(getattr(self.args, "box_weight", 0.4))
-        pose_w = float(getattr(self.args, "pose_weight_second" if stage == 2 else "pose_weight", 0.6))
-        total = max(box_w + pose_w, 1e-6)
-        alpha, beta = box_w / total, pose_w / total
-
         det_xywhs = np.array([d.xywh for d in detections], dtype=np.float32)
         det_xyxys = np.array([d.xyxy for d in detections], dtype=np.float32)
         iou_matrix = matching.iou_distance(tracks, detections)
@@ -571,17 +614,18 @@ class PoseTrack(BYTETracker):
         dead_line_scale = float(getattr(self.args, "dead_line_scale", 3.0))
         dead_line_velocity_scale = float(getattr(self.args, "dead_line_velocity_scale", 0.5))
         pose_reliable_thresh = float(getattr(self.args, "pose_reliable_thresh", 0.25))
+        motion_pose_recall_max = float(getattr(self.args, "motion_pose_recall_max", 0.45))
         use_gating = bool(getattr(self.args, "use_maha_gating", True))
 
         for i, track in enumerate(tracks):
             if track.mean is None:
                 continue
+            alpha, beta = self._association_weights(track, stage)
             iou_row = self._refine_iou_for_track(track, iou_matrix[i], det_xyxys)
             pose_row = pose_disim[i]
             young_lost = self._is_young_lost(track)
-            miss_age = self._lost_track_age(track) if track.state == TrackState.Lost else int(
-                getattr(track, "time_since_update", 0)
-            )
+            motion_conf = self._motion_confidence(track)
+            miss_age = self._lost_track_age(track) if track.state == TrackState.Lost else 0
             speed = float(np.linalg.norm(track.mean[4:6]))
             velocity_pad = dead_line_velocity_scale * speed * max(miss_age, 1)
 
@@ -609,7 +653,8 @@ class PoseTrack(BYTETracker):
                 pose_reliable = pose_row[j] < pose_reliable_thresh
                 if not (has_iou or in_gate or pose_reliable):
                     continue
-                if track.state == TrackState.Lost and not has_iou and not (young_lost and pose_reliable):
+                allow_pose_only = young_lost and pose_reliable and motion_conf < motion_pose_recall_max
+                if track.state == TrackState.Lost and not has_iou and not allow_pose_only:
                     continue
                 if track.state == TrackState.Lost:
                     box_score = min(iou_row[j], max(bbox_maha[j] / box_gate, pose_row[j]))
@@ -710,15 +755,9 @@ class PoseTrack(BYTETracker):
 
         for it in u_track:
             track = r_strack_pool[it]
-            if track.state == TrackState.Lost:
-                continue
-            track.time_since_update = int(getattr(track, "time_since_update", 0)) + 1
-            coast_max = int(getattr(self.args, "coast_max_frames", 2))
-            if track.time_since_update > coast_max:
+            if track.state != TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
-            else:
-                activated_stracks.append(track)
 
         detections = [detections[i] for i in u_detection]
         dists = self.get_dists(unconfirmed, detections, stage=1)

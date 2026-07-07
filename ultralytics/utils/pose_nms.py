@@ -70,6 +70,7 @@ def pose_aware_non_max_suppression(
     return_idxs: bool = False,
     point_thres: float = 0.25,
     bone_thres: float = 0.25,
+    ioa_thres: float = 0.65,
 ):
     """NMS with pose similarity for overlapping hand detections."""
     assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
@@ -178,7 +179,18 @@ def pose_aware_non_max_suppression(
             pose_data = x[:, 6 : 6 + extra].reshape(x.shape[0], -1, 3)
             poses = pose_data[..., :2].reshape(x.shape[0], -1) + c
             pose_scores = pose_data[..., 2].reshape(x.shape[0], -1)
-            i = PoseNMS.soft_pa_nms(boxes, scores, iou_thres, poses, pose_scores, point_thres, bone_thres)
+            det_classes = x[:, 5]
+            i = PoseNMS.soft_pa_nms(
+                boxes,
+                scores,
+                iou_thres,
+                poses,
+                pose_scores,
+                point_thres,
+                bone_thres,
+                classes=det_classes,
+                ioa_threshold=ioa_thres,
+            )
         i = i[:max_det]
 
         output[xi] = x[i]
@@ -203,6 +215,9 @@ class PoseNMS:
         pose_scores: torch.Tensor,
         point_threshold: float,
         bone_threshold: float,
+        *,
+        classes: torch.Tensor | None = None,
+        ioa_threshold: float = 0.65,
     ) -> torch.Tensor:
         if boxes.numel() == 0:
             return torch.empty((0,), dtype=torch.int64, device=boxes.device)
@@ -248,11 +263,18 @@ class PoseNMS:
             h = (yy2 - yy1).clamp(min=0)
             inter = w * h
             iou = inter / (areas[i] + areas[rest] - inter).clamp(min=1e-6)
+            inter_over_min = inter / torch.minimum(areas[i], areas[rest]).clamp(min=1e-6)
+            contain_mask = inter_over_min > ioa_threshold
 
-            candidate_mask = iou > iou_threshold
+            candidate_mask = (iou > iou_threshold) | contain_mask
             if not candidate_mask.any():
                 order = rest
                 continue
+
+            if classes is not None:
+                same_cls = classes[i] == classes[rest]
+            else:
+                same_cls = torch.ones_like(candidate_mask, dtype=torch.bool, device=boxes.device)
 
             pose_reliable_mask = (valid_nums[i] >= 10) & (valid_nums[rest] >= 10)
             final_mask = torch.zeros_like(candidate_mask)
@@ -277,9 +299,14 @@ class PoseNMS:
                 suppress = (m_point_d < point_threshold) & (m_bone_d < bone_threshold)
                 final_mask[active_pose_mask] = suppress
 
-            fallback_mask = candidate_mask & (~pose_reliable_mask)
-            if fallback_mask.any():
-                final_mask[fallback_mask] = True
+            # Nested duplicate dets: same class, pose unreliable or containment without pose check.
+            fallback_mask = candidate_mask & (~pose_reliable_mask) & same_cls
+            dup_by_contain = fallback_mask & contain_mask
+            dup_by_iou = fallback_mask & (~contain_mask) & (iou > iou_threshold)
+            if dup_by_contain.any():
+                final_mask[dup_by_contain] = True
+            if dup_by_iou.any():
+                final_mask[dup_by_iou] = True
 
             order = rest[~final_mask]
 

@@ -387,6 +387,7 @@ def _postprocess_pose_predictions(
     use_pose_nms: bool = False,
     point_thres: float = 0.25,
     bone_thres: float = 0.25,
+    ioa_thres: float = 0.65,
 ) -> list[torch.Tensor]:
     raw = raw_preds[0] if isinstance(raw_preds, (list, tuple)) and torch.is_tensor(raw_preds[0]) else raw_preds
     if use_pose_nms:
@@ -399,6 +400,7 @@ def _postprocess_pose_predictions(
             max_det=max_det,
             point_thres=point_thres,
             bone_thres=bone_thres,
+            ioa_thres=ioa_thres,
         )
     else:
         preds = nms.non_max_suppression(raw, conf, iou, nc=nc, multi_label=True, max_det=max_det)
@@ -556,6 +558,7 @@ def main():
     use_pose_nms = is_pose_track_tracker(args.tracker)
     point_thres = float(tracker_cfg.get("point_thres", 0.25))
     bone_thres = float(tracker_cfg.get("bone_thres", 0.25))
+    ioa_thres = float(tracker_cfg.get("ioa_thres", 0.65))
     override_name, override_preprocessor = _build_override_preprocessor(args)
     if override_preprocessor is not None:
         if override_name == "hyb" and args.tracker not in {"spad_tracker", "spad_posetrack"}:
@@ -620,6 +623,7 @@ def main():
                         use_pose_nms=use_pose_nms,
                         point_thres=point_thres,
                         bone_thres=bone_thres,
+                        ioa_thres=ioa_thres,
                     )
                     recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
                 if device.type == "cuda":

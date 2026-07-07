@@ -12,11 +12,19 @@ fuse_score: true
 remove_duplicate_stracks: false
 
 # Lost track survival (track_buffer is ignored; use this instead)
-lost_track_max_frames: 5 # short static-recall window (3-8 recommended)
-lost_pose_recall_frames: 3 # allow pose-only re-association for young lost tracks
-coast_max_frames: 2 # tolerate missed detections before marking lost
+lost_track_max_frames: 5
+lost_pose_recall_frames: 3
+motion_pose_recall_max: 0.45
 dead_line_velocity_scale: 0.5
 velocity_bonus_min_speed: 2.0
+
+# Motion-gated association: low motion -> pose-heavy, high motion -> box-heavy
+box_weight: 0.25
+box_weight_second: 0.35
+motion_box_weight: 0.75
+motion_speed_ref: 8.0
+motion_speed_min: 1.0
+motion_dir_weight: 0.5
 
 # Detection score fusion (box conf + mean keypoint conf)
 det_score_box_weight: 0.5
@@ -24,12 +32,11 @@ det_score_box_weight: 0.5
 # Pose association
 n_keypoints: 21
 kpt_dims: 3
-box_weight: 0.3
-pose_weight: 0.7
-pose_weight_second: 0.4
+pose_weight: 0.75
+pose_weight_second: 0.65
 proximity_thresh: 0.5
 pose_match_thresh: 0.0
-pose_metric: hybrid # oks | bone | hybrid
+pose_metric: hybrid
 kpt_conf_thresh: 0.3
 oks_sigma: 0.05
 match_weight_depth: [1.0, 1.0, 0.85, 0.70, 0.50]
@@ -49,3 +56,4 @@ cls_soft_match_penalty: 0.1
 # Pose-aware NMS (used automatically when this tracker is selected)
 point_thres: 0.25
 bone_thres: 0.25
+ioa_thres: 0.65

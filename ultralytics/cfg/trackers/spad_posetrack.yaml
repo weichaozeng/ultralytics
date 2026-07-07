@@ -12,11 +12,19 @@ fuse_score: true
 remove_duplicate_stracks: false
 
 # Lost track survival (track_buffer is ignored; use this instead)
-lost_track_max_frames: 5 # short static-recall window (3-8 recommended)
+lost_track_max_frames: 5
 lost_pose_recall_frames: 3
-coast_max_frames: 2
+motion_pose_recall_max: 0.45
 dead_line_velocity_scale: 0.5
 velocity_bonus_min_speed: 2.0
+
+# Motion-gated association
+box_weight: 0.25
+box_weight_second: 0.35
+motion_box_weight: 0.75
+motion_speed_ref: 8.0
+motion_speed_min: 1.0
+motion_dir_weight: 0.5
 
 # Detection score fusion (box conf + mean keypoint conf)
 det_score_box_weight: 0.5
@@ -24,9 +32,8 @@ det_score_box_weight: 0.5
 # Pose association
 n_keypoints: 21
 kpt_dims: 3
-box_weight: 0.3
-pose_weight: 0.7
-pose_weight_second: 0.4
+pose_weight: 0.75
+pose_weight_second: 0.65
 proximity_thresh: 0.5
 pose_match_thresh: 0.0
 pose_metric: hybrid
@@ -49,6 +56,7 @@ cls_soft_match_penalty: 0.1
 # Pose-aware NMS (used automatically when this tracker is selected)
 point_thres: 0.25
 bone_thres: 0.25
+ioa_thres: 0.65
 
 # Velocity field export
 field_value_source: predicted
