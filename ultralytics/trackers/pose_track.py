@@ -476,7 +476,7 @@ class PoseTrack(BYTETracker):
         return np.asarray(results.conf, dtype=np.float32)
 
     def _iou_stage_dists(self, tracks: list[PoseSTrack], detections: list[PoseSTrack]) -> np.ndarray:
-        """ByteTrack-style stage-2 cost: IoU distance with optional detection score fusion."""
+        """Stage-2 cost: IoU distance with optional detection score fusion (no pose terms)."""
         dists = matching.iou_distance(tracks, detections)
         if self.args.fuse_score:
             dists = matching.fuse_score(dists, detections)
@@ -726,18 +726,22 @@ class PoseTrack(BYTETracker):
         detections_second = self.init_track(
             results_second, keypoints=keypoints_second, det_indices=global_inds[inds_second]
         )
-        r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
-        dists = self._iou_stage_dists(r_tracked_stracks, detections_second)
-        second_thresh = float(getattr(self.args, "second_match_thresh", 0.5))
+        r_strack_pool = [strack_pool[i] for i in u_track]
+        dists = self._iou_stage_dists(r_strack_pool, detections_second)
+        second_thresh = float(getattr(self.args, "second_match_thresh", 0.6))
         matches, u_track, _u_detection_second = matching.linear_assignment(dists, thresh=second_thresh)
         for itracked, idet in matches:
-            track = r_tracked_stracks[itracked]
+            track = r_strack_pool[itracked]
             det = detections_second[idet]
-            track.update(det, self.frame_id)
-            activated_stracks.append(track)
+            if track.state == TrackState.Tracked:
+                track.update(det, self.frame_id)
+                activated_stracks.append(track)
+            else:
+                track.re_activate(det, self.frame_id, new_id=False)
+                refind_stracks.append(track)
 
         for it in u_track:
-            track = r_tracked_stracks[it]
+            track = r_strack_pool[it]
             if track.state != TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)

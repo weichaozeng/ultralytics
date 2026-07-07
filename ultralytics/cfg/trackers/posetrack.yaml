@@ -7,7 +7,8 @@ track_low_thresh: 0.1
 new_track_thresh: 0.25
 track_buffer: 30
 match_thresh: 0.62
-second_match_thresh: 0.5
+# Stage-2: IoU-only (tracked + lost), between ByteTrack 0.5 and old pose-aware 0.9
+second_match_thresh: 0.6
 fuse_score: true
 remove_duplicate_stracks: false
 

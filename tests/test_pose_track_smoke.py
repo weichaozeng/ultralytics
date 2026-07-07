@@ -243,8 +243,8 @@ def test_mark_lost_sets_lost_state():
     assert track.state == TrackState.Lost
 
 
-def test_second_stage_matches_tracked_only_with_iou():
-    """Stage-2 should follow ByteTrack: Tracked-only pool and IoU matching."""
+def test_second_stage_recalls_lost_with_iou():
+    """Stage-2 uses IoU only but may re-activate lost tracks from low-score detections."""
     args = _tracker_args()
     args.track_high_thresh = 0.5
     args.second_match_thresh = 0.5
@@ -263,9 +263,9 @@ def test_second_stage_matches_tracked_only_with_iou():
     low_kpts = _hand_skeleton_keypoints(258, 258)[None]
     tracker.update(low_boxes, img, keypoints=low_kpts)
 
-    assert not tracker.tracked_stracks
-    assert len(tracker.lost_stracks) == 1
-    assert tracker.lost_stracks[0].track_id == track.track_id
+    assert len(tracker.tracked_stracks) == 1
+    assert tracker.tracked_stracks[0].track_id == track.track_id
+    assert not tracker.lost_stracks
 
 
 def test_lost_track_expires_within_short_window():
