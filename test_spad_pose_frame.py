@@ -638,12 +638,6 @@ def main():
         vis_root.mkdir(parents=True, exist_ok=True)
 
     tracker = None if args.tracker == "none" else _init_tracker(args.tracker, frame_rate=args.frame_rate, class_names=names)
-    use_pose_nms = args.tracker in {"posetrack", "spad_posetrack"}
-    point_thres = 0.25
-    bone_thres = 0.25
-    if tracker is not None:
-        point_thres = float(getattr(tracker.args, "point_thres", point_thres))
-        bone_thres = float(getattr(tracker.args, "bone_thres", bone_thres))
 
     expected_render_fingerprint = None
     if resolved_cache_mode == "rendered" and not all(
@@ -774,9 +768,6 @@ def main():
                             nc=len(names),
                             max_det=args.max_det,
                             kpt_shape=kpt_shape,
-                            use_pose_nms=use_pose_nms,
-                            point_thres=point_thres,
-                            bone_thres=bone_thres,
                         )
                         recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
 
@@ -927,9 +918,6 @@ def main():
                         nc=len(names),
                         max_det=args.max_det,
                         kpt_shape=kpt_shape,
-                        use_pose_nms=use_pose_nms,
-                        point_thres=point_thres,
-                        bone_thres=bone_thres,
                     )
                     recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
 
