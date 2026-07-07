@@ -231,7 +231,7 @@ def test_iou_distance_accepts_ndarrays():
     assert d[0, 0] < d[0, 1]
 
 
-def test_mark_lost_preserves_static_pose_snapshot():
+def test_mark_lost_sets_lost_state():
     args = _tracker_args()
     tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
     img = np.zeros((512, 512, 3), np.uint8)
@@ -240,8 +240,6 @@ def test_mark_lost_preserves_static_pose_snapshot():
     tracker.update(boxes, img, keypoints=kpts)
     track = tracker.tracked_stracks[0]
     track.mark_lost()
-    assert track.static_pose_mean is not None
-    assert track.static_wrist_rel_to_box is not None
     assert track.state == TrackState.Lost
 
 

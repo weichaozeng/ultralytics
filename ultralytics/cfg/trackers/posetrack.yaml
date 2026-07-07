@@ -47,8 +47,6 @@ box_gate_thresh: 9.488
 dead_line_scale: 3.0
 pose_reliable_thresh: 0.25
 use_maha_gating: true
-lost_box_growth_rate: 0.02
-lost_box_growth_max: 1.4
 
 # Handedness belief smoothing (left_hand=0, right_hand=1)
 handedness_filter: true

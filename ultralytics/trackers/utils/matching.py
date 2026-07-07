@@ -249,23 +249,8 @@ def _rel_bones_from_track(
     track,
     *,
     use_pred_pose: bool = True,
-    use_static: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract parent-relative bones for association from a track or detection."""
-    from ..basetrack import TrackState
-
-    if (
-        use_static
-        and getattr(track, "state", None) == TrackState.Lost
-        and getattr(track, "static_pose_mean", None) is not None
-        and getattr(track, "pose_kalman_filter", None) is not None
-    ):
-        rel = track.pose_kalman_filter.get_rel_positions(track.static_pose_mean)
-        conf = getattr(track, "static_pose_pair_conf", None)
-        if conf is None:
-            conf = np.ones(rel.shape[0], dtype=np.float32)
-        return rel.astype(np.float32), np.asarray(conf, dtype=np.float32)
-
     if use_pred_pose and getattr(track, "pose_mean", None) is not None and getattr(track, "pose_kalman_filter", None) is not None:
         rel = track.pose_kalman_filter.get_rel_positions(track.pose_mean)
         conf = np.ones(rel.shape[0], dtype=np.float32)
@@ -332,7 +317,6 @@ def bone_cosine_distance(
     btracks: list,
     *,
     use_pred_pose: bool = True,
-    use_static: bool = False,
     conf_thresh: float = 0.0,
     bone_weights: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -342,10 +326,7 @@ def bone_cosine_distance(
         return cost_matrix
 
     for i, track in enumerate(atracks):
-        track_rel, _ = _rel_bones_from_track(track, use_pred_pose=use_pred_pose, use_static=False)
-        static_rel = static_conf = None
-        if use_static and getattr(track, "static_pose_mean", None) is not None:
-            static_rel, static_conf = _rel_bones_from_track(track, use_pred_pose=True, use_static=True)
+        track_rel, _ = _rel_bones_from_track(track, use_pred_pose=use_pred_pose)
 
         for j, det in enumerate(btracks):
             det_rel, det_conf = _rel_bones_from_keypoints(det.keypoints) if hasattr(det, "keypoints") else _rel_bones_from_track(det, use_pred_pose=False)
@@ -356,15 +337,6 @@ def bone_cosine_distance(
                 bone_weights=bone_weights,
                 conf_thresh=conf_thresh,
             )
-            if static_rel is not None:
-                sim_static = weighted_bone_cosine_similarity(
-                    static_rel,
-                    det_rel,
-                    static_conf if static_conf is not None else det_conf,
-                    bone_weights=bone_weights,
-                    conf_thresh=conf_thresh,
-                )
-                sim = max(sim, sim_static)
             cost_matrix[i, j] = (1.0 - sim) / 2.0
     return cost_matrix
 

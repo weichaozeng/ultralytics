@@ -56,12 +56,6 @@ class PoseSTrack(STrack):
         self.pose_covariance: np.ndarray | None = None
         self._anchor = self.keypoints[0, :2].astype(np.float32).copy()
         self.wrist_rel_to_box = self._encode_wrist_rel(xywh[:4], self.keypoints)
-        self.static_mean: np.ndarray | None = None
-        self.static_covariance: np.ndarray | None = None
-        self.static_pose_mean: np.ndarray | None = None
-        self.static_pose_covariance: np.ndarray | None = None
-        self.static_wrist_rel_to_box: np.ndarray | None = None
-        self.static_pose_pair_conf: np.ndarray | None = None
         self.cls_log_odds = 0.0
         self.enable_handedness = False
         self.kpt_conf_ema: np.ndarray | None = None
@@ -221,7 +215,6 @@ class PoseSTrack(STrack):
         self.keypoints = new_track.keypoints.copy()
         self.wrist_rel_to_box = new_track.wrist_rel_to_box.copy()
         self._push_velocity_history()
-        self._clear_static_snapshot()
 
     def update(self, new_track: PoseSTrack, frame_id: int):
         self.frame_id = frame_id
@@ -238,30 +231,9 @@ class PoseSTrack(STrack):
         self.keypoints = new_track.keypoints.copy()
         self.wrist_rel_to_box = new_track.wrist_rel_to_box.copy()
         self._push_velocity_history()
-        self._clear_static_snapshot()
 
     def mark_lost(self):
         super().mark_lost()
-        if self.mean is not None:
-            self.static_mean = self.mean.copy()
-            self.static_mean[4:] = 0.0
-            self.static_covariance = self.covariance.copy()
-        if self.pose_mean is not None:
-            self.static_pose_mean = self.pose_mean.copy()
-            self.static_pose_mean[2::4] = 0.0
-            self.static_pose_mean[3::4] = 0.0
-            self.static_pose_covariance = self.pose_covariance.copy()
-            self.static_wrist_rel_to_box = self.wrist_rel_to_box.copy()
-            _, pair_conf = matching._rel_bones_from_keypoints(self.keypoints)
-            self.static_pose_pair_conf = pair_conf.copy()
-
-    def _clear_static_snapshot(self):
-        self.static_mean = None
-        self.static_covariance = None
-        self.static_pose_mean = None
-        self.static_pose_covariance = None
-        self.static_wrist_rel_to_box = None
-        self.static_pose_pair_conf = None
 
     def _visible_mask(self, kpt_conf_thresh: float) -> np.ndarray:
         if self.keypoints.shape[1] > 2:
@@ -369,7 +341,6 @@ class PoseTrack(BYTETracker):
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = self.get_pose_kalmanfilter()
         self.lost_track_max_frames = int(getattr(args, "lost_track_max_frames", 5))
-        # Short lost survival: static box growth makes long-lived lost tracks prone to false recall.
         self.max_time_lost = self.lost_track_max_frames
         self.enable_handedness = _handedness_enabled(args, class_names)
         self._match_weights = self._resolve_match_weights(args)
@@ -449,7 +420,7 @@ class PoseTrack(BYTETracker):
         return self._lost_track_age(track) > self.lost_track_max_frames
 
     def _purge_expired_lost_tracks(self) -> list[PoseSTrack]:
-        """Remove lost tracks that exceeded the short static-recall window."""
+        """Remove lost tracks that exceeded the short recall window."""
         kept: list[PoseSTrack] = []
         removed: list[PoseSTrack] = []
         for track in self.lost_stracks:
@@ -534,7 +505,6 @@ class PoseTrack(BYTETracker):
             tracks,
             detections,
             use_pred_pose=True,
-            use_static=True,
             conf_thresh=self._kpt_conf_thresh,
         )
         metric = str(getattr(self.args, "pose_metric", "hybrid")).lower()
@@ -545,27 +515,13 @@ class PoseTrack(BYTETracker):
         return np.minimum(d_oks, d_bone)
 
     def _refine_iou_for_track(self, track: PoseSTrack, iou_row: np.ndarray, det_xyxys: np.ndarray) -> np.ndarray:
-        if track.state != TrackState.Lost or track.static_mean is None:
+        if track.state != TrackState.Lost or track.mean is None:
             return iou_row
         dt = min(self._lost_track_age(track), self.lost_track_max_frames)
-        growth_rate = float(getattr(self.args, "lost_box_growth_rate", 0.02))
-        growth_max = float(getattr(self.args, "lost_box_growth_max", 1.4))
-        growth = min(1.0 + growth_rate * dt, growth_max)
-        candidates = [iou_row]
-
-        static_xywh = track.static_mean[:4].copy()
-        static_xywh[2:4] *= growth
-        candidates.append(matching.iou_distance(self._xywh_to_xyxy(static_xywh), det_xyxys)[0])
-
-        if track.mean is not None:
-            velocity = track.mean[4:6]
-            shifted = self._velocity_shifted_xywh(track.mean, dt, velocity=velocity)
-            candidates.append(matching.iou_distance(self._xywh_to_xyxy(shifted), det_xyxys)[0])
-            shifted_static = static_xywh.copy()
-            shifted_static[:2] += velocity.astype(np.float32) * float(dt)
-            candidates.append(matching.iou_distance(self._xywh_to_xyxy(shifted_static), det_xyxys)[0])
-
-        return np.minimum.reduce(candidates)
+        velocity = track.mean[4:6]
+        shifted = self._velocity_shifted_xywh(track.mean, dt, velocity=velocity)
+        shifted_iou = matching.iou_distance(self._xywh_to_xyxy(shifted), det_xyxys)[0]
+        return np.minimum(iou_row, shifted_iou)
 
     def _resolve_pose_collisions(
         self,
@@ -671,15 +627,9 @@ class PoseTrack(BYTETracker):
 
             pixel_dists = np.linalg.norm(det_xywhs[:, :2] - track.mean[:2], axis=1)
             dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * dead_line_scale + velocity_pad
-            if track.state == TrackState.Lost and track.static_mean is not None:
-                static_pixel = np.linalg.norm(det_xywhs[:, :2] - track.static_mean[:2], axis=1)
-                static_dead = np.minimum(track.static_mean[3], det_xywhs[:, 3]) * dead_line_scale + velocity_pad
-            else:
-                static_pixel = np.ones(n, dtype=np.float32)
-                static_dead = np.zeros(n, dtype=np.float32)
 
             for j in range(n):
-                if pixel_dists[j] > dead_lines[j] and static_pixel[j] > static_dead[j]:
+                if pixel_dists[j] > dead_lines[j]:
                     continue
                 has_iou = iou_row[j] < 1.0
                 in_gate = bbox_maha[j] < box_gate
