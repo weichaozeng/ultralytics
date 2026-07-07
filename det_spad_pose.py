@@ -425,6 +425,8 @@ def _init_tracker(tracker_name: str, *, frame_rate: int, class_names=None):
 
 
 def _apply_tracker(result: Results, tracker) -> Results:
+    if result.boxes is None or len(result.boxes) == 0:
+        return result
     det = result.boxes.cpu().numpy()
     keypoints = None
     if getattr(result, "keypoints", None) is not None and len(result.keypoints):
@@ -441,6 +443,11 @@ def _apply_tracker(result: Results, tracker) -> Results:
     if len(tracks) == 0:
         return result
     idx = tracks[:, -1].astype(int)
+    valid = (idx >= 0) & (idx < len(result))
+    if not np.any(valid):
+        return result[:0]
+    idx = idx[valid]
+    tracks = tracks[valid]
     tracked = result[idx]
     tracked.update(boxes=torch.as_tensor(tracks[:, :-1], device=result.boxes.data.device))
     return tracked
