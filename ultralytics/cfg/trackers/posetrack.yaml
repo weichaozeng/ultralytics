@@ -29,6 +29,9 @@ motion_dir_weight: 0.5
 # Detection score fusion (box conf + mean keypoint conf)
 det_score_box_weight: 0.5
 
+# Result keypoints: detector = matched det kpts (BoTSORT-style); filtered = pose-KF output
+pose_output: detector
+
 # Pose association
 n_keypoints: 21
 kpt_dims: 3

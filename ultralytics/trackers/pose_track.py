@@ -15,6 +15,17 @@ from .utils.kalman_filter import KalmanFilterXYWH
 from .utils.pose_kalman_filter import HAND_MATCH_WEIGHTS, KalmanFilterPoseChain
 from .utils.result_layout import pose_track_result_dim
 
+POSE_OUTPUT_DETECTOR = "detector"
+POSE_OUTPUT_FILTERED = "filtered"
+POSE_OUTPUT_MODES = frozenset({POSE_OUTPUT_DETECTOR, POSE_OUTPUT_FILTERED})
+
+
+def _normalize_pose_output(mode: Any) -> str:
+    value = str(mode or POSE_OUTPUT_DETECTOR).strip().lower()
+    if value not in POSE_OUTPUT_MODES:
+        raise ValueError(f"pose_output must be one of {sorted(POSE_OUTPUT_MODES)}, got {mode!r}")
+    return value
+
 
 def _handedness_enabled(args: Any, class_names: dict | list | None = None) -> bool:
     if not bool(getattr(args, "handedness_filter", False)):
@@ -56,6 +67,7 @@ class PoseSTrack(STrack):
         self.kpt_conf_ema: np.ndarray | None = None
         self._kpt_conf_thresh = 0.3
         self._cls_learning_rate = 0.3
+        self._pose_output = POSE_OUTPUT_DETECTOR
         self._vel_history: list[np.ndarray] = []
 
     @staticmethod
@@ -82,13 +94,29 @@ class PoseSTrack(STrack):
         return self.pose_kalman_filter.rel_to_abs(self.pose_mean, self.anchor)
 
     @property
-    def output_keypoints(self) -> np.ndarray:
+    def detector_keypoints(self) -> np.ndarray:
+        """Return the latest matched detection keypoints for export."""
+        kpts = np.asarray(self.keypoints, dtype=np.float32)
+        if kpts.shape[1] >= 3:
+            return kpts[:, :3].copy()
+        conf = np.ones(kpts.shape[0], dtype=np.float32)
+        return np.concatenate([kpts[:, :2], conf[:, None]], axis=1).astype(np.float32)
+
+    @property
+    def filtered_keypoints(self) -> np.ndarray:
+        """Return pose-Kalman keypoints for export."""
         xy = self.pred_keypoints_xy
         if self.kpt_conf_ema is None:
             conf = self.keypoints[:, 2] if self.keypoints.shape[1] > 2 else np.ones(len(xy), dtype=np.float32)
         else:
             conf = self.kpt_conf_ema
         return np.concatenate([xy, conf[:, None]], axis=1).astype(np.float32)
+
+    @property
+    def output_keypoints(self) -> np.ndarray:
+        if getattr(self, "_pose_output", POSE_OUTPUT_DETECTOR) == POSE_OUTPUT_FILTERED:
+            return self.filtered_keypoints
+        return self.detector_keypoints
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -349,11 +377,16 @@ class PoseTrack(BYTETracker):
         self._kpt_conf_thresh = float(getattr(args, "kpt_conf_thresh", 0.3))
         self._cls_learning_rate = float(getattr(args, "cls_learning_rate", 0.3))
         self._cls_init_strength = float(getattr(args, "cls_init_strength", 2.0))
+        self._pose_output = _normalize_pose_output(getattr(args, "pose_output", POSE_OUTPUT_DETECTOR))
+
+    def _apply_track_settings(self, tracks: list[PoseSTrack]) -> None:
+        for track in tracks:
+            track._kpt_conf_thresh = self._kpt_conf_thresh
+            track._cls_learning_rate = self._cls_learning_rate
+            track._pose_output = self._pose_output
 
     def _decorate_detections(self, detections: list[PoseSTrack]) -> list[PoseSTrack]:
-        for det in detections:
-            det._kpt_conf_thresh = self._kpt_conf_thresh
-            det._cls_learning_rate = self._cls_learning_rate
+        self._apply_track_settings(detections)
         return detections
 
     def _lost_track_age(self, track: PoseSTrack) -> int:
@@ -694,6 +727,7 @@ class PoseTrack(BYTETracker):
     ) -> np.ndarray:
         """Update tracker with detections and optional pose keypoints shaped (N, K, C)."""
         self.frame_id += 1
+        self._apply_track_settings(self.tracked_stracks)
         removed_stracks = list(self._purge_expired_lost_tracks())
         activated_stracks = []
         refind_stracks = []
@@ -802,6 +836,7 @@ class PoseTrack(BYTETracker):
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]
 
+        self._apply_track_settings(self.tracked_stracks)
         expected_dim = pose_track_result_dim(self.n_keypoints, self.kpt_dims)
         rows = [x.result for x in self.tracked_stracks if x.is_activated]
         if not rows:

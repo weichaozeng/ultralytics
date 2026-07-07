@@ -108,6 +108,35 @@ def test_pose_track_two_frames_stable_ids():
     assert set(ids1) == set(ids2)
 
 
+def test_pose_output_detector_exports_matched_detection_keypoints():
+    args = _tracker_args()
+    args.pose_output = "detector"
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    img = np.zeros((512, 512, 3), np.uint8)
+
+    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
+    kpts = _hand_skeleton_keypoints(256, 256)[None]
+    tracks = tracker.update(boxes, img, keypoints=kpts)
+
+    out_kpts = parse_track_keypoints(tracks, n_keypoints=21, kpt_dims=3)
+    assert np.allclose(out_kpts, kpts, atol=1e-5)
+
+
+def test_pose_output_filtered_exports_kalman_keypoints():
+    args = _tracker_args()
+    args.pose_output = "filtered"
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    img = np.zeros((512, 512, 3), np.uint8)
+
+    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
+    kpts = _hand_skeleton_keypoints(256, 256)[None]
+    tracks = tracker.update(boxes, img, keypoints=kpts)
+    track = tracker.tracked_stracks[0]
+    out_kpts = parse_track_keypoints(tracks, n_keypoints=21, kpt_dims=3)
+    assert np.allclose(out_kpts, track.filtered_keypoints, atol=1e-5)
+    assert np.allclose(track.output_keypoints, track.filtered_keypoints, atol=1e-5)
+
+
 def test_handedness_belief_resists_single_flip():
     args = _tracker_args()
     tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
