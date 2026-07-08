@@ -22,6 +22,7 @@ velocity_bonus_min_speed: 2.0
 # Remove unconfirmed tracks (not yet in result) that duplicate an activated track
 suppress_redundant_unconfirmed: true
 unconfirmed_dup_ioa_thresh: 0.65
+unconfirmed_dup_ioa_min: 0.35
 unconfirmed_dup_pose_dissim_thresh: 0.25
 
 # Motion-gated association

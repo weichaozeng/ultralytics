@@ -296,6 +296,7 @@ def test_suppress_redundant_unconfirmed_requires_cls_ioa_and_pose():
     args = _tracker_args()
     args.suppress_redundant_unconfirmed = True
     args.unconfirmed_dup_ioa_thresh = 0.65
+    args.unconfirmed_dup_ioa_min = 0.35
     args.unconfirmed_dup_pose_dissim_thresh = 0.25
     tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
     img = np.zeros((512, 512, 3), np.uint8)
@@ -328,6 +329,10 @@ def test_suppress_redundant_unconfirmed_requires_cls_ioa_and_pose():
         kpt_conf_thresh=args.kpt_conf_thresh,
     )
     assert not tracker._is_redundant_unconfirmed(other_cls, [active])
+
+    assert tracker._adaptive_unconfirmed_ioa_thresh(0.0) == pytest.approx(0.35)
+    assert tracker._adaptive_unconfirmed_ioa_thresh(0.25) == pytest.approx(0.65)
+    assert tracker._adaptive_unconfirmed_ioa_thresh(0.125) == pytest.approx(0.5)
 
 
 def test_pose_reliable_gate_requires_handedness_match():

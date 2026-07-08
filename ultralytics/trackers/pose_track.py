@@ -533,6 +533,24 @@ class PoseTrack(BYTETracker):
         det_xyxy = np.asarray(det.xyxy, dtype=np.float32).reshape(1, 4)
         return float(np.max(bbox_ioa(track_xyxy, det_xyxy)))
 
+    def _adaptive_unconfirmed_ioa_thresh(self, pose_disim: float) -> float:
+        """IoA threshold decreases as pose similarity increases (linear ramp)."""
+        pose_thresh = float(getattr(self.args, "unconfirmed_dup_pose_dissim_thresh", 0.25))
+        ioa_max = float(
+            getattr(
+                self.args,
+                "unconfirmed_dup_ioa_thresh",
+                getattr(self.args, "unconfirmed_dup_iou_thresh", 0.65),
+            )
+        )
+        ioa_min = float(getattr(self.args, "unconfirmed_dup_ioa_min", 0.35))
+        if pose_disim >= pose_thresh:
+            return ioa_max + 1.0
+        if pose_thresh <= 0:
+            return ioa_min
+        t = float(np.clip(pose_disim / pose_thresh, 0.0, 1.0))
+        return ioa_min + t * (ioa_max - ioa_min)
+
     def _is_redundant_unconfirmed(self, track: PoseSTrack, active_tracks: list[PoseSTrack]) -> bool:
         """Return True when an unconfirmed track duplicates an activated track.
 
@@ -542,30 +560,25 @@ class PoseTrack(BYTETracker):
         duplicates an already-activated track.
 
         Redundancy requires all of:
-        1. Same handedness / class.
-        2. Unconfirmed box largely contained in an active track (IoA = inter/area(unconfirmed)).
-        3. Pose dissimilarity below threshold (bone metric by default).
+        1. Same handedness / class (always).
+        2. Pose dissimilarity below ``unconfirmed_dup_pose_dissim_thresh``.
+        3. IoA containment above an adaptive threshold: stricter IoA when pose is
+           weaker, relaxed IoA when pose is nearly identical.
         """
         if not bool(getattr(self.args, "suppress_redundant_unconfirmed", False)):
             return False
         if not active_tracks:
             return False
-        ioa_thresh = float(
-            getattr(
-                self.args,
-                "unconfirmed_dup_ioa_thresh",
-                getattr(self.args, "unconfirmed_dup_iou_thresh", 0.65),
-            )
-        )
         pose_thresh = float(getattr(self.args, "unconfirmed_dup_pose_dissim_thresh", 0.25))
 
         for active in active_tracks:
             if not _cls_consistent(track, active):
                 continue
-            if self._max_det_containment_ioa(track, [active]) < ioa_thresh:
-                continue
             pose_disim = float(self._pose_dissimilarity([active], [track])[0, 0])
             if pose_disim >= pose_thresh:
+                continue
+            ioa = self._max_det_containment_ioa(track, [active])
+            if ioa < self._adaptive_unconfirmed_ioa_thresh(pose_disim):
                 continue
             return True
         return False
