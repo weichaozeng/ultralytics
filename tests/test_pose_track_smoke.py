@@ -269,8 +269,9 @@ def test_second_stage_recalls_lost_with_pose():
 
 
 def test_redundant_unmatched_high_det_does_not_spawn_new_track():
-    """A high-score det contained in / pose-similar to an active track should not create a new ID."""
+    """When enabled, a high-score det contained in / pose-similar to an active track should not create a new ID."""
     args = _tracker_args()
+    args.suppress_redundant_new_tracks = True
     args.new_track_ioa_thresh = 0.65
     args.new_track_pose_dissim_thresh = 0.25
     args.match_thresh = 0.05  # force association failure so the second det remains unmatched

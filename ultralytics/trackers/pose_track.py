@@ -518,6 +518,8 @@ class PoseTrack(BYTETracker):
         1. Det box is largely contained in an active track box (IoA of det area).
         2. Pose is highly similar to an active track (OKS/bone hybrid dissimilarity).
         """
+        if not bool(getattr(self.args, "suppress_redundant_new_tracks", False)):
+            return False
         if not active_tracks:
             return False
         ioa_thresh = float(getattr(self.args, "new_track_ioa_thresh", 0.65))
