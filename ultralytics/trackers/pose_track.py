@@ -14,6 +14,7 @@ from .utils import matching
 from .utils.kalman_filter import KalmanFilterXYWH
 from .utils.pose_kalman_filter import HAND_MATCH_WEIGHTS, KalmanFilterPoseChain
 from .utils.result_layout import pose_track_result_dim
+from ultralytics.utils.metrics import bbox_ioa
 
 POSE_OUTPUT_DETECTOR = "detector"
 POSE_OUTPUT_FILTERED = "filtered"
@@ -340,7 +341,7 @@ class PoseTrack(BYTETracker):
         STrack.shared_kalman = KalmanFilterXYWH()
         super().__init__(args, frame_rate)
         self.pose_kalman_filter = self.get_pose_kalmanfilter()
-        self.lost_track_max_frames = int(getattr(args, "lost_track_max_frames", 5))
+        self.lost_track_max_frames = int(getattr(args, "lost_track_max_frames", 30))
         self.max_time_lost = self.lost_track_max_frames
         self.enable_handedness = _handedness_enabled(args, class_names)
         self._match_weights = self._resolve_match_weights(args)
@@ -509,6 +510,32 @@ class PoseTrack(BYTETracker):
         if metric == "bone":
             return d_bone
         return np.minimum(d_oks, d_bone)
+
+    def _is_redundant_new_detection(self, det: PoseSTrack, active_tracks: list[PoseSTrack]) -> bool:
+        """Return True when an unmatched high-score det duplicates an active track.
+
+        Redundancy criteria (either is enough):
+        1. Det box is largely contained in an active track box (IoA of det area).
+        2. Pose is highly similar to an active track (OKS/bone hybrid dissimilarity).
+        """
+        if not active_tracks:
+            return False
+        ioa_thresh = float(getattr(self.args, "new_track_ioa_thresh", 0.65))
+        pose_thresh = float(getattr(self.args, "new_track_pose_dissim_thresh", 0.25))
+
+        if ioa_thresh > 0:
+            track_xyxy = np.asarray([t.xyxy for t in active_tracks], dtype=np.float32)
+            det_xyxy = np.asarray(det.xyxy, dtype=np.float32).reshape(1, 4)
+            # bbox_ioa(box1, box2) = inter / box2_area → containment of det inside tracks
+            ioa = bbox_ioa(track_xyxy, det_xyxy)
+            if float(np.max(ioa)) >= ioa_thresh:
+                return True
+
+        if pose_thresh > 0:
+            pose_disim = self._pose_dissimilarity(active_tracks, [det]).reshape(-1)
+            if pose_disim.size and float(np.min(pose_disim)) < pose_thresh:
+                return True
+        return False
 
     def _refine_iou_for_track(self, track: PoseSTrack, iou_row: np.ndarray, det_xyxys: np.ndarray) -> np.ndarray:
         if track.state != TrackState.Lost or track.mean is None:
@@ -754,6 +781,10 @@ class PoseTrack(BYTETracker):
         for inew in u_detection:
             track = detections[inew]
             if track.score < self.args.new_track_thresh:
+                continue
+            # Prefer rejecting duplicate / contained high-score dets over spawning a new ID.
+            live_tracks = self.joint_stracks(activated_stracks, refind_stracks)
+            if self._is_redundant_new_detection(track, live_tracks):
                 continue
             track.activate(
                 self.kalman_filter,

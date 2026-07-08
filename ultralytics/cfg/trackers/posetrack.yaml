@@ -13,11 +13,15 @@ fuse_score: true
 remove_duplicate_stracks: false
 
 # Lost track survival (track_buffer is ignored; use this instead)
-lost_track_max_frames: 8
+lost_track_max_frames: 30
 lost_pose_recall_frames: 4
 motion_pose_recall_max: 0.55
 dead_line_velocity_scale: 0.5
 velocity_bonus_min_speed: 2.0
+
+# Suppress redundant new tracks from unmatched high-score dets
+new_track_ioa_thresh: 0.65
+new_track_pose_dissim_thresh: 0.25
 
 # Motion-gated association: low motion -> pose-heavy, high motion -> box-heavy
 box_weight: 0.25
