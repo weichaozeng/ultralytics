@@ -43,6 +43,12 @@ def _handedness_enabled(args: Any, class_names: dict | list | None = None) -> bo
     return {"left_hand", "right_hand"}.issubset(values) or int(getattr(args, "nc", 0) or 0) == 2
 
 
+def _cls_consistent(track: PoseSTrack, det: PoseSTrack) -> bool:
+    track_cls = int(round(float(getattr(track, "cls", 0))))
+    det_cls = int(round(float(getattr(det, "cls", 0))))
+    return track_cls == det_cls
+
+
 class PoseSTrack(STrack):
     """Single track with box and parent-relative pose Kalman states."""
 
@@ -658,7 +664,9 @@ class PoseTrack(BYTETracker):
                     continue
                 has_iou = iou_row[j] < 1.0
                 in_gate = bbox_maha[j] < box_gate
-                pose_reliable = pose_row[j] < pose_reliable_thresh
+                pose_similar = pose_row[j] < pose_reliable_thresh
+                cls_ok = not self.enable_handedness or _cls_consistent(track, detections[j])
+                pose_reliable = pose_similar and cls_ok
                 if not (has_iou or in_gate or pose_reliable):
                     continue
                 allow_pose_only = young_lost and pose_reliable and motion_conf < motion_pose_recall_max

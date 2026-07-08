@@ -320,6 +320,37 @@ def test_lost_track_expires_within_short_window():
     assert track.state == TrackState.Removed
 
 
+def test_pose_reliable_gate_requires_handedness_match():
+    """pose_reliable candidate bypass requires pose similarity and matching handedness."""
+    args = _tracker_args()
+    args.pose_reliable_thresh = 0.25
+    args.use_maha_gating = False
+    args.proximity_thresh = 0.0
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    img = np.zeros((512, 512, 3), np.uint8)
+
+    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
+    kpts = _hand_skeleton_keypoints(256, 256)[None]
+    tracker.update(boxes, img, keypoints=kpts)
+    track = tracker.tracked_stracks[0]
+    track.mark_lost()
+    tracker.tracked_stracks = []
+    tracker.lost_stracks = [track]
+
+    # Same pose layout but opposite handedness; boxes far apart so IoU gate fails.
+    far_boxes = _FakeBoxes([[420, 420, 120, 120]], [0.9], [0])
+    far_kpts = _hand_skeleton_keypoints(420, 420)[None]
+    det = tracker.init_track(far_boxes, img, keypoints=far_kpts)[0]
+    dists = tracker.get_dists([track], [det], stage=1)
+    assert dists[0, 0] >= 1.0 - 1e-5
+
+    # Matching handedness should allow pose-only recall for young lost tracks.
+    same_cls_boxes = _FakeBoxes([[420, 420, 120, 120]], [0.9], [1])
+    same_cls_det = tracker.init_track(same_cls_boxes, img, keypoints=far_kpts)[0]
+    dists_ok = tracker.get_dists([track], [same_cls_det], stage=1)
+    assert dists_ok[0, 0] < 1.0
+
+
 def test_motion_gated_association_weights():
     args = _tracker_args()
     args.box_weight = 0.25
