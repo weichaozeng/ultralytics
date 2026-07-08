@@ -243,8 +243,8 @@ def test_mark_lost_sets_lost_state():
     assert track.state == TrackState.Lost
 
 
-def test_second_stage_recalls_lost_with_iou():
-    """Stage-2 uses IoU only but may re-activate lost tracks from low-score detections."""
+def test_second_stage_recalls_lost_with_pose():
+    """Stage-2 keeps pose+box matching and may re-activate lost tracks from low-score dets."""
     args = _tracker_args()
     args.track_high_thresh = 0.5
     args.second_match_thresh = 0.5

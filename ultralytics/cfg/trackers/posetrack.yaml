@@ -7,15 +7,15 @@ track_low_thresh: 0.1
 new_track_thresh: 0.25
 track_buffer: 30
 match_thresh: 0.62
-# Stage-2: IoU-only (tracked + lost), between ByteTrack 0.5 and old pose-aware 0.9
-second_match_thresh: 0.6
+# Stage-2: tracked+lost with pose+box dists; lower thresh recovers more low-score matches
+second_match_thresh: 0.5
 fuse_score: true
 remove_duplicate_stracks: false
 
 # Lost track survival (track_buffer is ignored; use this instead)
-lost_track_max_frames: 5
-lost_pose_recall_frames: 3
-motion_pose_recall_max: 0.45
+lost_track_max_frames: 8
+lost_pose_recall_frames: 4
+motion_pose_recall_max: 0.55
 dead_line_velocity_scale: 0.5
 velocity_bonus_min_speed: 2.0
 

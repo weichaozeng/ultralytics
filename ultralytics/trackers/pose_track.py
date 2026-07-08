@@ -475,13 +475,6 @@ class PoseTrack(BYTETracker):
         """BYTE high/low pools use detector box confidence only (same as BoTSORT)."""
         return np.asarray(results.conf, dtype=np.float32)
 
-    def _iou_stage_dists(self, tracks: list[PoseSTrack], detections: list[PoseSTrack]) -> np.ndarray:
-        """Stage-2 cost: IoU distance with optional detection score fusion (no pose terms)."""
-        dists = matching.iou_distance(tracks, detections)
-        if self.args.fuse_score:
-            dists = matching.fuse_score(dists, detections)
-        return dists
-
     @staticmethod
     def _xywh_to_xyxy(xywh: np.ndarray) -> np.ndarray:
         xywh = np.asarray(xywh, dtype=np.float32)
@@ -726,9 +719,11 @@ class PoseTrack(BYTETracker):
         detections_second = self.init_track(
             results_second, keypoints=keypoints_second, det_indices=global_inds[inds_second]
         )
+        # Stage-2: tracked + lost, pose+box association (same metric as stage-1, stage-2 weights).
+        # Box-only BYTE split is kept; stage-2 stays pose-aware so low-score dets can re-id lost tracks.
         r_strack_pool = [strack_pool[i] for i in u_track]
-        dists = self._iou_stage_dists(r_strack_pool, detections_second)
-        second_thresh = float(getattr(self.args, "second_match_thresh", 0.6))
+        dists = self.get_dists(r_strack_pool, detections_second, stage=2)
+        second_thresh = float(getattr(self.args, "second_match_thresh", 0.5))
         matches, u_track, _u_detection_second = matching.linear_assignment(dists, thresh=second_thresh)
         for itracked, idet in matches:
             track = r_strack_pool[itracked]
