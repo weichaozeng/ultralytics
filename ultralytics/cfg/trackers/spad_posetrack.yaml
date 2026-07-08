@@ -42,7 +42,7 @@ pose_weight: 0.75
 pose_weight_second: 0.65
 proximity_thresh: 0.5
 pose_match_thresh: 0.0
-pose_metric: hybrid
+pose_metric: bone
 kpt_conf_thresh: 0.3
 oks_sigma: 0.05
 match_weight_depth: [1.0, 1.0, 0.85, 0.70, 0.50]

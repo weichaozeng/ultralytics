@@ -495,6 +495,25 @@ class PoseTrack(BYTETracker):
         return xyxy
 
     def _pose_dissimilarity(self, tracks: list[PoseSTrack], detections: list[PoseSTrack]) -> np.ndarray:
+        metric = str(getattr(self.args, "pose_metric", "bone")).lower()
+        if metric == "oks":
+            return matching.pose_oks_distance(
+                tracks,
+                detections,
+                sigmas=self._oks_sigma,
+                match_weights=self._match_weights,
+                use_pred_pose=True,
+                conf_thresh=self._kpt_conf_thresh,
+                pose_match_thresh=float(getattr(self.args, "pose_match_thresh", 0.0)),
+            )
+        d_bone = matching.bone_cosine_distance(
+            tracks,
+            detections,
+            use_pred_pose=True,
+            conf_thresh=self._kpt_conf_thresh,
+        )
+        if metric == "bone":
+            return d_bone
         d_oks = matching.pose_oks_distance(
             tracks,
             detections,
@@ -504,17 +523,6 @@ class PoseTrack(BYTETracker):
             conf_thresh=self._kpt_conf_thresh,
             pose_match_thresh=float(getattr(self.args, "pose_match_thresh", 0.0)),
         )
-        d_bone = matching.bone_cosine_distance(
-            tracks,
-            detections,
-            use_pred_pose=True,
-            conf_thresh=self._kpt_conf_thresh,
-        )
-        metric = str(getattr(self.args, "pose_metric", "hybrid")).lower()
-        if metric == "oks":
-            return d_oks
-        if metric == "bone":
-            return d_bone
         return np.minimum(d_oks, d_bone)
 
     def _is_redundant_new_detection(self, det: PoseSTrack, active_tracks: list[PoseSTrack]) -> bool:
