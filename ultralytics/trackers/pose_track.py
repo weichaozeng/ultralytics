@@ -723,7 +723,7 @@ class PoseTrack(BYTETracker):
         # Box-only BYTE split is kept; stage-2 stays pose-aware so low-score dets can re-id lost tracks.
         r_strack_pool = [strack_pool[i] for i in u_track]
         dists = self.get_dists(r_strack_pool, detections_second, stage=2)
-        second_thresh = float(getattr(self.args, "second_match_thresh", 0.5))
+        second_thresh = float(getattr(self.args, "second_match_thresh", 0.8))
         matches, u_track, _u_detection_second = matching.linear_assignment(dists, thresh=second_thresh)
         for itracked, idet in matches:
             track = r_strack_pool[itracked]

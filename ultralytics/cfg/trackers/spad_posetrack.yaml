@@ -7,8 +7,8 @@ track_low_thresh: 0.1
 new_track_thresh: 0.25
 track_buffer: 30
 match_thresh: 0.62
-# Stage-2: tracked+lost with pose+box dists; lower thresh recovers more low-score matches
-second_match_thresh: 0.5
+# Stage-2: tracked+lost with pose+box dists; stricter thresh reduces low-score ID switches
+second_match_thresh: 0.8
 fuse_score: true
 remove_duplicate_stracks: false
 
