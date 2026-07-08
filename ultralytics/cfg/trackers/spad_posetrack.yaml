@@ -19,14 +19,9 @@ motion_pose_recall_max: 0.55
 dead_line_velocity_scale: 0.5
 velocity_bonus_min_speed: 2.0
 
-# Suppress redundant new tracks from unmatched high-score dets (disabled: harmful to recall)
-suppress_redundant_new_tracks: false
-new_track_ioa_thresh: 0.65
-new_track_pose_dissim_thresh: 0.25
-
-# Drop unconfirmed tracks that duplicate an activated track (same cls, IoU>0.6, similar pose)
+# Remove unconfirmed tracks (not yet in result) that duplicate an activated track
 suppress_redundant_unconfirmed: true
-unconfirmed_dup_iou_thresh: 0.6
+unconfirmed_dup_ioa_thresh: 0.65
 unconfirmed_dup_pose_dissim_thresh: 0.25
 
 # Motion-gated association

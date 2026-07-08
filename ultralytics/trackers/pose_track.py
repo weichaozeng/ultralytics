@@ -525,55 +525,44 @@ class PoseTrack(BYTETracker):
         )
         return np.minimum(d_oks, d_bone)
 
-    def _is_redundant_new_detection(self, det: PoseSTrack, active_tracks: list[PoseSTrack]) -> bool:
-        """Return True when an unmatched high-score det duplicates an active track.
-
-        Redundancy criteria (either is enough):
-        1. Det box is largely contained in an active track box (IoA of det area).
-        2. Pose is highly similar to an active track (OKS/bone hybrid dissimilarity).
-        """
-        if not bool(getattr(self.args, "suppress_redundant_new_tracks", False)):
-            return False
+    def _max_det_containment_ioa(self, det: PoseSTrack, active_tracks: list[PoseSTrack]) -> float:
+        """Return max IoA = intersect(det, track) / area(det): how much of det lies inside a track."""
         if not active_tracks:
-            return False
-        ioa_thresh = float(getattr(self.args, "new_track_ioa_thresh", 0.65))
-        pose_thresh = float(getattr(self.args, "new_track_pose_dissim_thresh", 0.25))
-
-        if ioa_thresh > 0:
-            track_xyxy = np.asarray([t.xyxy for t in active_tracks], dtype=np.float32)
-            det_xyxy = np.asarray(det.xyxy, dtype=np.float32).reshape(1, 4)
-            # bbox_ioa(box1, box2) = inter / box2_area → containment of det inside tracks
-            ioa = bbox_ioa(track_xyxy, det_xyxy)
-            if float(np.max(ioa)) >= ioa_thresh:
-                return True
-
-        if pose_thresh > 0:
-            pose_disim = self._pose_dissimilarity(active_tracks, [det]).reshape(-1)
-            if pose_disim.size and float(np.min(pose_disim)) < pose_thresh:
-                return True
-        return False
+            return 0.0
+        track_xyxy = np.asarray([t.xyxy for t in active_tracks], dtype=np.float32)
+        det_xyxy = np.asarray(det.xyxy, dtype=np.float32).reshape(1, 4)
+        return float(np.max(bbox_ioa(track_xyxy, det_xyxy)))
 
     def _is_redundant_unconfirmed(self, track: PoseSTrack, active_tracks: list[PoseSTrack]) -> bool:
         """Return True when an unconfirmed track duplicates an activated track.
 
+        Unconfirmed tracks are spawned from unmatched dets but ``is_activated=False``,
+        so they are kept internally and excluded from ``update()`` results until the
+        next successful match. This removes that redundant pending track when it
+        duplicates an already-activated track.
+
         Redundancy requires all of:
         1. Same handedness / class.
-        2. Box IoU above threshold (default 0.6).
+        2. Unconfirmed box largely contained in an active track (IoA = inter/area(unconfirmed)).
         3. Pose dissimilarity below threshold (bone metric by default).
         """
         if not bool(getattr(self.args, "suppress_redundant_unconfirmed", False)):
             return False
         if not active_tracks:
             return False
-        iou_min = float(getattr(self.args, "unconfirmed_dup_iou_thresh", 0.6))
+        ioa_thresh = float(
+            getattr(
+                self.args,
+                "unconfirmed_dup_ioa_thresh",
+                getattr(self.args, "unconfirmed_dup_iou_thresh", 0.65),
+            )
+        )
         pose_thresh = float(getattr(self.args, "unconfirmed_dup_pose_dissim_thresh", 0.25))
-        iou_cost_max = 1.0 - iou_min
 
         for active in active_tracks:
             if not _cls_consistent(track, active):
                 continue
-            iou_cost = float(matching.iou_distance([track], [active])[0, 0])
-            if iou_cost > iou_cost_max:
+            if self._max_det_containment_ioa(track, [active]) < ioa_thresh:
                 continue
             pose_disim = float(self._pose_dissimilarity([active], [track])[0, 0])
             if pose_disim >= pose_thresh:
@@ -850,10 +839,6 @@ class PoseTrack(BYTETracker):
         for inew in u_detection:
             track = detections[inew]
             if track.score < self.args.new_track_thresh:
-                continue
-            # Prefer rejecting duplicate / contained high-score dets over spawning a new ID.
-            live_tracks = self.joint_stracks(activated_stracks, refind_stracks)
-            if self._is_redundant_new_detection(track, live_tracks):
                 continue
             track.activate(
                 self.kalman_filter,

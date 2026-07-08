@@ -268,34 +268,6 @@ def test_second_stage_recalls_lost_with_pose():
     assert not tracker.lost_stracks
 
 
-def test_redundant_unmatched_high_det_does_not_spawn_new_track():
-    """When enabled, a high-score det contained in / pose-similar to an active track should not create a new ID."""
-    args = _tracker_args()
-    args.suppress_redundant_new_tracks = True
-    args.new_track_ioa_thresh = 0.65
-    args.new_track_pose_dissim_thresh = 0.25
-    args.match_thresh = 0.05  # force association failure so the second det remains unmatched
-    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
-    img = np.zeros((512, 512, 3), np.uint8)
-
-    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.95], [1])
-    kpts = _hand_skeleton_keypoints(256, 256)[None]
-    tracker.update(boxes, img, keypoints=kpts)
-    assert len(tracker.tracked_stracks) == 1
-    tid = int(tracker.tracked_stracks[0].track_id)
-
-    # Same region, highly overlapping second detection that fails matching threshold.
-    boxes2 = _FakeBoxes(
-        [[256, 256, 120, 120], [258, 258, 90, 90]],
-        [0.95, 0.92],
-        [1, 1],
-    )
-    kpts2 = np.stack([_hand_skeleton_keypoints(256, 256), _hand_skeleton_keypoints(258, 258)])
-    tracker.update(boxes2, img, keypoints=kpts2)
-    assert len(tracker.tracked_stracks) == 1
-    assert int(tracker.tracked_stracks[0].track_id) == tid
-
-
 def test_lost_track_expires_within_short_window():
     args = _tracker_args()
     args.lost_track_max_frames = 3
@@ -320,10 +292,10 @@ def test_lost_track_expires_within_short_window():
     assert track.state == TrackState.Removed
 
 
-def test_suppress_redundant_unconfirmed_requires_cls_iou_and_pose():
+def test_suppress_redundant_unconfirmed_requires_cls_ioa_and_pose():
     args = _tracker_args()
     args.suppress_redundant_unconfirmed = True
-    args.unconfirmed_dup_iou_thresh = 0.6
+    args.unconfirmed_dup_ioa_thresh = 0.65
     args.unconfirmed_dup_pose_dissim_thresh = 0.25
     tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
     img = np.zeros((512, 512, 3), np.uint8)
