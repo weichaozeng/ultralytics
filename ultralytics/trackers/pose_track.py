@@ -644,6 +644,7 @@ class PoseTrack(BYTETracker):
         pose_reliable_thresh = float(getattr(self.args, "pose_reliable_thresh", 0.25))
         motion_pose_recall_max = float(getattr(self.args, "motion_pose_recall_max", 0.45))
         use_gating = bool(getattr(self.args, "use_maha_gating", True))
+        use_dead_line = bool(getattr(self.args, "use_dead_line", True))
 
         for i, track in enumerate(tracks):
             if track.mean is None:
@@ -668,7 +669,7 @@ class PoseTrack(BYTETracker):
             dead_lines = np.minimum(track.mean[3], det_xywhs[:, 3]) * dead_line_scale + velocity_pad
 
             for j in range(n):
-                if pixel_dists[j] > dead_lines[j]:
+                if use_dead_line and pixel_dists[j] > dead_lines[j]:
                     continue
                 has_iou = iou_row[j] < 1.0
                 in_gate = bbox_maha[j] < box_gate

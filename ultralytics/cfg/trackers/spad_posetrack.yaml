@@ -48,6 +48,7 @@ oks_sigma: 0.05
 match_weight_depth: [1.0, 1.0, 0.85, 0.70, 0.50]
 box_gate_thresh: 9.488
 dead_line_scale: 3.0
+use_dead_line: false
 pose_reliable_thresh: 0.25
 use_maha_gating: true
 
