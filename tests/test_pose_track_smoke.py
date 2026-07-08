@@ -320,6 +320,44 @@ def test_lost_track_expires_within_short_window():
     assert track.state == TrackState.Removed
 
 
+def test_suppress_redundant_unconfirmed_requires_cls_iou_and_pose():
+    args = _tracker_args()
+    args.suppress_redundant_unconfirmed = True
+    args.unconfirmed_dup_iou_thresh = 0.6
+    args.unconfirmed_dup_pose_dissim_thresh = 0.25
+    tracker = PoseTrack(args, frame_rate=25, class_names={0: "left_hand", 1: "right_hand"})
+    img = np.zeros((512, 512, 3), np.uint8)
+
+    boxes = _FakeBoxes([[256, 256, 120, 120]], [0.9], [1])
+    kpts = _hand_skeleton_keypoints(256, 256)[None]
+    tracker.update(boxes, img, keypoints=kpts)
+    active = tracker.tracked_stracks[0]
+    assert active.is_activated
+
+    dup = tracker.init_track(boxes, img, keypoints=kpts)[0]
+    dup.activate(
+        tracker.kalman_filter,
+        tracker.pose_kalman_filter,
+        tracker.frame_id + 1,
+        enable_handedness=True,
+        cls_init_strength=args.cls_init_strength,
+        kpt_conf_thresh=args.kpt_conf_thresh,
+    )
+    assert not dup.is_activated
+    assert tracker._is_redundant_unconfirmed(dup, [active])
+
+    other_cls = tracker.init_track(_FakeBoxes([[256, 256, 120, 120]], [0.9], [0]), img, keypoints=kpts)[0]
+    other_cls.activate(
+        tracker.kalman_filter,
+        tracker.pose_kalman_filter,
+        tracker.frame_id + 1,
+        enable_handedness=True,
+        cls_init_strength=args.cls_init_strength,
+        kpt_conf_thresh=args.kpt_conf_thresh,
+    )
+    assert not tracker._is_redundant_unconfirmed(other_cls, [active])
+
+
 def test_pose_reliable_gate_requires_handedness_match():
     """pose_reliable candidate bypass requires pose similarity and matching handedness."""
     args = _tracker_args()

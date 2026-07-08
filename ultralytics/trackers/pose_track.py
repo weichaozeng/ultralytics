@@ -553,6 +553,51 @@ class PoseTrack(BYTETracker):
                 return True
         return False
 
+    def _is_redundant_unconfirmed(self, track: PoseSTrack, active_tracks: list[PoseSTrack]) -> bool:
+        """Return True when an unconfirmed track duplicates an activated track.
+
+        Redundancy requires all of:
+        1. Same handedness / class.
+        2. Box IoU above threshold (default 0.6).
+        3. Pose dissimilarity below threshold (bone metric by default).
+        """
+        if not bool(getattr(self.args, "suppress_redundant_unconfirmed", False)):
+            return False
+        if not active_tracks:
+            return False
+        iou_min = float(getattr(self.args, "unconfirmed_dup_iou_thresh", 0.6))
+        pose_thresh = float(getattr(self.args, "unconfirmed_dup_pose_dissim_thresh", 0.25))
+        iou_cost_max = 1.0 - iou_min
+
+        for active in active_tracks:
+            if not _cls_consistent(track, active):
+                continue
+            iou_cost = float(matching.iou_distance([track], [active])[0, 0])
+            if iou_cost > iou_cost_max:
+                continue
+            pose_disim = float(self._pose_dissimilarity([active], [track])[0, 0])
+            if pose_disim >= pose_thresh:
+                continue
+            return True
+        return False
+
+    def _purge_redundant_unconfirmed(
+        self,
+        unconfirmed: list[PoseSTrack],
+        active_tracks: list[PoseSTrack],
+    ) -> tuple[list[PoseSTrack], list[PoseSTrack]]:
+        if not bool(getattr(self.args, "suppress_redundant_unconfirmed", False)):
+            return unconfirmed, []
+        kept: list[PoseSTrack] = []
+        removed: list[PoseSTrack] = []
+        for track in unconfirmed:
+            if self._is_redundant_unconfirmed(track, active_tracks):
+                track.mark_removed()
+                removed.append(track)
+            else:
+                kept.append(track)
+        return kept, removed
+
     def _refine_iou_for_track(self, track: PoseSTrack, iou_row: np.ndarray, det_xyxys: np.ndarray) -> np.ndarray:
         if track.state != TrackState.Lost or track.mean is None:
             return iou_row
@@ -788,6 +833,11 @@ class PoseTrack(BYTETracker):
                 lost_stracks.append(track)
 
         detections = [detections[i] for i in u_detection]
+        live_activated = self.joint_stracks(
+            self.joint_stracks(tracked_stracks, activated_stracks), refind_stracks
+        )
+        unconfirmed, removed_unconfirmed = self._purge_redundant_unconfirmed(unconfirmed, live_activated)
+        removed_stracks.extend(removed_unconfirmed)
         dists = self.get_dists(unconfirmed, detections, stage=1)
         matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
         for itracked, idet in matches:

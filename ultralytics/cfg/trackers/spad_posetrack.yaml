@@ -24,6 +24,11 @@ suppress_redundant_new_tracks: false
 new_track_ioa_thresh: 0.65
 new_track_pose_dissim_thresh: 0.25
 
+# Drop unconfirmed tracks that duplicate an activated track (same cls, IoU>0.6, similar pose)
+suppress_redundant_unconfirmed: true
+unconfirmed_dup_iou_thresh: 0.6
+unconfirmed_dup_pose_dissim_thresh: 0.25
+
 # Motion-gated association
 box_weight: 0.25
 box_weight_second: 0.35
