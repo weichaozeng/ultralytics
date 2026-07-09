@@ -35,7 +35,7 @@ def parse_args():
         default="",
         help="Optional explicit cache root. If omitted, writes beside each sample's renders-spc8kHz tree.",
     )
-    ap.add_argument("--preprocessor", type=str, choices=["sum", "ppb", "stea", "pgfu", "pgga"], required=True)
+    ap.add_argument("--preprocessor", type=str, choices=["sum", "ppb", "stea", "pdrs"], required=True)
     ap.add_argument("--chunk-size", type=int, default=320, help="Raw-bin chunk size per rendered frame.")
     ap.add_argument("--stride-bins", type=int, default=320, help="Stride in raw bins between cached chunks.")
     ap.add_argument("--spad-bins-per-gt", type=int, default=64, help="Raw bins corresponding to one GT frame.")
@@ -74,19 +74,15 @@ def parse_args():
     ap.add_argument("--stea-stable-prior", type=float, default=16.0)
     ap.add_argument("--stea-normalize", type=str, default="true")
     ap.add_argument("--stea-quantile", type=float, default=1.0)
-    ap.add_argument("--pg-fast-window", type=int, default=16)
-    ap.add_argument("--pg-temporal-window", type=int, default=5)
-    ap.add_argument("--pg-fast-tau", type=float, default=6.0)
-    ap.add_argument("--pg-motion-sharpness", type=float, default=60.0)
-    ap.add_argument("--pg-motion-threshold", type=float, default=0.07)
-    ap.add_argument("--pg-stable-prior", type=float, default=16.0)
-    ap.add_argument("--pg-normalize", type=str, default="true")
-    ap.add_argument("--pg-quantile", type=float, default=1.0)
-    ap.add_argument("--pg-beta-min", type=float, default=32.0)
-    ap.add_argument("--pg-cold-start-chunks", type=int, default=1)
-    ap.add_argument("--pgga-eta-min", type=float, default=0.02)
-    ap.add_argument("--pgga-eta-max", type=float, default=0.85)
-    ap.add_argument("--pgga-w-eps", type=float, default=1e-4)
+    ap.add_argument("--pdrs-fast-window", type=int, default=32)
+    ap.add_argument("--pdrs-slow-window", type=int, default=128)
+    ap.add_argument("--pdrs-temporal-window", type=int, default=5)
+    ap.add_argument("--pdrs-fast-tau", type=float, default=6.0)
+    ap.add_argument("--pdrs-motion-sharpness", type=float, default=60.0)
+    ap.add_argument("--pdrs-motion-threshold", type=float, default=0.07)
+    ap.add_argument("--pdrs-stable-prior", type=float, default=16.0)
+    ap.add_argument("--pdrs-normalize", type=str, default="true")
+    ap.add_argument("--pdrs-quantile", type=float, default=1.0)
     return ap.parse_args()
 
 
@@ -110,20 +106,19 @@ def _apply_input_gamma(frame_tchw: torch.Tensor, gamma: float) -> torch.Tensor:
     return torch.pow(torch.clamp(frame_tchw, 0.0, 1.0), 1.0 / gamma)
 
 
-def _build_pg_kwargs(args, *, subsampling: int, chunk_size: int) -> dict[str, Any]:
+def _build_pdrs_kwargs(args, *, subsampling: int, chunk_size: int) -> dict[str, Any]:
     return {
         "subsampling": int(subsampling),
         "chunk_size": int(chunk_size),
-        "fast_window": int(args.pg_fast_window),
-        "temporal_window": int(args.pg_temporal_window),
-        "fast_tau": float(args.pg_fast_tau),
-        "motion_sharpness": float(args.pg_motion_sharpness),
-        "motion_threshold": float(args.pg_motion_threshold),
-        "stable_prior": float(args.pg_stable_prior),
-        "normalize": _as_bool(args.pg_normalize),
-        "quantile": float(args.pg_quantile),
-        "beta_min": float(args.pg_beta_min),
-        "cold_start_chunks": int(args.pg_cold_start_chunks),
+        "fast_window": int(args.pdrs_fast_window),
+        "slow_window": int(args.pdrs_slow_window),
+        "temporal_window": int(args.pdrs_temporal_window),
+        "fast_tau": float(args.pdrs_fast_tau),
+        "motion_sharpness": float(args.pdrs_motion_sharpness),
+        "motion_threshold": float(args.pdrs_motion_threshold),
+        "stable_prior": float(args.pdrs_stable_prior),
+        "normalize": _as_bool(args.pdrs_normalize),
+        "quantile": float(args.pdrs_quantile),
     }
 
 
@@ -154,18 +149,8 @@ def _build_preprocessor_kwargs(args) -> dict[str, Any]:
             "normalize": _as_bool(args.stea_normalize),
             "quantile": float(args.stea_quantile),
         }
-    if name == "pgfu":
-        return _build_pg_kwargs(args, subsampling=subsampling, chunk_size=chunk_size)
-    if name == "pgga":
-        kwargs = _build_pg_kwargs(args, subsampling=subsampling, chunk_size=chunk_size)
-        kwargs.update(
-            {
-                "eta_min": float(args.pgga_eta_min),
-                "eta_max": float(args.pgga_eta_max),
-                "w_eps": float(args.pgga_w_eps),
-            }
-        )
-        return kwargs
+    if name == "pdrs":
+        return _build_pdrs_kwargs(args, subsampling=subsampling, chunk_size=chunk_size)
     raise ValueError(f"Unsupported preprocessor: {name!r}")
 
 

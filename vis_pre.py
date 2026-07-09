@@ -1,7 +1,7 @@
 """Visualize SPAD preprocessors on packed binary `.npy` inputs.
 
 This script is detector-free. It unpacks bit-packed binary arrays, runs one or
-more preprocessors (`sum`, `ppb`, `stea`, `pgfu`, `pgga`), saves per-method
+more preprocessors (`sum`, `ppb`, `stea`, `pdrs`), saves per-method
 reconstructions, and writes side-by-side comparison mosaics.
 
 Supported input layouts
@@ -35,18 +35,16 @@ from ultralytics.data.spad_packed import (
     sum_raw_chunk_to_rgb,
 )
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
-from ultralytics.quanta_pgdr_fusion_networks.integrator import PoissonGammaDevianceFusion
-from ultralytics.quanta_pgdr_gamma_networks.integrator import PoissonGammaDevianceGamma
+from ultralytics.quanta_pdrs_networks.integrator import PoissonDualRateSplit
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation
 
 
-ALL_METHODS = ("sum", "ppb", "stea", "pgfu", "pgga")
+ALL_METHODS = ("sum", "ppb", "stea", "pdrs")
 LABEL_COLORS = {
     "sum": (0, 255, 255),
     "ppb": (0, 255, 0),
     "stea": (255, 0, 255),
-    "pgfu": (0, 128, 255),
-    "pgga": (255, 128, 0),
+    "pdrs": (0, 128, 255),
 }
 
 
@@ -54,7 +52,7 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Visualize SPAD preprocessors on packed binary npy inputs")
     ap.add_argument("--in_path", type=Path, required=True, help="Directory containing binary.npy or a direct .npy path")
     ap.add_argument("--save_dir", type=Path, required=True, help="Output root")
-    ap.add_argument("--pre", type=str, default="sum,ppb,stea,pgfu,pgga", help="Comma-separated preprocessors")
+    ap.add_argument("--pre", type=str, default="sum,ppb,stea,pdrs", help="Comma-separated preprocessors")
     ap.add_argument("--bitdim", type=int, default=2, help="0-based axis to unpack with np.unpackbits")
     ap.add_argument("--expected_w", type=int, default=512, help="Crop unpacked bit dimension to this width")
     ap.add_argument("--bitorder", type=str, default="big", choices=["big", "little"])
@@ -94,20 +92,16 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--stea_kernel_size", type=int, default=None)
     ap.add_argument("--stea_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea_quantile", type=float, default=1.0)
-    # PG-FU / PG-GA
-    ap.add_argument("--pg_fast_window", type=int, default=32)
-    ap.add_argument("--pg_temporal_window", type=int, default=5)
-    ap.add_argument("--pg_fast_tau", type=float, default=6.0)
-    ap.add_argument("--pg_motion_sharpness", type=float, default=60.0)
-    ap.add_argument("--pg_motion_threshold", type=float, default=0.07)
-    ap.add_argument("--pg_stable_prior", type=float, default=16.0)
-    ap.add_argument("--pg_normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--pg_quantile", type=float, default=1.0)
-    ap.add_argument("--pg_beta_min", type=float, default=32.0)
-    ap.add_argument("--pg_cold_start_chunks", type=int, default=1)
-    ap.add_argument("--pgga_eta_min", type=float, default=0.02)
-    ap.add_argument("--pgga_eta_max", type=float, default=0.85)
-    ap.add_argument("--pgga_w_eps", type=float, default=1e-4)
+    # PDRS (Poisson Dual-Rate Split)
+    ap.add_argument("--pdrs_fast_window", type=int, default=32)
+    ap.add_argument("--pdrs_slow_window", type=int, default=128)
+    ap.add_argument("--pdrs_temporal_window", type=int, default=5)
+    ap.add_argument("--pdrs_fast_tau", type=float, default=6.0)
+    ap.add_argument("--pdrs_motion_sharpness", type=float, default=60.0)
+    ap.add_argument("--pdrs_motion_threshold", type=float, default=0.07)
+    ap.add_argument("--pdrs_stable_prior", type=float, default=16.0)
+    ap.add_argument("--pdrs_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--pdrs_quantile", type=float, default=1.0)
     return ap.parse_args()
 
 
@@ -298,20 +292,19 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-def _build_pg_integrator_kwargs(args: argparse.Namespace) -> dict[str, object]:
+def _build_pdrs_integrator_kwargs(args: argparse.Namespace) -> dict[str, object]:
     return {
         "chunk_size": int(args.chunk_size),
-        "fast_window": int(args.pg_fast_window),
-        "temporal_window": int(args.pg_temporal_window),
-        "fast_tau": float(args.pg_fast_tau),
-        "motion_sharpness": float(args.pg_motion_sharpness),
-        "motion_threshold": float(args.pg_motion_threshold),
-        "stable_prior": float(args.pg_stable_prior),
+        "fast_window": int(args.pdrs_fast_window),
+        "slow_window": int(args.pdrs_slow_window),
+        "temporal_window": int(args.pdrs_temporal_window),
+        "fast_tau": float(args.pdrs_fast_tau),
+        "motion_sharpness": float(args.pdrs_motion_sharpness),
+        "motion_threshold": float(args.pdrs_motion_threshold),
+        "stable_prior": float(args.pdrs_stable_prior),
         "subsampling": int(args.chunk_size),
-        "normalize": bool(args.pg_normalize),
-        "quantile": float(args.pg_quantile),
-        "beta_min": float(args.pg_beta_min),
-        "cold_start_chunks": int(args.pg_cold_start_chunks),
+        "normalize": bool(args.pdrs_normalize),
+        "quantile": float(args.pdrs_quantile),
     }
 
 
@@ -340,18 +333,8 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             normalize=bool(args.stea_normalize),
             quantile=float(args.stea_quantile),
         ).to(device)
-    if "pgfu" in preprocessors:
-        out["pgfu"] = PoissonGammaDevianceFusion(**_build_pg_integrator_kwargs(args)).to(device)
-    if "pgga" in preprocessors:
-        pgga_kwargs = dict(_build_pg_integrator_kwargs(args))
-        pgga_kwargs.update(
-            {
-                "eta_min": float(args.pgga_eta_min),
-                "eta_max": float(args.pgga_eta_max),
-                "w_eps": float(args.pgga_w_eps),
-            }
-        )
-        out["pgga"] = PoissonGammaDevianceGamma(**pgga_kwargs).to(device)
+    if "pdrs" in preprocessors:
+        out["pdrs"] = PoissonDualRateSplit(**_build_pdrs_integrator_kwargs(args)).to(device)
     return out
 
 
@@ -406,11 +389,11 @@ def _preprocess_stea_gray(
     return _gray_hwt_to_chw(recons)[-1:].contiguous()
 
 
-def _preprocess_pg_gray(
+def _preprocess_pdrs_gray(
     raw_chunk: np.ndarray,
     *,
     device: torch.device,
-    integrator: PoissonGammaDevianceFusion | PoissonGammaDevianceGamma,
+    integrator: PoissonDualRateSplit,
     clear_states: bool,
 ) -> torch.Tensor:
     cube = _gray_chunk_to_cube(raw_chunk, device)
@@ -442,11 +425,11 @@ def _preprocess_stea_rgb(
     return integrate_raw_chunk_to_rgb(integrator, raw_chunk, packed_nch=3, device=device, clear_states=clear_states)
 
 
-def _preprocess_pg_rgb(
+def _preprocess_pdrs_rgb(
     raw_chunk: np.ndarray,
     *,
     device: torch.device,
-    integrator: PoissonGammaDevianceFusion | PoissonGammaDevianceGamma,
+    integrator: PoissonDualRateSplit,
     clear_states: bool,
 ) -> torch.Tensor:
     return integrate_raw_chunk_to_rgb(integrator, raw_chunk, packed_nch=3, device=device, clear_states=clear_states)
@@ -550,8 +533,8 @@ def _preprocess_chunk(
             return _preprocess_ppb_gray(raw_chunk, device=device, integrator=integrators["ppb"], clear_states=first_chunk)
         if method == "stea":
             return _preprocess_stea_gray(raw_chunk, device=device, integrator=integrators["stea"], clear_states=first_chunk)
-        if method in {"pgfu", "pgga"}:
-            return _preprocess_pg_gray(
+        if method == "pdrs":
+            return _preprocess_pdrs_gray(
                 raw_chunk,
                 device=device,
                 integrator=integrators[method],
@@ -565,8 +548,8 @@ def _preprocess_chunk(
         return _preprocess_ppb_rgb(raw_chunk, device=device, integrator=integrators["ppb"], clear_states=first_chunk)
     if method == "stea":
         return _preprocess_stea_rgb(raw_chunk, device=device, integrator=integrators["stea"], clear_states=first_chunk)
-    if method in {"pgfu", "pgga"}:
-        return _preprocess_pg_rgb(
+    if method == "pdrs":
+        return _preprocess_pdrs_rgb(
             raw_chunk,
             device=device,
             integrator=integrators[method],

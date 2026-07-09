@@ -10,14 +10,7 @@ import torch.nn.functional as F
 
 from ultralytics.quanta_hyb_networks.integrator import HybridSpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
-from ultralytics.quanta_pgdr_fusion_networks.integrator import (
-    PoissonGammaDevianceFusion,
-    PoissonGammaDevianceFusionFrame,
-)
-from ultralytics.quanta_pgdr_gamma_networks.integrator import (
-    PoissonGammaDevianceGamma,
-    PoissonGammaDevianceGammaFrame,
-)
+from ultralytics.quanta_pdrs_networks.integrator import PoissonDualRateSplit, PoissonDualRateSplitFrame
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation, SpatioTemporalEvidenceFrame
 
 
@@ -132,10 +125,8 @@ def build_spad_preprocessor(name: str, *, kwargs: dict[str, Any]) -> nn.Module:
         return PerPixelBayesian(**kwargs)
     if name == "stea":
         return SpatioTemporalEvidenceAccumulation(**kwargs)
-    if name in {"pgfu", "pgdr_fusion", "pgdr-fusion", "pgdr1"}:
-        return PoissonGammaDevianceFusion(**kwargs)
-    if name in {"pgga", "pgdr_gamma", "pgdr-gamma", "pgdr2"}:
-        return PoissonGammaDevianceGamma(**kwargs)
+    if name in {"pdrs", "dual_rate", "dual-rate"}:
+        return PoissonDualRateSplit(**kwargs)
     if name == "hyb":
         return HybridSpatioTemporalEvidenceAccumulation(**kwargs)
     if name == "sum":
@@ -150,10 +141,8 @@ def build_spad_frame_preprocessor(name: str, *, kwargs: dict[str, Any]) -> nn.Mo
         return PerPixelBayesianFrame(**kwargs)
     if name == "stea":
         return SpatioTemporalEvidenceFrame(**kwargs)
-    if name in {"pgfu", "pgdr_fusion", "pgdr-fusion", "pgdr1"}:
-        return PoissonGammaDevianceFusionFrame(**kwargs)
-    if name in {"pgga", "pgdr_gamma", "pgdr-gamma", "pgdr2"}:
-        return PoissonGammaDevianceGammaFrame(**kwargs)
+    if name in {"pdrs", "dual_rate", "dual-rate"}:
+        return PoissonDualRateSplitFrame(**kwargs)
     if name == "sum":
         return SumPreprocessor(**kwargs)
     raise ValueError(f"Unsupported frame-mode SPAD preprocessor: {name!r}")

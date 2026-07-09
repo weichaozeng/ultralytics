@@ -839,7 +839,7 @@ class SpadPoseModel(PoseModel):
     def _spad_process_full_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
         """Process one full raw SPAD window into reconstructed frames."""
         name = str(getattr(self, "preprocessor_name", "")).strip().lower()
-        if name in {"stea", "pgfu", "pgga", "pgdr_fusion", "pgdr-fusion", "pgdr1", "pgdr_gamma", "pgdr-gamma", "pgdr2"}:
+        if name in {"stea", "pdrs", "dual_rate", "dual-rate"}:
             return self._spad_process_chunked_window(photon_cube)
         return self.preprocessor.process_photon_cube(photon_cube, clear_states=True)
 
