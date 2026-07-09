@@ -9,13 +9,15 @@ from a frozen reference (the failure mode of chunk-entry Poisson deviance).
   λ_f(t)  fast causal conv  — reacts in O(fast_window) bins (PPB-like responsiveness)
   λ_s(t)  slow causal conv  — long memory baseline (STEA-like stability)
 
-  score(t) = r log(r) - r + 1,  r = λ_f/λ_s   scale-invariant Poisson KL (zero when rates agree)
+Phase-1 adaptive mapping (no fixed motion/stable thresholds):
 
-After a changepoint λ_f moves first → score spikes → reverse-cummax fusion uses λ_f.
-Once λ_s catches up, score relaxes → stable photon integration resumes without drag.
+  z(t) = (λ_f - λ_s)² / (Var(λ_f) + Var(λ_s)),  Var ≈ λ / window
+  p_motion(t) = z / (z + 1)
 
-Fusion weight follows PPB-style run-length mapping:
-  w_stable = 1 - exp(-L / τ),  L = accumulated stable support in the chunk.
+  L = reverse-cummax stable support (effective stable run length in the chunk)
+  w_fast = 1 - exp(-1 / L)          — same form as PPB sample_weight
+  w_stable = 1 - w_fast
+  fused = w_stable * mean_stable + w_fast * λ_f
 
 Parallel path: dual conv1d over the full chunk (STEA-style). Streaming fallback for long T.
 """
@@ -32,12 +34,20 @@ from ultralytics.quanta_neural_networks.ops.array_ops import torch_quantile
 from ultralytics.quanta_neural_networks.ops.image import nearest_neighbor_inpaint
 
 
-def poisson_rate_kl(lam_f: Tensor, lam_s: Tensor, eps: float) -> Tensor:
-    """Scale-invariant Poisson KL via rate ratio r = λ_f/λ_s: r log(r) - r + 1."""
-    lf = lam_f.float().clamp(min=eps)
-    ls = lam_s.float().clamp(min=eps)
-    ratio = (lf / ls).clamp(min=eps, max=1.0 / eps)
-    return ratio * torch.log(ratio) - ratio + 1.0
+def dual_rate_z_score(
+    lam_f: Tensor,
+    lam_s: Tensor,
+    fast_window: int,
+    slow_window: int,
+    eps: float,
+) -> Tensor:
+    """Variance-normalized squared rate gap; ~χ²(1) under equal-rate null."""
+    lf = lam_f.float()
+    ls = lam_s.float()
+    var_f = lf.clamp(min=eps) / max(int(fast_window), 1)
+    var_s = ls.clamp(min=eps) / max(int(slow_window), 1)
+    delta = lf - ls
+    return delta.square() / (var_f + var_s + eps)
 
 
 class PoissonDualRateSplit(nn.Module):
@@ -47,30 +57,26 @@ class PoissonDualRateSplit(nn.Module):
         slow_window: int = 128,
         temporal_window: int = 5,
         fast_tau: float | None = None,
-        motion_sharpness: float = 60.0,
-        motion_threshold: float = 0.07,
         fusion_pool_size: int = 7,
         eps: float = 1e-5,
-        stable_tau: float = 32.0,
-        stable_prior: float | None = None,
         chunk_size: int = 320,
         subsampling: int = 1,
         hot_pixel_mask: np.ndarray | None = None,
         normalize: bool = False,
         quantile: float = 1.0,
+        # Legacy kwargs accepted for API compat; ignored by phase-1 adaptive mapping.
+        motion_sharpness: float | None = None,
+        motion_threshold: float | None = None,
+        stable_tau: float | None = None,
+        stable_prior: float | None = None,
     ):
         super().__init__()
         self.fast_window = max(int(fast_window), 1)
         self.slow_window = max(int(slow_window), 1)
         self.temporal_window = max(int(temporal_window), 1)
         self.fast_tau = float(fast_tau) if fast_tau is not None else max(self.fast_window / 4.0, 1.0)
-        self.motion_sharpness = float(motion_sharpness)
-        self.motion_threshold = float(motion_threshold)
         self.fusion_pool_size = max(int(fusion_pool_size), 1)
         self.eps = float(eps)
-        if stable_prior is not None:
-            stable_tau = float(stable_prior)
-        self.stable_tau = float(stable_tau)
         self.chunk_size = max(int(chunk_size), 1)
         self.subsampling = max(int(subsampling), 1)
         self.hot_pixel_mask = hot_pixel_mask
@@ -88,8 +94,7 @@ class PoissonDualRateSplit(nn.Module):
         return (
             f"{self.__class__.__name__}(fast_window={self.fast_window}, "
             f"slow_window={self.slow_window}, temporal_window={self.temporal_window}, "
-            f"motion_threshold={self.motion_threshold}, fusion_pool_size={self.fusion_pool_size}, "
-            f"stable_tau={self.stable_tau})"
+            f"fusion_pool_size={self.fusion_pool_size})"
         )
 
     @staticmethod
@@ -112,20 +117,23 @@ class PoissonDualRateSplit(nn.Module):
         rebuild_keys = {"fast_window", "slow_window", "temporal_window", "fast_tau"}
         if kwargs.get("kernel_size") is not None and kwargs.get("slow_window") is None:
             kwargs["slow_window"] = kwargs.pop("kernel_size")
-        for alias, target in (
-            ("sharpness", "motion_sharpness"),
-            ("bias", "motion_threshold"),
-            ("stable_prior", "stable_tau"),
+        # Drop legacy threshold kwargs silently.
+        for legacy in (
+            "motion_sharpness",
+            "motion_threshold",
+            "stable_tau",
+            "stable_prior",
+            "sharpness",
+            "bias",
         ):
-            if kwargs.get(alias) is not None and kwargs.get(target) is None:
-                kwargs[target] = kwargs.pop(alias)
+            kwargs.pop(legacy, None)
         needs_rebuild = False
         for name, value in kwargs.items():
             if not hasattr(self, name) or value is None:
                 continue
             if name in {"fast_window", "slow_window", "temporal_window", "chunk_size", "subsampling", "fusion_pool_size"}:
                 value = max(int(value), 1)
-            elif name in {"fast_tau", "motion_sharpness", "motion_threshold", "eps", "stable_tau", "quantile"}:
+            elif name in {"fast_tau", "eps", "quantile"}:
                 value = float(value)
             elif name == "normalize":
                 value = bool(value)
@@ -187,8 +195,16 @@ class PoissonDualRateSplit(nn.Module):
         x = x_hw.unsqueeze(0).unsqueeze(0)
         return -F.max_pool2d(-x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
 
-    def _motion_from_score(self, score: Tensor) -> Tensor:
-        return torch.sigmoid(self.motion_sharpness * (score - self.motion_threshold))
+    @staticmethod
+    def _motion_from_score(score: Tensor) -> Tensor:
+        s = score.float().clamp(min=0.0)
+        return s / (s + 1.0)
+
+    @staticmethod
+    def _stable_weight_from_length(stable_len: Tensor) -> Tensor:
+        """PPB-isomorphic: short L → trust fast; long L → trust stable."""
+        l_eff = stable_len.float().clamp(min=1.0)
+        return torch.exp(-1.0 / l_eff)
 
     def _smooth_score(self, score_hwt: Tensor) -> Tensor:
         hist = self._history_or_zeros(
@@ -226,11 +242,10 @@ class PoissonDualRateSplit(nn.Module):
             stable_num += valid_weight * x[..., ti]
             stable_den += valid_weight
         mean_stable = stable_num / stable_den.clamp(min=self.eps)
-        w_stable = 1.0 - torch.exp(-stable_den / max(self.stable_tau, self.eps))
+        w_stable = self._stable_weight_from_length(stable_den)
         w_stable = self._min_pool_hw(w_stable, self.fusion_pool_size)
         fused_last = w_stable * mean_stable + (1.0 - w_stable) * lam_f_last
-        w_mean = w_stable
-        return fused_last, w_mean
+        return fused_last, w_stable
 
     def _save_histories(self, x: Tensor, score_hwt: Tensor | None) -> None:
         max_photon_hist = max(self.fast_window, self.slow_window) - 1
@@ -251,7 +266,7 @@ class PoissonDualRateSplit(nn.Module):
         x = photon_cube.float()
         lam_f, lam_s = self._temporal_basis(x)
         lam_f_last = lam_f[..., -1]
-        score_raw = poisson_rate_kl(lam_f, lam_s, self.eps)
+        score_raw = dual_rate_z_score(lam_f, lam_s, self.fast_window, self.slow_window, self.eps)
         del lam_s
         score_smooth = self._smooth_score(score_raw)
         p_motion = self._motion_from_score(score_smooth)
@@ -286,7 +301,7 @@ class PoissonDualRateSplit(nn.Module):
             lam_f_t = self._causal_conv1d(x_flat, self.fast_kernel, fast_hist).reshape(h, w).clamp(min=self.eps)
             lam_s_t = self._causal_conv1d(x_flat, self.slow_kernel, slow_hist).reshape(h, w).clamp(min=self.eps)
             lam_f_last = lam_f_t
-            score_t = poisson_rate_kl(lam_f_t, lam_s_t, self.eps).unsqueeze(-1)
+            score_t = dual_rate_z_score(lam_f_t, lam_s_t, self.fast_window, self.slow_window, self.eps).unsqueeze(-1)
             score_sm = self._smooth_score_step(score_t, score_hist)
             p_motion[..., ti] = self._motion_from_score(score_sm)
             fast_hist = self._append_temporal_history(fast_hist, x_t, self.fast_window - 1)
@@ -321,11 +336,8 @@ class PoissonDualRateSplit(nn.Module):
         slow_window: int | None = None,
         temporal_window: int | None = None,
         fast_tau: float | None = None,
-        motion_sharpness: float | None = None,
-        motion_threshold: float | None = None,
         fusion_pool_size: int | None = None,
         eps: float | None = None,
-        stable_tau: float | None = None,
         parallel: bool | None = None,
         **kwargs,
     ) -> Tensor:
@@ -343,11 +355,8 @@ class PoissonDualRateSplit(nn.Module):
             slow_window=slow_window,
             temporal_window=temporal_window,
             fast_tau=fast_tau,
-            motion_sharpness=motion_sharpness,
-            motion_threshold=motion_threshold,
             fusion_pool_size=fusion_pool_size,
             eps=eps,
-            stable_tau=stable_tau,
             **kwargs,
         )
 

@@ -97,10 +97,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--pdrs_slow_window", type=int, default=128)
     ap.add_argument("--pdrs_temporal_window", type=int, default=5)
     ap.add_argument("--pdrs_fast_tau", type=float, default=6.0)
-    ap.add_argument("--pdrs_motion_sharpness", type=float, default=60.0)
-    ap.add_argument("--pdrs_motion_threshold", type=float, default=0.07)
     ap.add_argument("--pdrs_fusion_pool_size", type=int, default=7)
-    ap.add_argument("--pdrs_stable_tau", type=float, default=32.0)
     ap.add_argument("--pdrs_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--pdrs_quantile", type=float, default=1.0)
     return ap.parse_args()
@@ -300,10 +297,7 @@ def _build_pdrs_integrator_kwargs(args: argparse.Namespace) -> dict[str, object]
         "slow_window": int(args.pdrs_slow_window),
         "temporal_window": int(args.pdrs_temporal_window),
         "fast_tau": float(args.pdrs_fast_tau),
-        "motion_sharpness": float(args.pdrs_motion_sharpness),
-        "motion_threshold": float(args.pdrs_motion_threshold),
         "fusion_pool_size": int(args.pdrs_fusion_pool_size),
-        "stable_tau": float(args.pdrs_stable_tau),
         "subsampling": int(args.chunk_size),
         "normalize": bool(args.pdrs_normalize),
         "quantile": float(args.pdrs_quantile),
