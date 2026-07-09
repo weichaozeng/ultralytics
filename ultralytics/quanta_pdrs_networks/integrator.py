@@ -11,8 +11,11 @@ from a frozen reference (the failure mode of chunk-entry Poisson deviance).
 
 Phase-1 adaptive mapping (no fixed motion/stable thresholds):
 
-  z(t) = (λ_f - λ_s)² / (Var(λ_f) + Var(λ_s)),  Var ≈ λ / window
+  z(t) = (λ_f - λ_s)² / (λ_s · (Σw_s² + min(Σw_f², Σw_s²)))
   p_motion(t) = z / (z + 1)
+
+  Null variance uses slow rate and caps fast-kernel uncertainty so smaller
+  fast_window sharpens λ_f without suppressing motion detection.
 
   L = reverse-cummax stable support (effective stable run length in the chunk)
   w_fast = 1 - exp(-1 / L)          — same form as PPB sample_weight
@@ -37,17 +40,21 @@ from ultralytics.quanta_neural_networks.ops.image import nearest_neighbor_inpain
 def dual_rate_z_score(
     lam_f: Tensor,
     lam_s: Tensor,
-    fast_window: int,
-    slow_window: int,
+    fast_w_sq: Tensor | float,
+    slow_w_sq: Tensor | float,
     eps: float,
 ) -> Tensor:
-    """Variance-normalized squared rate gap; ~χ²(1) under equal-rate null."""
+    """Variance-normalized squared rate gap; null rate anchored on slow branch."""
     lf = lam_f.float()
-    ls = lam_s.float()
-    var_f = lf.clamp(min=eps) / max(int(fast_window), 1)
-    var_s = ls.clamp(min=eps) / max(int(slow_window), 1)
+    ls = lam_s.float().clamp(min=eps)
     delta = lf - ls
-    return delta.square() / (var_f + var_s + eps)
+    fast_var = torch.minimum(
+        torch.as_tensor(fast_w_sq, device=ls.device, dtype=ls.dtype),
+        torch.as_tensor(slow_w_sq, device=ls.device, dtype=ls.dtype),
+    )
+    slow_var = torch.as_tensor(slow_w_sq, device=ls.device, dtype=ls.dtype)
+    var_null = ls * (slow_var + fast_var)
+    return delta.square() / (var_null + eps)
 
 
 class PoissonDualRateSplit(nn.Module):
@@ -106,12 +113,17 @@ class PoissonDualRateSplit(nn.Module):
             device = self.fast_kernel.device
         device = device or "cpu"
         gamma_age = torch.arange(self.fast_window, 0, -1, dtype=torch.float32)
-        fast = gamma_age * torch.exp(-gamma_age / max(self.fast_tau, 1e-6))
+        effective_tau = min(max(self.fast_tau, 1e-6), max(self.fast_window / 2.0, 1.0))
+        fast = gamma_age * torch.exp(-gamma_age / effective_tau)
         slow = torch.ones(self.slow_window, dtype=torch.float32)
         stea = torch.ones((1, 1, self.temporal_window, 3, 3), dtype=torch.float32)
         self.register_buffer("fast_kernel", self._normalize_kernel(fast).view(1, 1, -1).to(device))
         self.register_buffer("slow_kernel", self._normalize_kernel(slow).view(1, 1, -1).to(device))
         self.register_buffer("stea_kernel", self._normalize_kernel(stea).to(device))
+        fast_norm = self._normalize_kernel(fast)
+        slow_norm = self._normalize_kernel(slow)
+        self.register_buffer("fast_w_sq", fast_norm.square().sum().to(device))
+        self.register_buffer("slow_w_sq", slow_norm.square().sum().to(device))
 
     def update_hyperparams(self, **kwargs) -> None:
         rebuild_keys = {"fast_window", "slow_window", "temporal_window", "fast_tau"}
@@ -266,7 +278,7 @@ class PoissonDualRateSplit(nn.Module):
         x = photon_cube.float()
         lam_f, lam_s = self._temporal_basis(x)
         lam_f_last = lam_f[..., -1]
-        score_raw = dual_rate_z_score(lam_f, lam_s, self.fast_window, self.slow_window, self.eps)
+        score_raw = dual_rate_z_score(lam_f, lam_s, self.fast_w_sq, self.slow_w_sq, self.eps)
         del lam_s
         score_smooth = self._smooth_score(score_raw)
         p_motion = self._motion_from_score(score_smooth)
@@ -301,7 +313,7 @@ class PoissonDualRateSplit(nn.Module):
             lam_f_t = self._causal_conv1d(x_flat, self.fast_kernel, fast_hist).reshape(h, w).clamp(min=self.eps)
             lam_s_t = self._causal_conv1d(x_flat, self.slow_kernel, slow_hist).reshape(h, w).clamp(min=self.eps)
             lam_f_last = lam_f_t
-            score_t = dual_rate_z_score(lam_f_t, lam_s_t, self.fast_window, self.slow_window, self.eps).unsqueeze(-1)
+            score_t = dual_rate_z_score(lam_f_t, lam_s_t, self.fast_w_sq, self.slow_w_sq, self.eps).unsqueeze(-1)
             score_sm = self._smooth_score_step(score_t, score_hist)
             p_motion[..., ti] = self._motion_from_score(score_sm)
             fast_hist = self._append_temporal_history(fast_hist, x_t, self.fast_window - 1)

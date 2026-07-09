@@ -81,7 +81,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
     # STEA
-    ap.add_argument("--stea_fast_window", type=int, default=32)
+    ap.add_argument("--stea_fast_window", type=int, default=16)
     ap.add_argument("--stea_slow_window", type=int, default=128)
     ap.add_argument("--stea_temporal_window", type=int, default=5)
     ap.add_argument("--stea_fast_tau", type=float, default=6.0)

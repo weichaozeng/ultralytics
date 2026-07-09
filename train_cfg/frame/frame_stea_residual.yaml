@@ -23,7 +23,7 @@ spad_cache_mode: auto
 
 # preprocessor
 spad_preprocessor: stea
-stea_fast_window: 32
+stea_fast_window: 16
 stea_slow_window: 128
 stea_temporal_window: 5
 stea_fast_tau: 6.0

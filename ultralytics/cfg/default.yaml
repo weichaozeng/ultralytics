@@ -176,7 +176,7 @@ ppb_bocpd_gamma: 0.0005 # (float) BOCPD hazard rate for PerPixelBayesian
 ppb_quantile: 1.0 # (float) normalization quantile for PerPixelBayesian
 ppb_normalize: True # (bool) normalize PerPixelBayesian reconstructions
 ppb_min_filter_size: 7 # (int) odd min-filter size for PerPixelBayesian
-stea_fast_window: 32 # (int) fast Gamma temporal basis length for STEA
+stea_fast_window: 16 # (int) fast Gamma temporal basis length for STEA
 stea_slow_window: 128 # (int) slow boxcar temporal basis length for STEA
 stea_temporal_window: 5 # (int) causal evidence blur window for STEA
 stea_fast_tau: 6.0 # (float) Gamma tau for the fast STEA basis

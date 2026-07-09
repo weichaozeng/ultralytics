@@ -284,7 +284,7 @@ def parse_args():
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb-min-filter-size", type=int, default=7)
-    ap.add_argument("--stea-fast-window", type=int, default=32)
+    ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
     ap.add_argument("--stea-temporal-window", type=int, default=5)
     ap.add_argument("--stea-fast-tau", type=float, default=6.0)
