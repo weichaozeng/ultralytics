@@ -81,13 +81,15 @@ def causal_window_sum_step(x_hw1: Tensor, hist_hwt: Tensor, window: int) -> Tens
 
 
 def causal_window_sum_full(x_hwt: Tensor, hist_hwt: Tensor, window: int) -> Tensor:
+    """Sliding window sum via conv1d (no Python loop over time)."""
     h, w, t = map(int, x_hwt.shape)
+    window = max(int(window), 1)
     hist = history_or_zeros(hist_hwt, h, w, window - 1, x_hwt)
-    context = torch.cat([hist, x_hwt], dim=-1)
-    sums = []
-    for ti in range(t):
-        sums.append(context[..., ti : ti + window].sum(dim=-1, keepdim=True))
-    return torch.cat(sums, dim=-1)
+    seq = torch.cat([hist, x_hwt], dim=-1)
+    seq_flat = seq.reshape(h * w, 1, window - 1 + t)
+    kernel = x_hwt.new_ones(1, 1, window)
+    out = F.conv1d(seq_flat, kernel)[..., :t]
+    return out.reshape(h, w, t)
 
 
 def smooth_deviance_step(d_raw_hw1: Tensor, d_hist: Tensor, stea_kernel: Tensor) -> Tensor:
@@ -111,5 +113,60 @@ def motion_gate(d_smooth: Tensor, sharpness: float, threshold: float) -> Tensor:
     return torch.sigmoid(float(sharpness) * (d_smooth - float(threshold)))
 
 
-def reverse_future_motion(p_motion_hwt: Tensor) -> Tensor:
-    return torch.flip(torch.flip(p_motion_hwt, dims=(-1,)).cummax(dim=-1).values, dims=(-1,))
+def fuse_stea_style(
+    x: Tensor,
+    p_motion: Tensor,
+    y_fast_last: Tensor,
+    *,
+    stable_prior: float,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Reverse running-max fusion without materializing (H,W,T) mask tensors."""
+    h, w, t = map(int, x.shape)
+    running_max = x.new_zeros(h, w)
+    stable_num = x.new_zeros(h, w)
+    stable_den = x.new_zeros(h, w)
+    for ti in range(t - 1, -1, -1):
+        running_max = torch.maximum(running_max, p_motion[..., ti])
+        valid_weight = 1.0 - running_max
+        stable_num += valid_weight * x[..., ti]
+        stable_den += valid_weight
+    mean_stable = stable_num / stable_den.clamp(min=eps)
+    w_mean = stable_den / (stable_den + max(float(stable_prior), eps))
+    fused_last = w_mean * mean_stable + (1.0 - w_mean) * y_fast_last
+    return fused_last, stable_num, stable_den, w_mean
+
+
+def compute_motion_weights_parallel(
+    x: Tensor,
+    *,
+    mu_ref: Tensor,
+    fast_kernel: Tensor,
+    stea_kernel: Tensor,
+    photon_history: Tensor | None,
+    d_history: Tensor | None,
+    fast_window: int,
+    motion_sharpness: float,
+    motion_threshold: float,
+    eps: float,
+    cold_start: bool,
+) -> tuple[Tensor, Tensor, Tensor | None]:
+    """Compact parallel motion path: keep only p_motion, y_fast_last, d_hist tail."""
+    h, w, t = map(int, x.shape)
+    sum_hist = history_or_zeros(photon_history, h, w, fast_window - 1, x)
+    k_fast = causal_window_sum_full(x, sum_hist, fast_window)
+    d_raw = poisson_deviance(k_fast, mu_ref, eps=eps)
+    del k_fast
+    d_hist_tail = (
+        d_raw[..., -int(stea_kernel.shape[2]) + 1 :].detach()
+        if int(stea_kernel.shape[2]) > 1
+        else None
+    )
+    d_smooth = smooth_deviance_full(d_raw, d_history, stea_kernel)
+    del d_raw
+    p_motion = motion_gate(d_smooth, motion_sharpness, motion_threshold)
+    del d_smooth
+    if cold_start:
+        p_motion = p_motion * 0.0
+    y_fast_last = causal_conv1d_full(x, fast_kernel, sum_hist)[..., -1].clamp(eps, 1.0 - eps)
+    return p_motion, y_fast_last, d_hist_tail

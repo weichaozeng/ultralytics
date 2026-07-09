@@ -1,7 +1,7 @@
 """Visualize SPAD preprocessors on packed binary `.npy` inputs.
 
 This script is detector-free. It unpacks bit-packed binary arrays, runs one or
-more preprocessors (`sum`, `ppb`, `vel`, `stea`, `hyb`), saves per-method
+more preprocessors (`sum`, `ppb`, `stea`, `pgfu`, `pgga`), saves per-method
 reconstructions, and writes side-by-side comparison mosaics.
 
 Supported input layouts
@@ -34,19 +34,19 @@ from ultralytics.data.spad_packed import (
     raw_plane_to_photon_cube,
     sum_raw_chunk_to_rgb,
 )
-from ultralytics.quanta_hyb_networks.integrator import HybridSpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
+from ultralytics.quanta_pgdr_fusion_networks.integrator import PoissonGammaDevianceFusion
+from ultralytics.quanta_pgdr_gamma_networks.integrator import PoissonGammaDevianceGamma
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation
-from ultralytics.quanta_vel_networks.integrator import VelIntegrator
 
 
-ALL_METHODS = ("sum", "ppb", "vel", "stea", "hyb")
+ALL_METHODS = ("sum", "ppb", "stea", "pgfu", "pgga")
 LABEL_COLORS = {
     "sum": (0, 255, 255),
     "ppb": (0, 255, 0),
-    "vel": (255, 128, 0),
     "stea": (255, 0, 255),
-    "hyb": (128, 0, 255),
+    "pgfu": (0, 128, 255),
+    "pgga": (255, 128, 0),
 }
 
 
@@ -54,7 +54,7 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Visualize SPAD preprocessors on packed binary npy inputs")
     ap.add_argument("--in_path", type=Path, required=True, help="Directory containing binary.npy or a direct .npy path")
     ap.add_argument("--save_dir", type=Path, required=True, help="Output root")
-    ap.add_argument("--pre", type=str, default="sum,ppb,vel,stea,hyb", help="Comma-separated preprocessors")
+    ap.add_argument("--pre", type=str, default="sum,ppb,stea,pgfu,pgga", help="Comma-separated preprocessors")
     ap.add_argument("--bitdim", type=int, default=2, help="0-based axis to unpack with np.unpackbits")
     ap.add_argument("--expected_w", type=int, default=512, help="Crop unpacked bit dimension to this width")
     ap.add_argument("--bitorder", type=str, default="big", choices=["big", "little"])
@@ -94,24 +94,20 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--stea_kernel_size", type=int, default=None)
     ap.add_argument("--stea_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea_quantile", type=float, default=1.0)
-    # HYB
-    ap.add_argument("--hyb_fast_window", type=int, default=16)
-    ap.add_argument("--hyb_slow_window", type=int, default=128)
-    ap.add_argument("--hyb_temporal_window", type=int, default=5)
-    ap.add_argument("--hyb_fast_tau", type=float, default=6.0)
-    ap.add_argument("--hyb_motion_sharpness", type=float, default=60.0)
-    ap.add_argument("--hyb_motion_threshold", type=float, default=0.05)
-    ap.add_argument("--hyb_eps", type=float, default=1e-5)
-    ap.add_argument("--hyb_blend_const", type=float, default=16.0)
-    ap.add_argument("--hyb_kernel_size", type=int, default=None)
-    ap.add_argument("--hyb_normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--hyb_quantile", type=float, default=1.0)
-    ap.add_argument("--hyb_warp_block_size", type=int, default=16)
-    # VEL
-    ap.add_argument("--vel_max_shift", type=int, default=16)
-    ap.add_argument("--vel_patch_size", type=int, default=0)
-    ap.add_argument("--vel_quantile", type=float, default=1.0)
-    ap.add_argument("--vel_normalize", action=argparse.BooleanOptionalAction, default=False)
+    # PG-FU / PG-GA
+    ap.add_argument("--pg_fast_window", type=int, default=16)
+    ap.add_argument("--pg_temporal_window", type=int, default=5)
+    ap.add_argument("--pg_fast_tau", type=float, default=6.0)
+    ap.add_argument("--pg_motion_sharpness", type=float, default=60.0)
+    ap.add_argument("--pg_motion_threshold", type=float, default=0.05)
+    ap.add_argument("--pg_stable_prior", type=float, default=16.0)
+    ap.add_argument("--pg_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--pg_quantile", type=float, default=1.0)
+    ap.add_argument("--pg_beta_min", type=float, default=32.0)
+    ap.add_argument("--pg_cold_start_chunks", type=int, default=1)
+    ap.add_argument("--pgga_eta_min", type=float, default=0.02)
+    ap.add_argument("--pgga_eta_max", type=float, default=0.85)
+    ap.add_argument("--pgga_w_eps", type=float, default=1e-4)
     return ap.parse_args()
 
 
@@ -302,6 +298,23 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def _build_pg_integrator_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "chunk_size": int(args.chunk_size),
+        "fast_window": int(args.pg_fast_window),
+        "temporal_window": int(args.pg_temporal_window),
+        "fast_tau": float(args.pg_fast_tau),
+        "motion_sharpness": float(args.pg_motion_sharpness),
+        "motion_threshold": float(args.pg_motion_threshold),
+        "stable_prior": float(args.pg_stable_prior),
+        "subsampling": int(args.chunk_size),
+        "normalize": bool(args.pg_normalize),
+        "quantile": float(args.pg_quantile),
+        "beta_min": float(args.pg_beta_min),
+        "cold_start_chunks": int(args.pg_cold_start_chunks),
+    }
+
+
 def _build_integrators(args: argparse.Namespace, device: torch.device, preprocessors: list[str]) -> dict[str, object]:
     out: dict[str, object] = {}
     if "ppb" in preprocessors:
@@ -311,23 +324,6 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             normalize=bool(args.ppb_normalize),
             quantile=float(args.ppb_quantile),
             min_filter_size=int(args.ppb_min_filter_size),
-        ).to(device)
-    if "vel" in preprocessors:
-        out["vel_rgb"] = VelIntegrator(
-            chunk_size=int(args.chunk_size),
-            max_shift=int(args.vel_max_shift),
-            patch_size=int(args.vel_patch_size),
-            compensate_space="rgb",
-            normalize=bool(args.vel_normalize),
-            quantile=float(args.vel_quantile),
-        ).to(device)
-        out["vel_raw"] = VelIntegrator(
-            chunk_size=int(args.chunk_size),
-            max_shift=int(args.vel_max_shift),
-            patch_size=int(args.vel_patch_size),
-            compensate_space="raw",
-            normalize=bool(args.vel_normalize),
-            quantile=float(args.vel_quantile),
         ).to(device)
     if "stea" in preprocessors:
         out["stea"] = SpatioTemporalEvidenceAccumulation(
@@ -344,22 +340,18 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             normalize=bool(args.stea_normalize),
             quantile=float(args.stea_quantile),
         ).to(device)
-    if "hyb" in preprocessors:
-        out["hyb"] = HybridSpatioTemporalEvidenceAccumulation(
-            chunk_size=int(args.chunk_size),
-            fast_window=int(args.hyb_fast_window),
-            slow_window=int(args.hyb_kernel_size or args.hyb_slow_window),
-            temporal_window=int(args.hyb_temporal_window),
-            fast_tau=float(args.hyb_fast_tau),
-            motion_sharpness=float(args.hyb_motion_sharpness),
-            motion_threshold=float(args.hyb_motion_threshold),
-            eps=float(args.hyb_eps),
-            stable_prior=float(args.hyb_blend_const),
-            subsampling=int(args.chunk_size),
-            normalize=bool(args.hyb_normalize),
-            quantile=float(args.hyb_quantile),
-            warp_block_size=int(args.hyb_warp_block_size),
-        ).to(device)
+    if "pgfu" in preprocessors:
+        out["pgfu"] = PoissonGammaDevianceFusion(**_build_pg_integrator_kwargs(args)).to(device)
+    if "pgga" in preprocessors:
+        pgga_kwargs = dict(_build_pg_integrator_kwargs(args))
+        pgga_kwargs.update(
+            {
+                "eta_min": float(args.pgga_eta_min),
+                "eta_max": float(args.pgga_eta_max),
+                "w_eps": float(args.pgga_w_eps),
+            }
+        )
+        out["pgga"] = PoissonGammaDevianceGamma(**pgga_kwargs).to(device)
     return out
 
 
@@ -414,34 +406,16 @@ def _preprocess_stea_gray(
     return _gray_hwt_to_chw(recons)[-1:].contiguous()
 
 
-def _preprocess_hyb_gray(
+def _preprocess_pg_gray(
     raw_chunk: np.ndarray,
     *,
     device: torch.device,
-    integrator: HybridSpatioTemporalEvidenceAccumulation,
+    integrator: PoissonGammaDevianceFusion | PoissonGammaDevianceGamma,
     clear_states: bool,
 ) -> torch.Tensor:
-    integrator.set_velocity_field(None, source_space="rgb")
     cube = _gray_chunk_to_cube(raw_chunk, device)
     recons = integrator.process_photon_cube(cube, clear_states=clear_states)
     return _gray_hwt_to_chw(recons)[-1:].contiguous()
-
-
-def _preprocess_vel_gray(
-    raw_chunk: np.ndarray,
-    *,
-    device: torch.device,
-    integrator: VelIntegrator,
-    clear_states: bool,
-) -> torch.Tensor:
-    integrator.set_velocity_field(None, source_space="raw")
-    cube = _gray_chunk_to_cube(raw_chunk, device)
-    recons = integrator.process_photon_cube(cube, clear_states=clear_states)
-    if recons.ndim == 2:
-        return recons.unsqueeze(0).unsqueeze(0).float().contiguous()
-    if recons.ndim == 3 and int(recons.shape[-1]) == 1:
-        return recons.permute(2, 0, 1).unsqueeze(1).float().contiguous()
-    raise ValueError(f"Unexpected vel grayscale output shape: {tuple(recons.shape)}")
 
 
 def _preprocess_sum_rgb(raw_chunk: np.ndarray, *, device: torch.device) -> torch.Tensor:
@@ -468,30 +442,14 @@ def _preprocess_stea_rgb(
     return integrate_raw_chunk_to_rgb(integrator, raw_chunk, packed_nch=3, device=device, clear_states=clear_states)
 
 
-def _preprocess_hyb_rgb(
+def _preprocess_pg_rgb(
     raw_chunk: np.ndarray,
     *,
     device: torch.device,
-    integrator: HybridSpatioTemporalEvidenceAccumulation,
+    integrator: PoissonGammaDevianceFusion | PoissonGammaDevianceGamma,
     clear_states: bool,
 ) -> torch.Tensor:
-    integrator.set_velocity_field(None, source_space="rgb")
     return integrate_raw_chunk_to_rgb(integrator, raw_chunk, packed_nch=3, device=device, clear_states=clear_states)
-
-
-def _preprocess_vel_rgb(
-    raw_chunk: np.ndarray,
-    *,
-    device: torch.device,
-    integrator: VelIntegrator,
-    clear_states: bool,
-) -> torch.Tensor:
-    integrator.set_velocity_field(None, source_space="rgb")
-    cube = _gray_chunk_to_cube(raw_chunk, device)
-    recons = integrator.process_photon_cube(cube, clear_states=clear_states, packed_nch=3)
-    if integrator.outputs_rgb:
-        return recons.unsqueeze(0).contiguous()
-    raise ValueError("RGB velocity path expected outputs_rgb=True")
 
 
 def _apply_vis_scaling(x: np.ndarray, *, mode: str, gamma: float, percentile: float) -> np.ndarray:
@@ -592,9 +550,14 @@ def _preprocess_chunk(
             return _preprocess_ppb_gray(raw_chunk, device=device, integrator=integrators["ppb"], clear_states=first_chunk)
         if method == "stea":
             return _preprocess_stea_gray(raw_chunk, device=device, integrator=integrators["stea"], clear_states=first_chunk)
-        if method == "hyb":
-            return _preprocess_hyb_gray(raw_chunk, device=device, integrator=integrators["hyb"], clear_states=first_chunk)
-        return _preprocess_vel_gray(raw_chunk, device=device, integrator=integrators["vel_raw"], clear_states=first_chunk)
+        if method in {"pgfu", "pgga"}:
+            return _preprocess_pg_gray(
+                raw_chunk,
+                device=device,
+                integrator=integrators[method],
+                clear_states=first_chunk,
+            )
+        raise ValueError(f"Unsupported grayscale preprocessor: {method!r}")
 
     if method == "sum":
         return _preprocess_sum_rgb(raw_chunk, device=device)
@@ -602,9 +565,14 @@ def _preprocess_chunk(
         return _preprocess_ppb_rgb(raw_chunk, device=device, integrator=integrators["ppb"], clear_states=first_chunk)
     if method == "stea":
         return _preprocess_stea_rgb(raw_chunk, device=device, integrator=integrators["stea"], clear_states=first_chunk)
-    if method == "hyb":
-        return _preprocess_hyb_rgb(raw_chunk, device=device, integrator=integrators["hyb"], clear_states=first_chunk)
-    return _preprocess_vel_rgb(raw_chunk, device=device, integrator=integrators["vel_rgb"], clear_states=first_chunk)
+    if method in {"pgfu", "pgga"}:
+        return _preprocess_pg_rgb(
+            raw_chunk,
+            device=device,
+            integrator=integrators[method],
+            clear_states=first_chunk,
+        )
+    raise ValueError(f"Unsupported RGB preprocessor: {method!r}")
 
 
 def _chunk_start_indices(

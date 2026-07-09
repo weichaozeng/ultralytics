@@ -14,14 +14,11 @@ from ultralytics.quanta_pgdr_networks.common import (
     append_temporal_history,
     build_fast_kernel,
     build_stea_smooth_kernel,
-    causal_conv1d_full,
-    causal_conv1d_step,
-    causal_window_sum_full,
     causal_window_sum_step,
+    compute_motion_weights_parallel,
     history_or_zeros,
     motion_gate,
     poisson_deviance,
-    smooth_deviance_full,
     smooth_deviance_step,
 )
 
@@ -191,59 +188,38 @@ class PoissonGammaDevianceGamma(nn.Module):
         self.y = (1.0 - eta_t) * self.y + eta_t * x_t
         self.sample_weight = (1.0 - w_t).detach()
 
-    def _compute_motion_streaming(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    def _integrate_motion_gamma_streaming(self, x: Tensor) -> Tensor | None:
         h, w, t = map(int, x.shape)
-        fast_hist = history_or_zeros(self.photon_history, h, w, self.fast_window - 1, x)
+        photon_hist = history_or_zeros(self.photon_history, h, w, self.fast_window - 1, x)
         d_hist = history_or_zeros(self.d_history, h, w, self.temporal_window - 1, x)
-        sum_hist = history_or_zeros(self.photon_history, h, w, self.fast_window - 1, x)
 
         mu_ref = self._mu_reference()
-        p_motion = x.new_zeros(h, w, t)
-        d_raw_hwt = x.new_zeros(h, w, t)
         cold = self._cold_start_active()
 
         for ti in range(t):
-            x_t = x[..., ti : ti + 1]
-            k_fast_t = causal_window_sum_step(x_t, sum_hist, self.fast_window)
+            x_t = x[..., ti]
+            k_fast_t = causal_window_sum_step(x[..., ti : ti + 1], photon_hist, self.fast_window)
             d_t = poisson_deviance(k_fast_t, mu_ref, eps=self.eps)
             d_raw_t = d_t.unsqueeze(-1)
             d_smooth_t = smooth_deviance_step(d_raw_t, d_hist, self.stea_kernel)
             w_t = motion_gate(d_smooth_t, self.motion_sharpness, self.motion_threshold)
             if cold:
                 w_t = w_t * 0.0
-            p_motion[..., ti] = w_t
-            d_raw_hwt[..., ti] = d_t
-            sum_hist = append_temporal_history(sum_hist, x_t, self.fast_window - 1)
-            fast_hist = append_temporal_history(fast_hist, x_t, self.fast_window - 1)
+            self._gamma_micro_step(x_t, w_t)
+            photon_hist = append_temporal_history(photon_hist, x[..., ti : ti + 1], self.fast_window - 1)
             d_hist = append_temporal_history(d_hist, d_raw_t, self.temporal_window - 1)
 
-        return p_motion, d_raw_hwt
+        return d_hist if self.temporal_window > 1 else None
 
-    def _compute_motion_parallel(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        h, w, t = map(int, x.shape)
-        sum_hist = history_or_zeros(self.photon_history, h, w, self.fast_window - 1, x)
-        k_fast = causal_window_sum_full(x, sum_hist, self.fast_window)
-        mu_ref = self._mu_reference()
-        d_raw = poisson_deviance(k_fast, mu_ref, eps=self.eps)
-        d_smooth = smooth_deviance_full(d_raw, self.d_history, self.stea_kernel)
-        p_motion = motion_gate(d_smooth, self.motion_sharpness, self.motion_threshold)
-        if self._cold_start_active():
-            p_motion = p_motion * 0.0
-        return p_motion, d_raw
-
-    def _apply_gamma_streaming(self, x: Tensor, p_motion: Tensor) -> None:
-        h, w, t = map(int, x.shape)
-        for ti in range(t):
-            self._gamma_micro_step(x[..., ti], p_motion[..., ti])
-
-    def _apply_gamma_parallel(self, x: Tensor, p_motion: Tensor) -> None:
-        if float(p_motion.max()) < self.w_eps:
-            self.alpha_s = self.alpha_s + x.sum(dim=-1)
-            self.beta_s = self.beta_s + float(x.shape[-1])
-            self.y = x.mean(dim=-1)
-            self.sample_weight = torch.ones_like(self.sample_weight)
-            return
-        self._apply_gamma_streaming(x, p_motion)
+    def _finalize_chunk_histories(self, x: Tensor, d_hist: Tensor | None) -> None:
+        if self.fast_window > 1:
+            self.photon_history = x[..., -self.fast_window + 1 :].detach()
+        else:
+            self.photon_history = None
+        if self.temporal_window > 1 and d_hist is not None:
+            self.d_history = d_hist.detach()
+        else:
+            self.d_history = None
 
     @torch.no_grad()
     def _integrate_last(self, photon_cube: Tensor) -> Tensor:
@@ -253,17 +229,8 @@ class PoissonGammaDevianceGamma(nn.Module):
 
         self._ensure_state(photon_cube)
         x = photon_cube.float()
-        p_motion, d_raw_hwt = self._compute_motion_streaming(x)
-        self._apply_gamma_streaming(x, p_motion)
-
-        if self.fast_window > 1:
-            self.photon_history = x[..., -self.fast_window + 1 :].detach()
-        else:
-            self.photon_history = None
-        if self.temporal_window > 1:
-            self.d_history = d_raw_hwt[..., -self.temporal_window + 1 :].detach()
-        else:
-            self.d_history = None
+        d_hist = self._integrate_motion_gamma_streaming(x)
+        self._finalize_chunk_histories(x, d_hist)
         self._chunk_index += 1
         return self.y.unsqueeze(-1)
 
@@ -275,19 +242,35 @@ class PoissonGammaDevianceGamma(nn.Module):
 
         self._ensure_state(photon_cube)
         x = photon_cube.float()
-        p_motion, d_raw_hwt = self._compute_motion_parallel(x)
+        p_motion, _, d_hist_tail = compute_motion_weights_parallel(
+            x,
+            mu_ref=self._mu_reference(),
+            fast_kernel=self.fast_kernel,
+            stea_kernel=self.stea_kernel,
+            photon_history=self.photon_history,
+            d_history=self.d_history,
+            fast_window=self.fast_window,
+            motion_sharpness=self.motion_sharpness,
+            motion_threshold=self.motion_threshold,
+            eps=self.eps,
+            cold_start=self._cold_start_active(),
+        )
         self._apply_gamma_parallel(x, p_motion)
-
-        if self.fast_window > 1:
-            self.photon_history = x[..., -self.fast_window + 1 :].detach()
-        else:
-            self.photon_history = None
-        if self.temporal_window > 1:
-            self.d_history = d_raw_hwt[..., -self.temporal_window + 1 :].detach()
-        else:
-            self.d_history = None
+        del p_motion
+        self._finalize_chunk_histories(x, d_hist_tail)
         self._chunk_index += 1
         return self.y.unsqueeze(-1)
+
+    def _apply_gamma_parallel(self, x: Tensor, p_motion: Tensor) -> None:
+        if float(p_motion.max()) < self.w_eps:
+            self.alpha_s = self.alpha_s + x.sum(dim=-1)
+            self.beta_s = self.beta_s + float(x.shape[-1])
+            self.y = x.mean(dim=-1)
+            self.sample_weight = torch.ones_like(self.sample_weight)
+            return
+        h, w, t = map(int, x.shape)
+        for ti in range(t):
+            self._gamma_micro_step(x[..., ti], p_motion[..., ti])
 
     def _subsample_reconstruction(self, fused_hwt: Tensor) -> Tensor:
         h, w, t = map(int, fused_hwt.shape)
@@ -351,9 +334,7 @@ class PoissonGammaDevianceGamma(nn.Module):
         )
 
         self.set_cube(photon_cube)
-        use_parallel = parallel
-        if use_parallel is None:
-            use_parallel = int(photon_cube.shape[-1]) <= self.chunk_size
+        use_parallel = False if parallel is None else bool(parallel)
         fused = self._integrate_parallel(photon_cube) if use_parallel else self._integrate_last(photon_cube)
         recons = self._subsample_reconstruction(fused)
         if self.hot_pixel_mask is not None:
