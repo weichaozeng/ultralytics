@@ -80,7 +80,7 @@ def parse_args():
     ap.add_argument("--pdrs-fast-tau", type=float, default=6.0)
     ap.add_argument("--pdrs-motion-sharpness", type=float, default=60.0)
     ap.add_argument("--pdrs-motion-threshold", type=float, default=0.07)
-    ap.add_argument("--pdrs-motion-pool-size", type=int, default=7)
+    ap.add_argument("--pdrs-fusion-pool-size", type=int, default=7)
     ap.add_argument("--pdrs-stable-prior", type=float, default=16.0)
     ap.add_argument("--pdrs-normalize", type=str, default="true")
     ap.add_argument("--pdrs-quantile", type=float, default=1.0)
@@ -117,7 +117,7 @@ def _build_pdrs_kwargs(args, *, subsampling: int, chunk_size: int) -> dict[str, 
         "fast_tau": float(args.pdrs_fast_tau),
         "motion_sharpness": float(args.pdrs_motion_sharpness),
         "motion_threshold": float(args.pdrs_motion_threshold),
-        "motion_pool_size": int(args.pdrs_motion_pool_size),
+        "fusion_pool_size": int(args.pdrs_fusion_pool_size),
         "stable_prior": float(args.pdrs_stable_prior),
         "normalize": _as_bool(args.pdrs_normalize),
         "quantile": float(args.pdrs_quantile),
