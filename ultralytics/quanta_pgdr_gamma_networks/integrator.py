@@ -159,10 +159,11 @@ class PoissonGammaDevianceGamma(nn.Module):
         if self.alpha_s is None or tuple(self.alpha_s.shape) != (h, w):
             self.init_state(h, w, device=device, dtype=dtype)
 
-    def _cold_start_active(self) -> bool:
-        return self._chunk_index < self.cold_start_chunks or (
-            self.beta_s is not None and bool(torch.any(self.beta_s < self.beta_min))
-        )
+    def _cold_start_mask(self) -> Tensor:
+        """Per-pixel mask: 1 where motion reset is allowed, 0 while slow stats are immature."""
+        if self._chunk_index < self.cold_start_chunks:
+            return torch.zeros_like(self.beta_s)
+        return (self.beta_s >= self.beta_min).to(dtype=self.beta_s.dtype)
 
     def set_cube(self, photon_cube: Tensor) -> None:
         self._h, self._w, self._t = map(int, photon_cube.shape)
@@ -182,11 +183,15 @@ class PoissonGammaDevianceGamma(nn.Module):
     def _gamma_micro_step(self, x_t: Tensor, w_t: Tensor) -> None:
         a0 = self.alpha_s.new_tensor(self.alpha_prior)
         b0 = self.alpha_s.new_tensor(self.beta_prior)
-        self.alpha_s = (1.0 - w_t) * self.alpha_s + w_t * a0 + x_t
-        self.beta_s = (1.0 - w_t) * self.beta_s + w_t * b0 + 1.0
-        eta_t = self.eta_min + (self.eta_max - self.eta_min) * (1.0 - w_t)
-        self.y = (1.0 - eta_t) * self.y + eta_t * x_t
-        self.sample_weight = (1.0 - w_t).detach()
+        w_eff = w_t * self._cold_start_mask()
+        self.alpha_s = (1.0 - w_eff) * self.alpha_s + w_eff * a0 + x_t
+        self.beta_s = (1.0 - w_eff) * self.beta_s + w_eff * b0 + 1.0
+        rate_hat = self.alpha_s / self.beta_s.clamp(min=self.eps)
+        # Stable bins smooth toward Gamma rate; motion bins may track raw photons faster.
+        eta_t = self.eta_min + (self.eta_max - self.eta_min) * w_eff
+        target_t = torch.where(w_eff > 0.5, x_t, rate_hat)
+        self.y = (1.0 - eta_t) * self.y + eta_t * target_t
+        self.sample_weight = (1.0 - w_eff).detach()
 
     def _integrate_motion_gamma_streaming(self, x: Tensor) -> Tensor | None:
         h, w, t = map(int, x.shape)
@@ -194,7 +199,6 @@ class PoissonGammaDevianceGamma(nn.Module):
         d_hist = history_or_zeros(self.d_history, h, w, self.temporal_window - 1, x)
 
         mu_ref = self._mu_reference()
-        cold = self._cold_start_active()
 
         for ti in range(t):
             x_t = x[..., ti]
@@ -203,8 +207,6 @@ class PoissonGammaDevianceGamma(nn.Module):
             d_raw_t = d_t.unsqueeze(-1)
             d_smooth_t = smooth_deviance_step(d_raw_t, d_hist, self.stea_kernel)
             w_t = motion_gate(d_smooth_t, self.motion_sharpness, self.motion_threshold)
-            if cold:
-                w_t = w_t * 0.0
             self._gamma_micro_step(x_t, w_t)
             photon_hist = append_temporal_history(photon_hist, x[..., ti : ti + 1], self.fast_window - 1)
             d_hist = append_temporal_history(d_hist, d_raw_t, self.temporal_window - 1)
@@ -253,7 +255,7 @@ class PoissonGammaDevianceGamma(nn.Module):
             motion_sharpness=self.motion_sharpness,
             motion_threshold=self.motion_threshold,
             eps=self.eps,
-            cold_start=self._cold_start_active(),
+            cold_start=False,
         )
         self._apply_gamma_parallel(x, p_motion)
         del p_motion
