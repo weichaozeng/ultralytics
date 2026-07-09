@@ -9,10 +9,13 @@ from a frozen reference (the failure mode of chunk-entry Poisson deviance).
   λ_f(t)  fast causal conv  — reacts in O(fast_window) bins (PPB-like responsiveness)
   λ_s(t)  slow causal conv  — long memory baseline (STEA-like stability)
 
-  score(t) = D_Pois(λ_f(t) || λ_s(t))   generalized Poisson KL, zero when rates agree
+  score(t) = r log(r) - r + 1,  r = λ_f/λ_s   scale-invariant Poisson KL (zero when rates agree)
 
 After a changepoint λ_f moves first → score spikes → reverse-cummax fusion uses λ_f.
 Once λ_s catches up, score relaxes → stable photon integration resumes without drag.
+
+Fusion weight follows PPB-style run-length mapping:
+  w_stable = 1 - exp(-L / τ),  L = accumulated stable support in the chunk.
 
 Parallel path: dual conv1d over the full chunk (STEA-style). Streaming fallback for long T.
 """
@@ -30,10 +33,11 @@ from ultralytics.quanta_neural_networks.ops.image import nearest_neighbor_inpain
 
 
 def poisson_rate_kl(lam_f: Tensor, lam_s: Tensor, eps: float) -> Tensor:
-    """Generalized KL between Poisson means: λ_f log(λ_f/λ_s) + λ_s - λ_f."""
+    """Scale-invariant Poisson KL via rate ratio r = λ_f/λ_s: r log(r) - r + 1."""
     lf = lam_f.float().clamp(min=eps)
     ls = lam_s.float().clamp(min=eps)
-    return lf * torch.log(lf / ls) + ls - lf
+    ratio = (lf / ls).clamp(min=eps, max=1.0 / eps)
+    return ratio * torch.log(ratio) - ratio + 1.0
 
 
 class PoissonDualRateSplit(nn.Module):
@@ -47,7 +51,8 @@ class PoissonDualRateSplit(nn.Module):
         motion_threshold: float = 0.07,
         fusion_pool_size: int = 7,
         eps: float = 1e-5,
-        stable_prior: float = 16.0,
+        stable_tau: float = 32.0,
+        stable_prior: float | None = None,
         chunk_size: int = 320,
         subsampling: int = 1,
         hot_pixel_mask: np.ndarray | None = None,
@@ -63,7 +68,9 @@ class PoissonDualRateSplit(nn.Module):
         self.motion_threshold = float(motion_threshold)
         self.fusion_pool_size = max(int(fusion_pool_size), 1)
         self.eps = float(eps)
-        self.stable_prior = float(stable_prior)
+        if stable_prior is not None:
+            stable_tau = float(stable_prior)
+        self.stable_tau = float(stable_tau)
         self.chunk_size = max(int(chunk_size), 1)
         self.subsampling = max(int(subsampling), 1)
         self.hot_pixel_mask = hot_pixel_mask
@@ -81,7 +88,8 @@ class PoissonDualRateSplit(nn.Module):
         return (
             f"{self.__class__.__name__}(fast_window={self.fast_window}, "
             f"slow_window={self.slow_window}, temporal_window={self.temporal_window}, "
-            f"motion_threshold={self.motion_threshold}, fusion_pool_size={self.fusion_pool_size})"
+            f"motion_threshold={self.motion_threshold}, fusion_pool_size={self.fusion_pool_size}, "
+            f"stable_tau={self.stable_tau})"
         )
 
     @staticmethod
@@ -104,7 +112,11 @@ class PoissonDualRateSplit(nn.Module):
         rebuild_keys = {"fast_window", "slow_window", "temporal_window", "fast_tau"}
         if kwargs.get("kernel_size") is not None and kwargs.get("slow_window") is None:
             kwargs["slow_window"] = kwargs.pop("kernel_size")
-        for alias, target in (("sharpness", "motion_sharpness"), ("bias", "motion_threshold")):
+        for alias, target in (
+            ("sharpness", "motion_sharpness"),
+            ("bias", "motion_threshold"),
+            ("stable_prior", "stable_tau"),
+        ):
             if kwargs.get(alias) is not None and kwargs.get(target) is None:
                 kwargs[target] = kwargs.pop(alias)
         needs_rebuild = False
@@ -113,7 +125,7 @@ class PoissonDualRateSplit(nn.Module):
                 continue
             if name in {"fast_window", "slow_window", "temporal_window", "chunk_size", "subsampling", "fusion_pool_size"}:
                 value = max(int(value), 1)
-            elif name in {"fast_tau", "motion_sharpness", "motion_threshold", "eps", "stable_prior", "quantile"}:
+            elif name in {"fast_tau", "motion_sharpness", "motion_threshold", "eps", "stable_tau", "quantile"}:
                 value = float(value)
             elif name == "normalize":
                 value = bool(value)
@@ -214,9 +226,10 @@ class PoissonDualRateSplit(nn.Module):
             stable_num += valid_weight * x[..., ti]
             stable_den += valid_weight
         mean_stable = stable_num / stable_den.clamp(min=self.eps)
-        w_mean = stable_den / (stable_den + max(self.stable_prior, self.eps))
-        w_mean = self._min_pool_hw(w_mean, self.fusion_pool_size)
-        fused_last = w_mean * mean_stable + (1.0 - w_mean) * lam_f_last
+        w_stable = 1.0 - torch.exp(-stable_den / max(self.stable_tau, self.eps))
+        w_stable = self._min_pool_hw(w_stable, self.fusion_pool_size)
+        fused_last = w_stable * mean_stable + (1.0 - w_stable) * lam_f_last
+        w_mean = w_stable
         return fused_last, w_mean
 
     def _save_histories(self, x: Tensor, score_hwt: Tensor | None) -> None:
@@ -312,7 +325,7 @@ class PoissonDualRateSplit(nn.Module):
         motion_threshold: float | None = None,
         fusion_pool_size: int | None = None,
         eps: float | None = None,
-        stable_prior: float | None = None,
+        stable_tau: float | None = None,
         parallel: bool | None = None,
         **kwargs,
     ) -> Tensor:
@@ -334,7 +347,7 @@ class PoissonDualRateSplit(nn.Module):
             motion_threshold=motion_threshold,
             fusion_pool_size=fusion_pool_size,
             eps=eps,
-            stable_prior=stable_prior,
+            stable_tau=stable_tau,
             **kwargs,
         )
 
