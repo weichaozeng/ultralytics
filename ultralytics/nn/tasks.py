@@ -838,12 +838,13 @@ class SpadPoseModel(PoseModel):
 
     def _spad_process_full_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
         """Process one full raw SPAD window into reconstructed frames."""
-        if str(getattr(self, "preprocessor_name", "")).strip().lower() == "stea":
-            return self._spad_process_stea_window(photon_cube)
+        name = str(getattr(self, "preprocessor_name", "")).strip().lower()
+        if name in {"stea", "pgfu", "pgga", "pgdr_fusion", "pgdr-fusion", "pgdr1", "pgdr_gamma", "pgdr-gamma", "pgdr2"}:
+            return self._spad_process_chunked_window(photon_cube)
         return self.preprocessor.process_photon_cube(photon_cube, clear_states=True)
 
-    def _spad_process_stea_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
-        """Replay a full STEA training window chunk-by-chunk while carrying causal histories forward."""
+    def _spad_process_chunked_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
+        """Replay a full window chunk-by-chunk while carrying causal preprocessor state forward."""
         if photon_cube.ndim != 3:
             raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
 
@@ -860,7 +861,9 @@ class SpadPoseModel(PoseModel):
             chunk_recons = self.preprocessor.process_photon_cube(chunk, clear_states=first_chunk)
             first_chunk = False
             if chunk_recons.ndim != 3:
-                raise ValueError(f"Expected STEA reconstruction (H,W,T'), got shape={tuple(chunk_recons.shape)}")
+                raise ValueError(
+                    f"Expected chunked reconstruction (H,W,T'), got shape={tuple(chunk_recons.shape)}"
+                )
             if int(chunk_recons.shape[-1]) > 0:
                 recons.append(chunk_recons)
 
@@ -868,6 +871,10 @@ class SpadPoseModel(PoseModel):
             h, w = map(int, photon_cube.shape[:2])
             return photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
         return torch.cat(recons, dim=-1)
+
+    def _spad_process_stea_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
+        """Backward-compatible alias for chunked causal preprocessing."""
+        return self._spad_process_chunked_window(photon_cube)
 
     @staticmethod
     def _spad_recon_t_indices(t_raw: int, subsampling: int, num_frames: int) -> list[int]:
