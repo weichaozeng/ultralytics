@@ -5,8 +5,8 @@ spad_train_json: /home/zvc/Data/visionsim/outputs/train.json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test.json
 
 project: Runs/spad_pose
-name: sequence_ppb_ssd
-device: "2"
+name: sequence_sum_ssd
+device: "1"
 epochs: 30
 batch: 4
 workers: 0
@@ -22,12 +22,8 @@ spad_image_size: 512
 spad_packed_ch_order: RGB
 spad_cache_mode: auto
 
-# PPB offline cache (forward skips online preprocessing when cache_mode=rendered)
-spad_preprocessor: ppb
-ppb_bocpd_gamma: 0.0005
-ppb_quantile: 1.0
-ppb_normalize: true
-ppb_min_filter_size: 7
+# sum offline cache (temporal mean over each 320-bin chunk; forward skips online preprocessing when cache_mode=rendered)
+spad_preprocessor: sum
 
 # backbone SSD plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.
 spad_plugin: temporal_ssd

@@ -185,7 +185,16 @@ class SpadPoseSequenceTrainer(PoseTrainer):
     @staticmethod
     def _samples_have_explicit_render(samples: list[dict[str, str]], preprocessor_name: str) -> bool:
         key = str(preprocessor_name).strip().lower()
-        return bool(samples) and all(bool(sample.get(key)) for sample in samples)
+        if not samples:
+            return False
+        return all(
+            bool(
+                sample.get(key)
+                or sample.get(f"render_{key}")
+                or sample.get(f"render_{key}_frames")
+            )
+            for sample in samples
+        )
 
     def _resolve_spad_cache_mode(self, samples: list[dict[str, str]], preprocessor_name: str) -> str:
         requested = str(getattr(self.args, "spad_cache_mode", "auto")).strip().lower()
