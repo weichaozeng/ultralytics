@@ -29,9 +29,9 @@ ppb_quantile: 1.0
 ppb_normalize: true
 ppb_min_filter_size: 7
 
-# backbone SSD plugins (no frame_adapter)
+# backbone SSD plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.
 spad_plugin: temporal_ssd
-spad_plugin_scales: 2,4,6,8,10
+spad_plugin_scales: backbone
 ssd_state_dim: 8
 ssd_head_divisor: 4
 spad_spatial_reduce_ratio: 2

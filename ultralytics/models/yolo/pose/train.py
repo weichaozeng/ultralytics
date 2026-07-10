@@ -298,7 +298,11 @@ class SpadPoseSequenceTrainer(PoseTrainer):
 
         plugin_layers = getattr(self.args, "spad_plugin_scales", None)
         if isinstance(plugin_layers, str):
-            plugin_layers = [int(x) for x in plugin_layers.split(",") if x.strip()]
+            stripped = plugin_layers.strip().lower()
+            if stripped == "backbone":
+                plugin_layers = "backbone"
+            else:
+                plugin_layers = [int(x) for x in plugin_layers.split(",") if x.strip()]
 
         model = SpadPoseSequenceModel(
             cfg,

@@ -634,7 +634,10 @@ class SpadPoseModel(PoseModel):
         self.preprocessor_name = str(preprocessor).strip().lower()
         self.preprocessor_kwargs = dict(preprocessor_kwargs or {})
         self.plugin_name = str(plugin).strip().lower()
-        self.plugin_layers = None if plugin_layers is None else tuple(plugin_layers)
+        if plugin_layers is not None and str(plugin_layers).strip().lower() == "backbone":
+            self.plugin_layers = "backbone"
+        else:
+            self.plugin_layers = None if plugin_layers is None else tuple(plugin_layers)
         self.temporal_core = str(temporal_core).strip().lower()
         self.ssd_state_dim = ssd_state_dim
         self.ssd_head_divisor = ssd_head_divisor
@@ -716,8 +719,38 @@ class SpadPoseModel(PoseModel):
                     reference_bin_rate_hz=self.spad_reference_bin_rate_hz,
                 )
 
+    def _infer_backbone_plugin_layers(self) -> tuple[int, ...]:
+        """Infer SSD insertion points after each backbone stage (before the FPN neck).
+
+        YOLOv8 example: C2f@2,4,6,8 then SPPF@9.
+        YOLO11 example: C3k2@2,4,6,8 then C2PSA@10 (SPPF@9 skipped when C2PSA exists).
+        """
+        block_types = {"C2f", "C3k2", "C2fPSA", "C2PSA"}
+        stages: list[int] = []
+        sppf_idx: int | None = None
+        for idx, module in enumerate(self.model):
+            name = module.__class__.__name__
+            if name == "Upsample":
+                break
+            if name in block_types:
+                stages.append(int(idx))
+            elif name == "SPPF":
+                sppf_idx = int(idx)
+        if any(self.model[i].__class__.__name__ == "C2PSA" for i in stages):
+            return tuple(stages)
+        if sppf_idx is not None:
+            stages.append(sppf_idx)
+        if not stages:
+            raise ValueError("Unable to infer backbone SSD plugin layers from the detector graph.")
+        return tuple(stages)
+
     def _resolve_plugin_layers(self) -> tuple[int, ...]:
         """Resolve plugin insertion layers, preferring the detector head input scales."""
+        if str(getattr(self, "plugin_layers", "")).strip().lower() == "backbone":
+            layers = self._infer_backbone_plugin_layers()
+            LOGGER.info("Auto-resolved backbone SSD plugin layers: %s", layers)
+            return layers
+
         detect_inputs = ()
         last_layer = self.model[-1]
         if hasattr(last_layer, "f") and isinstance(last_layer.f, (list, tuple)):
@@ -729,6 +762,21 @@ class SpadPoseModel(PoseModel):
             raise ValueError("Unable to infer default plugin layers from the detector head.")
 
         requested = tuple(int(x) for x in self.plugin_layers)
+        invalid = []
+        for idx in requested:
+            if idx < 0 or idx >= len(self.model):
+                invalid.append((idx, "out of range"))
+                continue
+            name = self.model[idx].__class__.__name__
+            if name in {"Upsample", "Concat", "Pose", "Detect"}:
+                invalid.append((idx, name))
+        if invalid:
+            hint = self._infer_backbone_plugin_layers()
+            raise ValueError(
+                f"SPAD plugin layers {requested} hit neck/head modules {invalid}. "
+                f"For this detector use spad_plugin_scales: backbone (auto -> {hint}) "
+                f"or explicit indices such as {hint}."
+            )
         final_idx = len(self.model) - 1
         if detect_inputs and any(idx == final_idx for idx in requested):
             LOGGER.warning(
