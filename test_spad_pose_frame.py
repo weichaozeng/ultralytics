@@ -169,14 +169,15 @@ def _build_frame_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsa
     if name == "sum":
         return {"subsampling": spad_subsampling}
     if name == "hyb":
+        # HYB shares STEA temporal/motion knobs; only warp_* are HYB-specific.
         return {
             "subsampling": spad_subsampling,
             "fast_window": int(args.stea_fast_window),
             "slow_window": int(args.stea_slow_window),
             "temporal_window": int(args.stea_temporal_window),
             "fast_tau": None if args.stea_fast_tau in {None, 0} else float(args.stea_fast_tau),
-            "motion_sharpness": float(args.hyb_motion_sharpness),
-            "motion_threshold": float(args.hyb_motion_threshold),
+            "motion_sharpness": float(args.stea_motion_sharpness),
+            "motion_threshold": float(args.stea_motion_threshold),
             "stable_prior": float(args.stea_stable_prior),
             "normalize": bool(args.stea_normalize),
             "quantile": float(args.stea_quantile),
@@ -547,8 +548,18 @@ def parse_args():
     ap.add_argument("--stea-stable-prior", type=float, default=16.0)
     ap.add_argument("--stea-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea-quantile", type=float, default=1.0)
-    ap.add_argument("--hyb-motion-sharpness", type=float, default=60.0)
-    ap.add_argument("--hyb-motion-threshold", type=float, default=0.05)
+    ap.add_argument(
+        "--hyb-motion-sharpness",
+        type=float,
+        default=None,
+        help="Deprecated: HYB now uses --stea-motion-sharpness. Kept for CLI compatibility.",
+    )
+    ap.add_argument(
+        "--hyb-motion-threshold",
+        type=float,
+        default=None,
+        help="Deprecated: HYB now uses --stea-motion-threshold. Kept for CLI compatibility.",
+    )
     ap.add_argument("--hyb-warp-block-size", type=int, default=16)
     ap.add_argument("--hyb-source-space", type=str, default="rgb", choices=["rgb", "raw"])
     ap.add_argument("--vis", nargs="?", const="video", default="none", choices=["none", "image", "video"])

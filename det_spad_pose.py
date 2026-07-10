@@ -312,14 +312,15 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
             }
         )
     elif name == "hyb":
+        # HYB shares STEA temporal/motion knobs; only warp_* are HYB-specific.
         kwargs.update(
             {
                 "fast_window": int(args.stea_fast_window),
                 "slow_window": int(args.stea_slow_window),
                 "temporal_window": int(args.stea_temporal_window),
                 "fast_tau": float(args.stea_fast_tau),
-                "motion_sharpness": float(args.hyb_motion_sharpness),
-                "motion_threshold": float(args.hyb_motion_threshold),
+                "motion_sharpness": float(args.stea_motion_sharpness),
+                "motion_threshold": float(args.stea_motion_threshold),
                 "stable_prior": float(args.stea_stable_prior),
                 "normalize": bool(args.stea_normalize),
                 "quantile": float(args.stea_quantile),
@@ -476,12 +477,22 @@ def main():
     ap.add_argument("--stea-temporal-window", type=int, default=5)
     ap.add_argument("--stea-fast-tau", type=float, default=6.0)
     ap.add_argument("--stea-motion-sharpness", type=float, default=60.0)
-    ap.add_argument("--stea-motion-threshold", type=float, default=0.05)
+    ap.add_argument("--stea-motion-threshold", type=float, default=0.07)
     ap.add_argument("--stea-stable-prior", type=float, default=16.0)
     ap.add_argument("--stea-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea-quantile", type=float, default=1.0)
-    ap.add_argument("--hyb-motion-sharpness", type=float, default=60.0)
-    ap.add_argument("--hyb-motion-threshold", type=float, default=0.05)
+    ap.add_argument(
+        "--hyb-motion-sharpness",
+        type=float,
+        default=None,
+        help="Deprecated: HYB now uses --stea-motion-sharpness. Kept for CLI compatibility.",
+    )
+    ap.add_argument(
+        "--hyb-motion-threshold",
+        type=float,
+        default=None,
+        help="Deprecated: HYB now uses --stea-motion-threshold. Kept for CLI compatibility.",
+    )
     ap.add_argument("--hyb-warp-block-size", type=int, default=16)
     ap.add_argument("--hyb-source-space", type=str, default="rgb", choices=["rgb", "raw"])
     ap.add_argument(
