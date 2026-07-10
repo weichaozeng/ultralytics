@@ -6,7 +6,7 @@ spad_test_json: /home/zvc/Data/visionsim/outputs/test.json
 
 project: Runs/spad_pose
 name: sequence_stea_ssd
-device: "1"
+device: "0"
 epochs: 30
 batch: 4
 workers: 0
