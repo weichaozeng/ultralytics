@@ -623,6 +623,7 @@ class SpadPoseModel(PoseModel):
         plugin_alpha_init=0.0,
         spad_input_gamma=1.0,
         spad_bin_rate_hz=8000.0,
+        spad_cache_mode: str = "raw",
     ):
         """Initialize a SPAD-augmented YOLO pose model.
 
@@ -642,11 +643,14 @@ class SpadPoseModel(PoseModel):
         self.spatial_kernel_size = spatial_kernel_size
         self.plugin_alpha_init = plugin_alpha_init
         self.spad_input_gamma = float(spad_input_gamma)
+        self.spad_cache_mode = str(spad_cache_mode).strip().lower()
         self.spad_reference_bin_rate_hz = float(spad_bin_rate_hz)
         self.spad_current_bin_rate_hz = float(spad_bin_rate_hz)
         self.ssd_kwargs.setdefault("reference_bin_rate_hz", self.spad_reference_bin_rate_hz)
         self.ssd_kwargs.setdefault("current_bin_rate_hz", self.spad_current_bin_rate_hz)
         self.spad_packed_nch = 3
+        self.spad_last_recon_frames = None
+        self.spad_pending_t_index_ll = None
 
         super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
 
@@ -742,6 +746,8 @@ class SpadPoseModel(PoseModel):
         layer = self.model[layer_idx]
         if hasattr(layer, "cv2") and hasattr(layer.cv2, "conv"):
             return layer.cv2.conv.out_channels
+        if hasattr(layer, "cv3") and hasattr(layer.cv3, "conv"):
+            return layer.cv3.conv.out_channels
         if hasattr(layer, "cv1") and hasattr(layer.cv1, "conv"):
             return layer.cv1.conv.out_channels
         if hasattr(layer, "conv") and hasattr(layer.conv, "out_channels"):
@@ -758,12 +764,54 @@ class SpadPoseModel(PoseModel):
             head_dim -= 1
         return head_dim
 
+    @staticmethod
+    def _is_rendered_sequence_input(x: torch.Tensor) -> bool:
+        return torch.is_tensor(x) and x.ndim == 5 and int(x.shape[2]) == 3
+
+    @staticmethod
+    def _is_raw_spad_video_input(x: torch.Tensor) -> bool:
+        return torch.is_tensor(x) and x.ndim == 5 and int(x.shape[-1]) == 1
+
+    def _spad_rendered_sequence_to_frame_sequence(
+        self,
+        video: torch.Tensor,
+        *,
+        t_index_ll: list[int] | None = None,
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Convert cached RGB clips ``B,T,3,H,W`` into ``T,B,3,H,W`` detector inputs."""
+        if video.ndim != 5 or int(video.shape[2]) != 3:
+            raise ValueError(f"Expected rendered sequence B,T,3,H,W, got shape={tuple(video.shape)}")
+
+        bsz, num_frame, _, _, _ = video.shape
+        frames_t_b_c_h_w = video.permute(1, 0, 2, 3, 4).contiguous()
+        self.spad_batch_size = int(bsz)
+        self.spad_num_frame = int(num_frame)
+        if t_index_ll is None or len(t_index_ll) != int(num_frame):
+            raise ValueError(
+                f"Rendered sequence forward requires t_index_ll with length {num_frame}, "
+                f"got {None if t_index_ll is None else len(t_index_ll)}"
+            )
+        self.spad_t_index_ll = [int(v) for v in t_index_ll]
+        self.spad_last_recon_frames = frames_t_b_c_h_w.detach()
+        return frames_t_b_c_h_w, self.spad_t_index_ll
+
+    def _spad_begin_temporal_forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
+        """Route raw SPAD or cached rendered clips into the shared temporal YOLO path."""
+        if self._is_rendered_sequence_input(x):
+            t_index_ll = getattr(self, "spad_pending_t_index_ll", None)
+            return self._spad_rendered_sequence_to_frame_sequence(x, t_index_ll=t_index_ll)
+        if self._is_raw_spad_video_input(x):
+            return self._spad_video_to_frame_sequence(x)
+        raise ValueError(
+            f"SpadPoseModel expected raw SPAD B,T,H,W,1 or rendered B,T,3,H,W input, got shape={tuple(x.shape)}"
+        )
+
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
         """Run the standard YOLO graph, injecting SPAD modules for raw SPAD video tensors."""
         if not self.spad_enabled or not torch.is_tensor(x) or x.ndim != 5:
             return super()._predict_once(x, profile, visualize, embed)
 
-        x, t_index_ll = self._spad_video_to_frame_sequence(x)
+        x, t_index_ll = self._spad_begin_temporal_forward(x)
         y, dt, embeddings = [], [], []
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)

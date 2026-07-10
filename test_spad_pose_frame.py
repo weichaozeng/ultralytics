@@ -215,11 +215,15 @@ def _resolve_chunk_size(spad_model, args) -> int:
     return int(subsampling)
 
 
-def _resolve_spad_stride_frames(spad_model, args) -> int:
+def _resolve_spad_stride_frames(spad_model, args, *, ckpt: dict | None = None) -> int:
     if int(args.spad_stride_frames) > 0:
         return int(args.spad_stride_frames)
-    train_args = getattr(spad_model, "args", None)
-    return int(_cfg_get(train_args, "spad_stride_frames", 1) or 1)
+    # YOLO() strips most keys from model.args via _reset_ckpt_args; read training args from ckpt first.
+    for src in ((ckpt or {}).get("train_args"), getattr(spad_model, "args", None)):
+        val = _cfg_get(src, "spad_stride_frames", None)
+        if val not in {None, 0, ""}:
+            return int(val)
+    return 5
 
 
 def _resolve_spad_bins_per_gt(spad_model, args) -> int:
@@ -626,7 +630,12 @@ def main():
     if chunk_size <= 0:
         raise ValueError(f"Frame-mode chunk size must be positive, got {chunk_size}")
     spad_bins_per_gt = _resolve_spad_bins_per_gt(spad_model, args)
-    stride_frames = _resolve_spad_stride_frames(spad_model, args)
+    stride_frames = _resolve_spad_stride_frames(spad_model, args, ckpt=yolo.ckpt)
+    print(
+        f"Resolved frame windowing: chunk_size={chunk_size}, "
+        f"spad_bins_per_gt={spad_bins_per_gt}, stride_frames={stride_frames}, "
+        f"chunk_stride_bins={int(stride_frames * spad_bins_per_gt)}"
+    )
     spad_subsampling = _resolve_spad_subsampling(spad_model, args)
     input_gamma = _resolve_input_gamma(spad_model, args)
     preprocessor_kwargs = _build_frame_preprocessor_kwargs(

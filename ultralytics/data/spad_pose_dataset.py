@@ -802,6 +802,325 @@ class SpadPoseRenderedFrameDataset(Dataset):
         return new_batch
 
 
+@dataclass(frozen=True)
+class SpadPoseRenderedSequenceWindow:
+    """A fixed-length sequence of consecutive cached rendered frames."""
+
+    name: str
+    gt_ann_path: Path
+    render_dir: Path
+    chunks: tuple[dict[str, Any], ...]
+    packed_nch: int
+
+
+class SpadPoseRenderedSequenceDataset(Dataset):
+    """Load consecutive cached rendered frames for sequence-mode SSD training."""
+
+    HAND_TO_CLASS = SpadPoseSequenceDataset.HAND_TO_CLASS
+
+    def __init__(
+        self,
+        samples: list[dict[str, str]],
+        *,
+        render_root: str | Path | None,
+        preprocessor: str,
+        output_frames: int = 10,
+        spad_bins_per_gt: int = 64,
+        stride_frames: int | None = None,
+        image_size: int = 512,
+        render_contains_confidence: bool = True,
+        expected_render_config: dict[str, Any] | None = None,
+        source_render_dirname: str = "renders-spc8kHz",
+    ):
+        if not samples:
+            raise ValueError("samples must be a non-empty list")
+
+        self.render_root = None if render_root in {None, ""} else Path(render_root)
+        self.preprocessor = str(preprocessor).strip().lower()
+        self.output_frames = int(output_frames)
+        self.spad_bins_per_gt = int(spad_bins_per_gt)
+        self.stride_frames = int(stride_frames or 5)
+        self.image_size = int(image_size)
+        self.render_contains_confidence = bool(render_contains_confidence)
+        self.expected_render_config = dict(expected_render_config or {})
+        self.source_render_dirname = str(source_render_dirname).strip()
+        self.expected_render_fingerprint = (
+            render_config_fingerprint(self.expected_render_config) if self.expected_render_config else None
+        )
+
+        if self.output_frames <= 0:
+            raise ValueError(f"output_frames must be > 0, got {self.output_frames}")
+        if self.spad_bins_per_gt <= 0:
+            raise ValueError(f"spad_bins_per_gt must be > 0, got {self.spad_bins_per_gt}")
+        if self.stride_frames <= 0:
+            raise ValueError(f"stride_frames must be > 0, got {self.stride_frames}")
+
+        self.sample_records = {rec["id"]: rec for rec in samples}
+        self.video_names = sorted(self.sample_records)
+        self.annotations = {name: self._load_annotation(name) for name in self.video_names}
+        self._sample_chunks: dict[str, list[dict[str, Any]]] = {}
+        self._sample_render_dirs: dict[str, Path] = {}
+        self.windows = self._build_windows()
+        if not self.windows:
+            render_hint = self.render_root if self.render_root is not None else f"<sibling:{self.source_render_dirname}>"
+            raise RuntimeError(f"No cached rendered SPAD sequence windows found under {render_hint}")
+        self.labels = self._build_ultralytics_labels()
+        self.im_files = [str(lb["im_file"]) for lb in self.labels]
+        self.ni = len(self.labels)
+        self._frames_cache: dict[str, np.ndarray] = {}
+
+    def _load_annotation(self, name: str) -> dict[str, Any]:
+        path = Path(self.sample_records[name]["gt"])
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _sample_meta_paths(self, name: str) -> tuple[Path, Path, Path]:
+        sample_record = self.sample_records[name]
+        sample_name = sample_record["name"]
+        explicit_frames = sample_record.get(self.preprocessor) or sample_record.get(f"render_{self.preprocessor}_frames")
+        explicit_render_dir = sample_record.get(f"render_{self.preprocessor}")
+        explicit_meta = sample_record.get(f"{self.preprocessor}_meta") or sample_record.get(f"render_{self.preprocessor}_meta")
+
+        if explicit_frames or explicit_render_dir:
+            if explicit_frames:
+                frames_path = Path(explicit_frames)
+                render_dir = frames_path.parent
+            else:
+                render_dir = Path(explicit_render_dir)
+                frames_path = render_dir / "frames.npy"
+            meta_path = Path(explicit_meta) if explicit_meta else render_dir / "meta.json"
+            return render_dir, frames_path, meta_path
+
+        if self.render_root is not None:
+            render_dir = sample_render_dir(self.render_root, sample_name)
+        else:
+            render_dir = sibling_sample_render_dir(
+                sample_record["spad"],
+                preprocessor=self.preprocessor,
+                sample_name=sample_name,
+                source_render_dirname=self.source_render_dirname,
+            )
+        return render_dir, render_dir / "frames.npy", render_dir / "meta.json"
+
+    def _load_sample_chunks(self, name: str) -> tuple[Path, list[dict[str, Any]]]:
+        if name in self._sample_chunks:
+            return self._sample_render_dirs[name], self._sample_chunks[name]
+
+        render_dir, frames_path, meta_path = self._sample_meta_paths(name)
+        if not meta_path.is_file():
+            raise FileNotFoundError(f"Cached render metadata not found for {name!r}: {meta_path}")
+        if not frames_path.is_file():
+            raise FileNotFoundError(f"Cached frames not found for {name!r}: {frames_path}")
+
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        version = int(meta.get("version", -1))
+        if version != CACHE_META_VERSION:
+            raise ValueError(f"Unsupported cache meta version for {meta_path}: {version}")
+
+        if self.expected_render_fingerprint is not None:
+            cached = str(meta.get("config_fingerprint", "")).strip()
+            if cached != self.expected_render_fingerprint:
+                raise ValueError(
+                    f"Cached render fingerprint mismatch for {name!r}: expected "
+                    f"{self.expected_render_fingerprint}, got {cached or '<missing>'}"
+                )
+        cached_preprocessor = str(meta.get("preprocessor", "")).strip().lower()
+        if cached_preprocessor and cached_preprocessor != self.preprocessor:
+            raise ValueError(
+                f"Cached render preprocessor mismatch for {name!r}: expected {self.preprocessor!r}, "
+                f"got {cached_preprocessor!r}"
+            )
+
+        chunks = meta.get("chunks")
+        if not isinstance(chunks, list) or not chunks:
+            raise ValueError(f"Cached render metadata must include non-empty chunks list: {meta_path}")
+
+        chunks = sorted(chunks, key=lambda c: int(c["chunk_index"]))
+        self._sample_render_dirs[name] = render_dir
+        self._sample_chunks[name] = chunks
+        return render_dir, chunks
+
+    def _build_windows(self) -> list[SpadPoseRenderedSequenceWindow]:
+        windows: list[SpadPoseRenderedSequenceWindow] = []
+        last_gt_offset = self.output_frames * self.spad_bins_per_gt / float(self.spad_bins_per_gt)
+
+        for name in self.video_names:
+            ann = self.annotations[name]
+            n_gt = len(ann)
+            max_start = int(np.floor((n_gt - 1) - last_gt_offset))
+            if max_start < 0:
+                continue
+
+            render_dir, chunks = self._load_sample_chunks(name)
+            gt_ann_path = Path(self.sample_records[name]["gt"])
+            for gt_start in range(0, max_start + 1, self.stride_frames):
+                ci = gt_start // self.stride_frames
+                if ci + self.output_frames > len(chunks):
+                    break
+                window_chunks = chunks[ci : ci + self.output_frames]
+                if len(window_chunks) != self.output_frames:
+                    continue
+                chunk_indices = [int(chunk["chunk_index"]) for chunk in window_chunks]
+                if chunk_indices != list(range(chunk_indices[0], chunk_indices[0] + self.output_frames)):
+                    continue
+                if int(window_chunks[0].get("gt_start", gt_start)) != int(gt_start):
+                    continue
+                windows.append(
+                    SpadPoseRenderedSequenceWindow(
+                        name=name,
+                        gt_ann_path=gt_ann_path,
+                        render_dir=render_dir,
+                        chunks=tuple(window_chunks),
+                        packed_nch=int(window_chunks[0].get("packed_nch", 3)),
+                    )
+                )
+        return windows
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def _frames_array(self, window: SpadPoseRenderedSequenceWindow) -> np.ndarray:
+        key = str(window.render_dir)
+        frames = self._frames_cache.get(key)
+        if frames is None:
+            frames_path = self._sample_meta_paths(window.name)[1]
+            frames = np.load(frames_path, mmap_mode="r")
+            self._frames_cache[key] = frames
+        return frames
+
+    def _t_index_ll_for_window(self, window: SpadPoseRenderedSequenceWindow) -> list[int]:
+        return [int(chunk["spad_end_bin"]) for chunk in window.chunks]
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str | float | int | list[int]]:
+        window = self.windows[index]
+        frames_arr = self._frames_array(window)
+        frame_ll = []
+        for chunk in window.chunks:
+            frame = np.array(frames_arr[int(chunk["chunk_index"])], copy=True)
+            img = torch.from_numpy(frame)
+            if img.dtype == torch.uint8:
+                img = img.float() / 255.0
+            else:
+                img = img.float()
+            frame_ll.append(img)
+        img = torch.stack(frame_ll, dim=0)
+
+        cls, bboxes, keypoints, batch_idx = self._labels_for_window(window)
+        first_chunk = window.chunks[0]
+        last_chunk = window.chunks[-1]
+        return {
+            "img": img,
+            "packed_nch": int(window.packed_nch),
+            "cls": cls,
+            "bboxes": bboxes,
+            "keypoints": keypoints,
+            "batch_idx": batch_idx,
+            "output_frames": int(self.output_frames),
+            "t_index_ll": self._t_index_ll_for_window(window),
+            "im_file": (
+                f"{window.name}:{int(first_chunk['spad_start_bin'])}:"
+                f"{int(last_chunk['spad_end_bin'])}"
+            ),
+            "ori_shape": (self.image_size, self.image_size),
+            "resized_shape": (self.image_size, self.image_size),
+            "sample_name": window.name,
+            "spad_start_bin": int(first_chunk["spad_start_bin"]),
+            "spad_end_bin": int(last_chunk["spad_end_bin"]),
+            "chunk_size": int(first_chunk.get("chunk_size", self.output_frames * self.spad_bins_per_gt)),
+        }
+
+    def _labels_for_window(self, window: SpadPoseRenderedSequenceWindow):
+        ann = self.annotations[window.name]
+        cls_ll, bbox_ll, kpt_ll, batch_idx_ll = [], [], [], []
+
+        for out_i, chunk in enumerate(window.chunks):
+            gt_time = float(chunk["target_gt_time"])
+            for hand_name, cls_id in self.HAND_TO_CLASS.items():
+                hand = self._interpolate_hand_annotation(ann, gt_time, hand_name)
+                if not hand:
+                    continue
+                cls_ll.append([float(cls_id)])
+                bbox_ll.append(self._xyxy_to_normalized_xywh(hand["bbox"]))
+                kpt_ll.append(self._keypoints_to_normalized_xyv(hand["keypoints_2d"]))
+                batch_idx_ll.append([float(out_i)])
+
+        if cls_ll:
+            cls = torch.tensor(cls_ll, dtype=torch.float32)
+            bboxes = torch.tensor(bbox_ll, dtype=torch.float32)
+            keypoints = torch.tensor(kpt_ll, dtype=torch.float32)
+            batch_idx = torch.tensor(batch_idx_ll, dtype=torch.float32)
+        else:
+            cls = torch.zeros((0, 1), dtype=torch.float32)
+            bboxes = torch.zeros((0, 4), dtype=torch.float32)
+            keypoints = torch.zeros((0, 21, 3), dtype=torch.float32)
+            batch_idx = torch.zeros((0, 1), dtype=torch.float32)
+        return cls, bboxes, keypoints, batch_idx
+
+    def _interpolate_hand_annotation(self, ann: dict[str, Any], gt_time: float, hand_name: str):
+        return SpadPoseSequenceDataset._interpolate_hand_annotation(self, ann, gt_time, hand_name)
+
+    def _xyxy_to_normalized_xywh(self, bbox) -> list[float]:
+        return SpadPoseSequenceDataset._xyxy_to_normalized_xywh(self, bbox)
+
+    def _keypoints_to_normalized_xyv(self, keypoints) -> list[list[float]]:
+        return SpadPoseSequenceDataset._keypoints_to_normalized_xyv(self, keypoints)
+
+    def _build_ultralytics_labels(self) -> list[dict[str, Any]]:
+        labels = []
+        for window in self.windows:
+            cls, bboxes, keypoints, _ = self._labels_for_window(window)
+            first_chunk = window.chunks[0]
+            last_chunk = window.chunks[-1]
+            labels.append(
+                {
+                    "im_file": (
+                        f"{window.name}:{int(first_chunk['spad_start_bin'])}:"
+                        f"{int(last_chunk['spad_end_bin'])}"
+                    ),
+                    "shape": (self.image_size, self.image_size),
+                    "cls": cls.detach().cpu().numpy(),
+                    "bboxes": bboxes.detach().cpu().numpy(),
+                    "segments": [],
+                    "keypoints": keypoints.detach().cpu().numpy(),
+                    "normalized": True,
+                    "bbox_format": "xywh",
+                }
+            )
+        return labels
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        new_batch = {}
+        new_batch["img"] = torch.stack([b["img"] for b in batch], 0)
+        new_batch["cls"] = torch.cat([b["cls"] for b in batch], 0)
+        new_batch["bboxes"] = torch.cat([b["bboxes"] for b in batch], 0)
+        new_batch["keypoints"] = torch.cat([b["keypoints"] for b in batch], 0)
+
+        batch_idx = []
+        t_offset = 0
+        for b in batch:
+            idx = b["batch_idx"].clone()
+            if idx.numel():
+                idx += t_offset
+            batch_idx.append(idx)
+            t_offset += int(b["output_frames"])
+        new_batch["batch_idx"] = torch.cat(batch_idx, 0) if batch_idx else torch.zeros((0, 1), dtype=torch.float32)
+
+        new_batch["im_file"] = [b["im_file"] for b in batch]
+        new_batch["output_frames"] = [b["output_frames"] for b in batch]
+        new_batch["packed_nch"] = int(batch[0]["packed_nch"])
+        new_batch["ori_shape"] = [b["ori_shape"] for b in batch]
+        new_batch["resized_shape"] = [b["resized_shape"] for b in batch]
+        new_batch["sample_name"] = [b["sample_name"] for b in batch]
+        new_batch["spad_start_bin"] = torch.tensor([b["spad_start_bin"] for b in batch], dtype=torch.long)
+        new_batch["spad_end_bin"] = torch.tensor([b["spad_end_bin"] for b in batch], dtype=torch.long)
+        new_batch["chunk_size"] = torch.tensor([b["chunk_size"] for b in batch], dtype=torch.long)
+        new_batch["t_index_ll"] = batch[0]["t_index_ll"]
+        return new_batch
+
+
 # Backward-compatible aliases while the codebase transitions to explicit Sequence/Frame naming.
 SpadWindow = SpadPoseSequenceWindow
 SpadPoseDataset = SpadPoseSequenceDataset

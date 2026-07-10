@@ -15,6 +15,7 @@ from ultralytics.data.spad_pose_dataset import (
     SpadPoseDataset,
     SpadPoseFrameDataset,
     SpadPoseRenderedFrameDataset,
+    SpadPoseRenderedSequenceDataset,
     SpadPoseSequenceDataset,
     load_visionsim_split_json,
 )
@@ -181,6 +182,48 @@ class SpadPoseSequenceTrainer(PoseTrainer):
             }
         return super().get_dataset()
 
+    @staticmethod
+    def _samples_have_explicit_render(samples: list[dict[str, str]], preprocessor_name: str) -> bool:
+        key = str(preprocessor_name).strip().lower()
+        return bool(samples) and all(bool(sample.get(key)) for sample in samples)
+
+    def _resolve_spad_cache_mode(self, samples: list[dict[str, str]], preprocessor_name: str) -> str:
+        requested = str(getattr(self.args, "spad_cache_mode", "auto")).strip().lower()
+        if requested == "raw":
+            return "raw"
+        if requested == "rendered":
+            return "rendered"
+        if requested == "auto":
+            return "rendered" if self._samples_have_explicit_render(samples, preprocessor_name) else "raw"
+        raise ValueError(f"Unsupported spad_cache_mode={requested!r}; expected raw, rendered, or auto.")
+
+    def _build_preprocessor_kwargs(self, preprocessor_name: str, spad_subsampling: int) -> dict[str, Any]:
+        preprocessor_name = str(preprocessor_name).strip().lower()
+        if preprocessor_name == "ppb":
+            return {
+                "subsampling": spad_subsampling,
+                "bocpd_gamma": float(getattr(self.args, "ppb_bocpd_gamma", getattr(self.args, "bocpd_gamma", 5e-4))),
+                "normalize": bool(getattr(self.args, "ppb_normalize", True)),
+                "quantile": float(getattr(self.args, "ppb_quantile", getattr(self.args, "quantile", 1.0))),
+                "min_filter_size": int(getattr(self.args, "ppb_min_filter_size", getattr(self.args, "min_filter_size", 7))),
+            }
+        if preprocessor_name == "stea":
+            return {
+                "subsampling": spad_subsampling,
+                "fast_window": int(getattr(self.args, "stea_fast_window", 16)),
+                "slow_window": int(getattr(self.args, "stea_slow_window", 128)),
+                "temporal_window": int(getattr(self.args, "stea_temporal_window", 5)),
+                "fast_tau": None if getattr(self.args, "stea_fast_tau", None) in {None, 0} else float(getattr(self.args, "stea_fast_tau")),
+                "motion_sharpness": float(getattr(self.args, "stea_motion_sharpness", 60.0)),
+                "motion_threshold": float(getattr(self.args, "stea_motion_threshold", 0.05)),
+                "stable_prior": float(getattr(self.args, "stea_stable_prior", 16.0)),
+                "normalize": bool(getattr(self.args, "stea_normalize", True)),
+                "quantile": float(getattr(self.args, "stea_quantile", 1.0)),
+            }
+        if preprocessor_name == "sum":
+            return {"subsampling": spad_subsampling}
+        raise ValueError(f"Unsupported training preprocessor: {preprocessor_name!r}")
+
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
         """Build SPAD pose dataset for train/val from VisionSIM split JSON."""
         json_path = getattr(self.args, "spad_train_json", None) or self.data.get("spad_train_json")
@@ -192,12 +235,48 @@ class SpadPoseSequenceTrainer(PoseTrainer):
         samples = load_visionsim_split_json(json_path)
         LOGGER.info(f"Loaded {len(samples)} samples from {json_path} for mode={mode!r}")
 
+        output_frames = int(getattr(self.args, "spad_output_frames", self.data.get("spad_output_frames", 4)))
+        spad_bins_per_gt = int(getattr(self.args, "spad_bins_per_gt", self.data.get("spad_bins_per_gt", 64)))
+        spad_subsampling = int(getattr(self.args, "spad_subsampling", self.data.get("spad_subsampling", 64)))
+        stride_frames = int(getattr(self.args, "spad_stride_frames", self.data.get("spad_stride_frames", 0))) or None
+        preprocessor_name = str(getattr(self.args, "spad_preprocessor", "ppb")).strip().lower()
+        cache_mode = self._resolve_spad_cache_mode(samples, preprocessor_name)
+        LOGGER.info(f"SpadPoseSequenceTrainer cache_mode={cache_mode!r} preprocessor={preprocessor_name!r}")
+
+        if cache_mode == "rendered":
+            chunk_size = int(getattr(self.args, "spad_chunk_size", 0)) or (5 * spad_subsampling)
+            input_gamma = float(getattr(self.args, "spad_input_gamma", getattr(self.args, "input_gamma", 1.0)))
+            render_root = getattr(self.args, "spad_render_root", None)
+            stride_bins = chunk_size if stride_frames is None else (int(stride_frames) * spad_bins_per_gt)
+            has_explicit_render = self._samples_have_explicit_render(samples, preprocessor_name)
+            expected_config = None if has_explicit_render else build_render_config(
+                preprocessor=preprocessor_name,
+                chunk_size=chunk_size,
+                stride_bins=stride_bins,
+                spad_bins_per_gt=spad_bins_per_gt,
+                packed_ch_order=getattr(self.args, "spad_packed_ch_order", self.data.get("spad_packed_ch_order", "RGB")),
+                input_gamma=input_gamma,
+                extra_kwargs=self._build_preprocessor_kwargs(preprocessor_name, spad_subsampling),
+            )
+            return SpadPoseRenderedSequenceDataset(
+                samples=samples,
+                render_root=render_root,
+                preprocessor=preprocessor_name,
+                output_frames=output_frames,
+                spad_bins_per_gt=spad_bins_per_gt,
+                stride_frames=stride_frames,
+                image_size=int(getattr(self.args, "spad_image_size", self.data.get("spad_image_size", 512))),
+                render_contains_confidence=bool(getattr(self.args, "spad_render_contains_confidence", True)),
+                expected_render_config=expected_config,
+                source_render_dirname=str(getattr(self.args, "spad_source_render_dirname", "renders-spc8kHz")),
+            )
+
         return SpadPoseDataset(
             samples=samples,
-            output_frames=int(getattr(self.args, "spad_output_frames", self.data.get("spad_output_frames", 4))),
-            spad_bins_per_gt=int(getattr(self.args, "spad_bins_per_gt", self.data.get("spad_bins_per_gt", 64))),
-            spad_step=int(getattr(self.args, "spad_subsampling", self.data.get("spad_subsampling", 64))),
-            stride_frames=int(getattr(self.args, "spad_stride_frames", self.data.get("spad_stride_frames", 0))) or None,
+            output_frames=output_frames,
+            spad_bins_per_gt=spad_bins_per_gt,
+            spad_step=spad_subsampling,
+            stride_frames=stride_frames,
             image_size=int(getattr(self.args, "spad_image_size", self.data.get("spad_image_size", 512))),
             packed_ch_order=getattr(self.args, "spad_packed_ch_order", self.data.get("spad_packed_ch_order", "RGB")),
         )
@@ -212,34 +291,10 @@ class SpadPoseSequenceTrainer(PoseTrainer):
         preprocessor_name = str(getattr(self.args, "spad_preprocessor", "ppb")).strip().lower()
         spad_subsampling = int(getattr(self.args, "spad_subsampling", getattr(self.args, "subsampling", 64)))
         spad_bin_rate_hz = float(getattr(self.args, "spad_bin_rate_hz", 8000.0))
-        preprocessor_kwargs = {"subsampling": spad_subsampling}
-        if preprocessor_name == "ppb":
-            preprocessor_kwargs.update(
-                {
-                    "bocpd_gamma": float(getattr(self.args, "ppb_bocpd_gamma", getattr(self.args, "bocpd_gamma", 5e-4))),
-                    "normalize": bool(getattr(self.args, "ppb_normalize", True)),
-                    "quantile": float(getattr(self.args, "ppb_quantile", getattr(self.args, "quantile", 1.0))),
-                    "min_filter_size": int(getattr(self.args, "ppb_min_filter_size", getattr(self.args, "min_filter_size", 7))),
-                }
-            )
-        elif preprocessor_name == "stea":
-            preprocessor_kwargs.update(
-                {
-                    "fast_window": int(getattr(self.args, "stea_fast_window", 16)),
-                    "slow_window": int(getattr(self.args, "stea_slow_window", 128)),
-                    "temporal_window": int(getattr(self.args, "stea_temporal_window", 5)),
-                    "fast_tau": None if getattr(self.args, "stea_fast_tau", None) in {None, 0} else float(getattr(self.args, "stea_fast_tau")),
-                    "motion_sharpness": float(getattr(self.args, "stea_motion_sharpness", 60.0)),
-                    "motion_threshold": float(getattr(self.args, "stea_motion_threshold", 0.05)),
-                    "stable_prior": float(getattr(self.args, "stea_stable_prior", 16.0)),
-                    "normalize": bool(getattr(self.args, "stea_normalize", True)),
-                    "quantile": float(getattr(self.args, "stea_quantile", 1.0)),
-                }
-            )
-        elif preprocessor_name == "sum":
-            preprocessor_kwargs = {"subsampling": spad_subsampling}
-        else:
-            raise ValueError(f"Unsupported training preprocessor: {preprocessor_name!r}")
+        train_json = getattr(self.args, "spad_train_json", None) or self.data.get("spad_train_json")
+        samples = load_visionsim_split_json(train_json) if train_json else []
+        resolved_cache_mode = self._resolve_spad_cache_mode(samples, preprocessor_name)
+        preprocessor_kwargs = self._build_preprocessor_kwargs(preprocessor_name, spad_subsampling)
 
         plugin_layers = getattr(self.args, "spad_plugin_scales", None)
         if isinstance(plugin_layers, str):
@@ -264,6 +319,7 @@ class SpadPoseSequenceTrainer(PoseTrainer):
             plugin_alpha_init=float(getattr(self.args, "spad_plugin_alpha_init", 0.0)),
             spad_input_gamma=float(getattr(self.args, "spad_input_gamma", getattr(self.args, "input_gamma", 1.0))),
             spad_bin_rate_hz=spad_bin_rate_hz,
+            spad_cache_mode=resolved_cache_mode,
         )
         if weights:
             model.load(weights)
@@ -284,6 +340,10 @@ class SpadPoseSequenceTrainer(PoseTrainer):
             self.model.spad_packed_nch = packed_nch
             if getattr(self, "ema", None) is not None and getattr(self.ema, "ema", None) is not None:
                 self.ema.ema.spad_packed_nch = packed_nch
+        t_index_ll = batch.get("t_index_ll")
+        self.model.spad_pending_t_index_ll = t_index_ll
+        if getattr(self, "ema", None) is not None and getattr(self.ema, "ema", None) is not None:
+            self.ema.ema.spad_pending_t_index_ll = t_index_ll
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
@@ -462,47 +522,11 @@ class SpadPoseSequenceTrainer(PoseTrainer):
 class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
     """Pose trainer that collapses each raw SPAD chunk into one end-of-chunk detector frame."""
 
-    @staticmethod
-    def _samples_have_explicit_render(samples: list[dict[str, str]], preprocessor_name: str) -> bool:
-        key = str(preprocessor_name).strip().lower()
-        return bool(samples) and all(bool(sample.get(key)) for sample in samples)
-
     def _resolve_frame_cache_mode(self, samples: list[dict[str, str]], preprocessor_name: str) -> str:
-        requested = str(getattr(self.args, "spad_cache_mode", "auto")).strip().lower()
-        if requested == "raw":
-            return "raw"
-        if requested == "rendered":
-            return "rendered"
-        if requested == "auto":
-            return "rendered" if self._samples_have_explicit_render(samples, preprocessor_name) else "raw"
-        raise ValueError(f"Unsupported spad_cache_mode={requested!r}; expected raw, rendered, or auto.")
+        return self._resolve_spad_cache_mode(samples, preprocessor_name)
 
     def _build_frame_preprocessor_kwargs(self, preprocessor_name: str, spad_subsampling: int) -> dict[str, Any]:
-        preprocessor_name = str(preprocessor_name).strip().lower()
-        if preprocessor_name == "ppb":
-            return {
-                "subsampling": spad_subsampling,
-                "bocpd_gamma": float(getattr(self.args, "ppb_bocpd_gamma", getattr(self.args, "bocpd_gamma", 5e-4))),
-                "normalize": bool(getattr(self.args, "ppb_normalize", True)),
-                "quantile": float(getattr(self.args, "ppb_quantile", getattr(self.args, "quantile", 1.0))),
-                "min_filter_size": int(getattr(self.args, "ppb_min_filter_size", getattr(self.args, "min_filter_size", 7))),
-            }
-        if preprocessor_name == "stea":
-            return {
-                "subsampling": spad_subsampling,
-                "fast_window": int(getattr(self.args, "stea_fast_window", 16)),
-                "slow_window": int(getattr(self.args, "stea_slow_window", 128)),
-                "temporal_window": int(getattr(self.args, "stea_temporal_window", 5)),
-                "fast_tau": None if getattr(self.args, "stea_fast_tau", None) in {None, 0} else float(getattr(self.args, "stea_fast_tau")),
-                "motion_sharpness": float(getattr(self.args, "stea_motion_sharpness", 60.0)),
-                "motion_threshold": float(getattr(self.args, "stea_motion_threshold", 0.05)),
-                "stable_prior": float(getattr(self.args, "stea_stable_prior", 16.0)),
-                "normalize": bool(getattr(self.args, "stea_normalize", True)),
-                "quantile": float(getattr(self.args, "stea_quantile", 1.0)),
-            }
-        if preprocessor_name == "sum":
-            return {"subsampling": spad_subsampling}
-        raise ValueError(f"Unsupported frame-mode SPAD preprocessor: {preprocessor_name!r}")
+        return self._build_preprocessor_kwargs(preprocessor_name, spad_subsampling)
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
         """Build frame-mode SPAD pose dataset for train/val from VisionSIM split JSON."""
