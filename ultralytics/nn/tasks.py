@@ -654,6 +654,7 @@ class SpadPoseModel(PoseModel):
         self.spad_packed_nch = 3
         self.spad_last_recon_frames = None
         self.spad_pending_t_index_ll = None
+        self.spad_online_inference = False
 
         super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
 
@@ -718,6 +719,19 @@ class SpadPoseModel(PoseModel):
                     current_bin_rate_hz=self.spad_current_bin_rate_hz,
                     reference_bin_rate_hz=self.spad_reference_bin_rate_hz,
                 )
+
+    def spad_set_online_inference(self, enabled: bool) -> None:
+        """Switch detector SSD plugins to one-chunk online streaming (inference)."""
+        self.spad_online_inference = bool(enabled)
+        for plugin in self.plugins_by_layer.values():
+            if hasattr(plugin, "set_online_mode"):
+                plugin.set_online_mode(enabled)
+
+    def spad_clear_plugin_states(self) -> None:
+        """Reset SSD hidden states before processing a new sample/video stream."""
+        for plugin in self.plugins_by_layer.values():
+            if hasattr(plugin, "clear_temporal_state"):
+                plugin.clear_temporal_state()
 
     def _infer_backbone_plugin_layers(self) -> tuple[int, ...]:
         """Infer SSD insertion points after each backbone stage (before the FPN neck).

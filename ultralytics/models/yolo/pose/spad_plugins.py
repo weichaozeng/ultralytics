@@ -46,6 +46,15 @@ class TemporalSSDPlugin(nn.Module):
             ) from exc
 
         self.core = SSD(in_dim=in_dim, state_dim=state_dim, head_dim=head_dim, **dict(ssd_kwargs or {}))
+        self.online_mode = False
+
+    def set_online_mode(self, enabled: bool) -> None:
+        """Enable one-step online SSD updates that carry hidden state across forwards."""
+        self.online_mode = bool(enabled)
+
+    def clear_temporal_state(self) -> None:
+        """Reset SSD hidden state before a new streaming sequence."""
+        self.core.clear_hidden_state()
 
     def set_bin_rate_hz(
         self,
@@ -64,6 +73,18 @@ class TemporalSSDPlugin(nn.Module):
             raise ValueError(f"TemporalSSDPlugin expected T,B,C,H,W tensor, got {type(x)}")
         t, b, c, h, w = x.shape
         x_flat = x.permute(0, 1, 3, 4, 2).reshape(t, b * h * w, c).contiguous()
+        if self.online_mode:
+            if t != 1:
+                raise ValueError(
+                    f"TemporalSSDPlugin online mode expects exactly one timestep per forward, got T={t}"
+                )
+            if len(t_index_ll) != 1:
+                raise ValueError(
+                    f"TemporalSSDPlugin online mode expects one t_index, got {len(t_index_ll)}"
+                )
+            out = self.core.forward_online(x_flat[0], time_instant=float(t_index_ll[0]))
+            out = out.reshape(b, h, w, c).permute(0, 3, 1, 2).unsqueeze(0).contiguous()
+            return out, list(t_index_ll)
         out, out_t_index_ll = self.core(x_flat, t_index_ll)
         out_t = out.shape[0]
         out = out.reshape(out_t, b, h, w, c).permute(0, 1, 4, 2, 3).contiguous()
@@ -123,6 +144,12 @@ class SpatialTemporalPlugin(nn.Module):
             head_dim=_compatible_head_dim(hidden_dim, head_dim),
             ssd_kwargs=ssd_kwargs,
         )
+
+    def set_online_mode(self, enabled: bool) -> None:
+        self.temporal.set_online_mode(enabled)
+
+    def clear_temporal_state(self) -> None:
+        self.temporal.clear_temporal_state()
 
     def set_bin_rate_hz(
         self,

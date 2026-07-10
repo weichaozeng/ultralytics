@@ -1,7 +1,7 @@
 """Run external SPAD preprocessors before a standard YOLO pose detector.
 
 This script evaluates classic preprocessor + original detector baselines against a
-VisionSIM split JSON. It mirrors ``test_spad_pose.py`` output conventions:
+VisionSIM split JSON. It mirrors ``test_spad_pose_sequence.py`` output conventions:
 
 - JSON results: ``Evals/<model_name>/<test_name>/<sample>.json``
 - Optional visualizations: ``Vis/<model_name>/<test_name>/...``
@@ -34,7 +34,7 @@ from det_spad_pose import (
     _slice_raw_chunk,
     _video_num_bins,
 )
-from test_spad_pose import (
+from test_spad_pose_sequence import (
     _default_test_name,
     _default_test_name_from_json,
     _draw_bbox,
