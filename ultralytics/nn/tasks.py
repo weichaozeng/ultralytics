@@ -767,10 +767,12 @@ class SpadPoseModel(PoseModel):
         if current_bin_rate_hz <= 0:
             raise ValueError(f"current_bin_rate_hz must be positive, got {current_bin_rate_hz}")
         self.spad_current_bin_rate_hz = current_bin_rate_hz
-        self.ssd_kwargs["reference_bin_rate_hz"] = self.spad_reference_bin_rate_hz
-        self.ssd_kwargs["current_bin_rate_hz"] = self.spad_current_bin_rate_hz
-        self.attn_kwargs["reference_bin_rate_hz"] = self.spad_reference_bin_rate_hz
-        self.attn_kwargs["current_bin_rate_hz"] = self.spad_current_bin_rate_hz
+        if hasattr(self, "ssd_kwargs"):
+            self.ssd_kwargs["reference_bin_rate_hz"] = self.spad_reference_bin_rate_hz
+            self.ssd_kwargs["current_bin_rate_hz"] = self.spad_current_bin_rate_hz
+        if hasattr(self, "attn_kwargs"):
+            self.attn_kwargs["reference_bin_rate_hz"] = self.spad_reference_bin_rate_hz
+            self.attn_kwargs["current_bin_rate_hz"] = self.spad_current_bin_rate_hz
         for plugin in self.plugins_by_layer.values():
             if hasattr(plugin, "set_bin_rate_hz"):
                 plugin.set_bin_rate_hz(
