@@ -159,10 +159,10 @@ spad_render_root: # (str, optional) root directory containing cached rendered fr
 spad_render_contains_confidence: True # (bool) whether cached renders include confidence.npy for UA/residual adapters
 spad_source_render_dirname: renders-spc8kHz # (str) source render dirname used to infer sibling rendered cache roots
 spad_preprocessor: ppb # (str) detector input preprocessor: ppb, sum, stea
-spad_plugin: temporal_ssd # (str) detector-side feature plugin: none, temporal_ssd, spatial_only, spatial_temporal
+spad_plugin: temporal_ssd # (str) detector-side feature plugin: none, temporal_ssd, temporal_attn, sr_attn, window_st_attn, spatial_only, spatial_temporal
 spad_frame_adapter: ua # (str) frame-mode image-space adapter: none, residual, ua
 spad_plugin_scales: 16,19,22 # (str) comma-separated YOLO layer indices for detector plugins
-spad_temporal_core: ssd # (str) temporal core used by plugins
+spad_temporal_core: ssd # (str) temporal core used by plugins: ssd, temporal_attn, sr_attn, window_st_attn
 spad_freeze_detector: True # (bool) freeze pretrained detector while training SPAD modules
 spad_eval_max_batches: -1 # (int) max test batches for SPAD eval visualization (-1 = full split)
 spad_eval_seed: 0 # (int) seed for SPAD eval sampling
@@ -187,6 +187,11 @@ stea_normalize: True # (bool) normalize STEA reconstructions
 stea_quantile: 1.0 # (float) normalization quantile for STEA
 ssd_state_dim: 8 # (int) latent state dimension for SSD temporal blocks
 ssd_head_divisor: 4 # (int) derive SSD head dim from channels // divisor
+attn_state_dim: 8 # (int) bottleneck state width for attention temporal blocks (attn_dim = num_heads * attn_state_dim)
+attn_head_divisor: 4 # (int) derive attention head dim from channels // divisor
+attn_dropout: 0.0 # (float) dropout for attention temporal blocks
+attn_sr_ratio: 2 # (int) default spatial-reduction ratio for sr_attn plugins
+attn_window_size: [3, 7, 7] # (list) default window size [T,H,W] for window_st_attn plugins
 spad_spatial_reduce_ratio: 2 # (int) channel bottleneck ratio for spatial detector plugins
 spad_spatial_kernel_size: 3 # (int) depthwise kernel size for spatial detector plugins
 spad_plugin_alpha_init: 0.0 # (float) initial residual gate value for detector plugins

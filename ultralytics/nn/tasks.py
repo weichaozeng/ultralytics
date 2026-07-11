@@ -618,6 +618,12 @@ class SpadPoseModel(PoseModel):
         ssd_state_dim=8,
         ssd_head_divisor=4,
         ssd_kwargs=None,
+        attn_state_dim=8,
+        attn_head_divisor=4,
+        attn_dropout=0.0,
+        attn_sr_ratio=2,
+        attn_window_size=(3, 7, 7),
+        attn_kwargs=None,
         spatial_reduce_ratio=2,
         spatial_kernel_size=3,
         plugin_alpha_init=0.0,
@@ -639,9 +645,15 @@ class SpadPoseModel(PoseModel):
         else:
             self.plugin_layers = None if plugin_layers is None else tuple(plugin_layers)
         self.temporal_core = str(temporal_core).strip().lower()
-        self.ssd_state_dim = ssd_state_dim
-        self.ssd_head_divisor = ssd_head_divisor
+        self.ssd_state_dim = int(ssd_state_dim)
+        self.ssd_head_divisor = int(ssd_head_divisor)
         self.ssd_kwargs = dict(ssd_kwargs or {})
+        self.attn_state_dim = int(attn_state_dim)
+        self.attn_head_divisor = int(attn_head_divisor)
+        self.attn_dropout = float(attn_dropout)
+        self.attn_sr_ratio = int(attn_sr_ratio)
+        self.attn_window_size = tuple(int(v) for v in attn_window_size)
+        self.attn_kwargs = dict(attn_kwargs or {})
         self.spatial_reduce_ratio = spatial_reduce_ratio
         self.spatial_kernel_size = spatial_kernel_size
         self.plugin_alpha_init = plugin_alpha_init
@@ -651,6 +663,10 @@ class SpadPoseModel(PoseModel):
         self.spad_current_bin_rate_hz = float(spad_bin_rate_hz)
         self.ssd_kwargs.setdefault("reference_bin_rate_hz", self.spad_reference_bin_rate_hz)
         self.ssd_kwargs.setdefault("current_bin_rate_hz", self.spad_current_bin_rate_hz)
+        self.attn_kwargs.setdefault("reference_bin_rate_hz", self.spad_reference_bin_rate_hz)
+        self.attn_kwargs.setdefault("current_bin_rate_hz", self.spad_current_bin_rate_hz)
+        if self.attn_dropout > 0:
+            self.attn_kwargs.setdefault("dropout", self.attn_dropout)
         self.spad_packed_nch = 3
         self.spad_last_recon_frames = None
         self.spad_pending_t_index_ll = None
@@ -666,32 +682,72 @@ class SpadPoseModel(PoseModel):
 
     def _init_spad_modules(self):
         """Create SPAD preprocessors and detector plugins without changing the base YOLO graph."""
-        from ultralytics.models.yolo.pose.spad_plugins import build_spad_plugin
+        from ultralytics.models.yolo.pose.spad_plugins import build_spad_plugin, uses_attn_temporal
+
         from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_preprocessor
 
         self.preprocessor = build_spad_preprocessor(self.preprocessor_name, kwargs=self.preprocessor_kwargs)
         resolved_layers = self._resolve_plugin_layers()
         self.plugin_layers = tuple(resolved_layers)
+        use_attn = uses_attn_temporal(plugin=self.plugin_name, temporal_core=self.temporal_core)
 
         for layer_idx in self.plugin_layers:
             channels = self._layer_output_channels(layer_idx)
-            head_dim = self._ssd_head_dim(channels)
-            self.spad_plugin_layer_info[int(layer_idx)] = {"in_dim": int(channels), "head_dim": int(head_dim)}
+            if use_attn:
+                state_dim = self.attn_state_dim
+                head_dim = self._attn_head_dim(channels)
+                core_kwargs = self._build_attn_core_kwargs(layer_idx)
+            else:
+                state_dim = self.ssd_state_dim
+                head_dim = self._ssd_head_dim(channels)
+                core_kwargs = dict(self.ssd_kwargs)
+
+            self.spad_plugin_layer_info[int(layer_idx)] = {
+                "in_dim": int(channels),
+                "head_dim": int(head_dim),
+                "temporal_backend": "attn" if use_attn else "ssd",
+            }
             self.plugins_by_layer[str(layer_idx)] = build_spad_plugin(
                 self.plugin_name,
                 in_dim=channels,
-                state_dim=self.ssd_state_dim,
+                state_dim=state_dim,
                 head_dim=head_dim,
                 reduce_ratio=self.spatial_reduce_ratio,
                 kernel_size=self.spatial_kernel_size,
                 alpha_init=self.plugin_alpha_init,
                 temporal_core=self.temporal_core,
-                ssd_kwargs=self.ssd_kwargs,
+                ssd_kwargs=core_kwargs if not use_attn else {},
+                attn_kwargs=core_kwargs if use_attn else {},
             )
         self.set_spad_bin_rate_hz(
             current_bin_rate_hz=self.spad_current_bin_rate_hz,
             reference_bin_rate_hz=self.spad_reference_bin_rate_hz,
         )
+
+    def _active_attn_core_name(self) -> str | None:
+        from ultralytics.models.yolo.pose.spad_plugins import uses_attn_temporal
+
+        if not uses_attn_temporal(plugin=self.plugin_name, temporal_core=self.temporal_core):
+            return None
+        if self.plugin_name in {"temporal_attn", "sr_attn", "window_st_attn"}:
+            return self.plugin_name
+        return self.temporal_core
+
+    def _build_attn_core_kwargs(self, layer_idx: int) -> dict:
+        """Return attention-core kwargs scoped to the active plugin/core type."""
+        core_name = self._active_attn_core_name()
+        kwargs = dict(self.attn_kwargs)
+        if core_name == "sr_attn":
+            default_sr = {2: 4, 4: 2, 6: 1, 8: 1, 9: 1}
+            kwargs["sr_ratio"] = int(default_sr.get(int(layer_idx), self.attn_sr_ratio))
+            kwargs.pop("window_size", None)
+        elif core_name == "window_st_attn":
+            kwargs["window_size"] = tuple(self.attn_window_size)
+            kwargs.pop("sr_ratio", None)
+        else:
+            kwargs.pop("sr_ratio", None)
+            kwargs.pop("window_size", None)
+        return kwargs
 
     def set_spad_bin_rate_hz(
         self,
@@ -713,6 +769,8 @@ class SpadPoseModel(PoseModel):
         self.spad_current_bin_rate_hz = current_bin_rate_hz
         self.ssd_kwargs["reference_bin_rate_hz"] = self.spad_reference_bin_rate_hz
         self.ssd_kwargs["current_bin_rate_hz"] = self.spad_current_bin_rate_hz
+        self.attn_kwargs["reference_bin_rate_hz"] = self.spad_reference_bin_rate_hz
+        self.attn_kwargs["current_bin_rate_hz"] = self.spad_current_bin_rate_hz
         for plugin in self.plugins_by_layer.values():
             if hasattr(plugin, "set_bin_rate_hz"):
                 plugin.set_bin_rate_hz(
@@ -820,8 +878,16 @@ class SpadPoseModel(PoseModel):
 
     def _ssd_head_dim(self, channels):
         """Choose an SSD head dimension that divides the feature channel count."""
-        divisor = max(int(self.ssd_head_divisor), 1)
-        head_dim = max(channels // divisor, 1)
+        return self._temporal_head_dim(channels, divisor=self.ssd_head_divisor)
+
+    def _attn_head_dim(self, channels):
+        """Choose an attention head dimension that divides the feature channel count."""
+        return self._temporal_head_dim(channels, divisor=self.attn_head_divisor)
+
+    @staticmethod
+    def _temporal_head_dim(channels, *, divisor: int):
+        divisor = max(int(divisor), 1)
+        head_dim = max(int(channels) // divisor, 1)
         while channels % head_dim != 0 and head_dim > 1:
             head_dim -= 1
         return head_dim

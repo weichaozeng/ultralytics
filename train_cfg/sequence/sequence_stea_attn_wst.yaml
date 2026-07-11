@@ -1,0 +1,51 @@
+spad_train_mode: sequence
+model: /home/zvc/Project/SPADHand/ultralytics/weights/detector.pt
+
+spad_train_json: /home/zvc/Data/visionsim/outputs/train.json
+spad_test_json: /home/zvc/Data/visionsim/outputs/test.json
+
+project: Runs/spad_pose
+name: sequence_stea_attn_wst
+device: "0"
+epochs: 60
+batch: 4
+workers: 0
+imgsz: 512
+
+# sequence windowing (10 consecutive cached frames per sample)
+spad_output_frames: 10
+spad_chunk_size: 320
+spad_subsampling: 64
+spad_bins_per_gt: 64
+spad_stride_frames: 5
+spad_image_size: 512
+spad_packed_ch_order: RGB
+spad_cache_mode: auto
+
+# STEA offline cache (forward skips online preprocessing when cache_mode=rendered)
+spad_preprocessor: stea
+stea_fast_window: 16
+stea_slow_window: 128
+stea_temporal_window: 5
+stea_fast_tau: 6.0
+stea_motion_sharpness: 60.0
+stea_motion_threshold: 0.07
+stea_stable_prior: 16.0
+stea_normalize: true
+stea_quantile: 1.0
+
+# backbone windowed spatio-temporal attention plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.
+spad_plugin: window_st_attn
+spad_plugin_scales: backbone
+attn_state_dim: 8
+attn_head_divisor: 4
+attn_dropout: 0.0
+attn_sr_ratio: 2
+attn_window_size: [3, 7, 7]
+spad_spatial_reduce_ratio: 2
+spad_spatial_kernel_size: 3
+spad_plugin_alpha_init: 0.0
+
+spad_bin_rate_hz: 8000.0
+spad_input_gamma: 2.2
+spad_freeze_detector: true

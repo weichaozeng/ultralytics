@@ -156,7 +156,7 @@ class SpadPoseSequenceTrainer(PoseTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
         """Initialize SPAD trainer while allowing custom SPAD args through Ultralytics cfg validation."""
         overrides = overrides or {}
-        custom_prefixes = ("spad_", "ppb_", "stea_", "ssd_")
+        custom_prefixes = ("spad_", "ppb_", "stea_", "ssd_", "attn_")
         if any(str(k).startswith(custom_prefixes) for k in overrides):
             cfg_dict = dict(vars(cfg)) if hasattr(cfg, "__dict__") else dict(cfg)
             cfg_dict.update({k: v for k, v in overrides.items() if str(k).startswith(custom_prefixes)})
@@ -327,6 +327,11 @@ class SpadPoseSequenceTrainer(PoseTrainer):
             temporal_core=str(getattr(self.args, "spad_temporal_core", "ssd")),
             ssd_state_dim=int(getattr(self.args, "ssd_state_dim", 8)),
             ssd_head_divisor=int(getattr(self.args, "ssd_head_divisor", 4)),
+            attn_state_dim=int(getattr(self.args, "attn_state_dim", 8)),
+            attn_head_divisor=int(getattr(self.args, "attn_head_divisor", 4)),
+            attn_dropout=float(getattr(self.args, "attn_dropout", 0.0)),
+            attn_sr_ratio=int(getattr(self.args, "attn_sr_ratio", 2)),
+            attn_window_size=tuple(getattr(self.args, "attn_window_size", (3, 7, 7))),
             spatial_reduce_ratio=int(getattr(self.args, "spad_spatial_reduce_ratio", 2)),
             spatial_kernel_size=int(getattr(self.args, "spad_spatial_kernel_size", 3)),
             plugin_alpha_init=float(getattr(self.args, "spad_plugin_alpha_init", 0.0)),
