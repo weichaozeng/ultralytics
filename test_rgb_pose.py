@@ -1,10 +1,10 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Run standard YOLO pose tracking on RGB ``frames.npy`` and save structured predictions.
 
-This is the RGB sibling of ``test_spad_pose_sequence.py`` / ``test_pose.py``:
+This is the RGB sibling of ``test_spad_pose_sequence.py`` / ``test_spad_pose_pre.py``:
 - Reads VisionSIM RGB clips (``renders-rgb25fps/.../frames.npy``) or direct paths.
 - Runs the pretrained detector via Ultralytics ``model.track`` (same path as ``det.py`` / ``det_rgb.py``).
-- Writes ``Evals/<dated_model>/<test_name>/<sample>.json`` and optional ``Vis/...``.
+- Writes ``Evals/<YYYYMMDD>_detector/<test_name>/<sample>.json`` and optional ``Vis/...``.
 """
 
 from __future__ import annotations
@@ -34,15 +34,14 @@ from test_spad_pose_sequence import (
     _eval_dir,
     _frame_record_from_result,
     _json_default,
-    _model_name_from_ckpt,
     _names_to_dict,
     _sample_paths_from_args,
     _vis_dir,
 )
 
 
-def _dated_model_name(model_name: str) -> str:
-    return f"{datetime.now():%Y%m%d}_{model_name}"
+def _dated_run_name() -> str:
+    return f"{datetime.now():%Y%m%d}_detector"
 
 
 def _sample_specs_from_json_rgb(test_json: Path) -> list[dict[str, Any]]:
@@ -141,8 +140,8 @@ def main():
     ckpt = Path(args.ckpt)
     if not ckpt.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
-    model_name = _model_name_from_ckpt(ckpt)
-    run_name = _dated_model_name(model_name)
+    model_name = "detector"
+    run_name = _dated_run_name()
 
     if args.test_json:
         test_json = Path(args.test_json)
