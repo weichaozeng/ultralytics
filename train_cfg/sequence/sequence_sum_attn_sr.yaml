@@ -9,7 +9,7 @@ name: sequence_sum_attn_sr
 device: "2"
 epochs: 100
 spad_viz_period: 10
-batch: 10
+batch: 8
 workers: 0
 imgsz: 512
 
