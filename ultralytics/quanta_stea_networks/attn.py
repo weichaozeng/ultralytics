@@ -113,10 +113,14 @@ class AbsolutePositionalEncoding3D(nn.Module):
         self.register_buffer("pe_h", pe_h, persistent=False)
         self.register_buffer("pe_w", pe_w, persistent=False)
 
-    def _encode_tbchw(self, x: Tensor) -> Tensor:
+    def _encode_tbchw(self, x: Tensor, *, t_start: int = 0) -> Tensor:
         t, b, c, h, w = x.shape
         device, dtype = x.device, x.dtype
-        enc_t = self.pe_t[:t, : self.dim_t].to(device=device, dtype=dtype)
+        t_start = int(t_start)
+        t_end = t_start + t
+        if t_end > self.max_t:
+            raise ValueError(f"t_start+t={t_end} exceeds max_t={self.max_t}")
+        enc_t = self.pe_t[t_start:t_end, : self.dim_t].to(device=device, dtype=dtype)
         enc_h = self.pe_h[:h, : self.dim_h].to(device=device, dtype=dtype)
         enc_w = self.pe_w[:w, : self.dim_w].to(device=device, dtype=dtype)
         enc = torch.cat(
@@ -146,15 +150,24 @@ class AbsolutePositionalEncoding3D(nn.Module):
         out = x + enc
         return out
 
-    def forward(self, x: Tensor, *, layout: str = "TBCHW", temporal_only: bool = False) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        *,
+        layout: str = "TBCHW",
+        temporal_only: bool = False,
+        t_start: int = 0,
+    ) -> Tensor:
         if temporal_only or layout.upper() in {"TLBC", "TBC"}:
             if x.ndim != 3:
                 raise ValueError(f"Expected (T, batch, C) for temporal-only PE, got shape={tuple(x.shape)}")
+            if t_start != 0:
+                raise ValueError("t_start is only supported for TBCHW positional encoding")
             return self._encode_t_only(x)
         if layout.upper() == "TBCHW":
             if x.ndim != 5:
                 raise ValueError(f"Expected (T, B, C, H, W) for TBCHW PE, got shape={tuple(x.shape)}")
-            return self._encode_tbchw(x)
+            return self._encode_tbchw(x, t_start=t_start)
         raise ValueError(f"Unsupported layout={layout!r}")
 
 
@@ -511,9 +524,38 @@ class RelativePositionBias3D(nn.Module):
             self.num_heads,
         )
 
+    def bias_from_deltas(self, dt: Tensor, dh: Tensor, dw: Tensor) -> Tensor:
+        """Lookup per-head bias for relative offsets.
+
+        Args:
+            dt, dh, dw: Integer tensors of identical shape (broadcastable).
+
+        Returns:
+            Bias tensor with shape ``(*delta_shape, num_heads)``.
+        """
+        dt_i = dt + (self.window_t - 1)
+        dh_i = dh + (self.window_h - 1)
+        dw_i = dw + (self.window_w - 1)
+        max_t = 2 * self.window_t - 1
+        max_h = 2 * self.window_h - 1
+        max_w = 2 * self.window_w - 1
+        dt_i = dt_i.clamp(0, max_t - 1)
+        dh_i = dh_i.clamp(0, max_h - 1)
+        dw_i = dw_i.clamp(0, max_w - 1)
+        index = dt_i * (max_h * max_w) + dh_i * max_w + dw_i
+        return self.bias_table[index.long()]
+
 
 class WindowSTAttention(TemporalCoreBase):
-    """Local 3D window spatio-temporal attention with temporal causality."""
+    """Causal sliding-window spatio-temporal attention with relative bias.
+
+    For each query at time ``t``, keys are restricted to
+    ``[max(0, t - window_t + 1), t]`` (frame 0 sees itself, frame 1 sees two
+    frames, later frames see a full ``window_t`` history). Relative position
+    bias is applied for every valid ``(dt, dx, dy)`` pair. Online inference
+    keeps a rolling K/V cache of at most ``window_t`` frames with the same
+    attention rule.
+    """
 
     def __init__(
         self,
@@ -555,8 +597,16 @@ class WindowSTAttention(TemporalCoreBase):
             batch_first=True,
         )
 
+        self._k_cache: Tensor | None = None  # (n_windows, Tc, S, D)
+        self._v_cache: Tensor | None = None
+        self._cache_hw: tuple[int, int] | None = None
+        self._time_index = 0
+
     def clear_hidden_state(self) -> None:
-        return
+        self._k_cache = None
+        self._v_cache = None
+        self._cache_hw = None
+        self._time_index = 0
 
     def _to_tbchw(self, in_vector_ll: Tensor, meta: TBCHWMeta | None) -> tuple[Tensor, TBCHWMeta]:
         if in_vector_ll.ndim == 5:
@@ -566,36 +616,82 @@ class WindowSTAttention(TemporalCoreBase):
             return unflatten_tbchw(in_vector_ll, meta), meta
         raise ValueError("WindowSTAttention requires (T,B,C,H,W) or (T,B*H*W,C) with meta.")
 
-    def _pad_tbchw(self, x: Tensor, wt: int, wh: int, ww: int) -> tuple[Tensor, TBCHWMeta, tuple[int, int, int]]:
+    def _pad_spatial(self, x: Tensor) -> tuple[Tensor, TBCHWMeta, tuple[int, int]]:
+        """Pad H/W to multiples of the spatial window; do not pad time."""
         t, b, c, h, w = x.shape
-        pad_t = (wt - t % wt) % wt
+        wh, ww = self.window_h, self.window_w
         pad_h = (wh - h % wh) % wh
         pad_w = (ww - w % ww) % ww
-        if pad_t or pad_h or pad_w:
-            # F.pad applies to last dimensions first: W, H, C, B, T for (T, B, C, H, W).
-            x = F.pad(x, (0, pad_w, 0, pad_h, 0, 0, 0, 0, 0, pad_t))
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h, 0, 0, 0, 0, 0, 0))
         t2, _, _, h2, w2 = x.shape
-        return x, TBCHWMeta(t2, b, c, h2, w2), (pad_t, pad_h, pad_w)
+        return x, TBCHWMeta(t2, b, c, h2, w2), (pad_h, pad_w)
 
-    def _build_window_causal_mask(
+    def _spatial_token_coords(self, device: torch.device) -> tuple[Tensor, Tensor]:
+        wh, ww = self.window_h, self.window_w
+        ys = torch.arange(wh, device=device).repeat_interleave(ww)
+        xs = torch.arange(ww, device=device).repeat(wh)
+        return ys, xs
+
+    def _build_sliding_attn_mask(
         self,
-        t: int,
-        wh: int,
-        ww: int,
+        n_q_frames: int,
+        n_k_frames: int,
+        q_time0: int,
+        k_time0: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Tensor:
-        tokens = t * wh * ww
-        q_times = torch.arange(t, device=device).repeat_interleave(wh * ww)
-        k_times = torch.arange(t, device=device).repeat_interleave(wh * ww)
-        dt = q_times.unsqueeze(1) - k_times.unsqueeze(0)
-        mask = torch.zeros(tokens, tokens, device=device, dtype=dtype)
+        """Build ``(num_heads, Q, K)`` additive mask with causal local window + rel bias.
+
+        Token layout is ``(time, spatial)`` with spatial = ``window_h * window_w``.
+        ``q_time0`` / ``k_time0`` are absolute frame indices of the first query/key frame.
+        """
+        wh, ww = self.window_h, self.window_w
+        s = wh * ww
+        ys, xs = self._spatial_token_coords(device)
+
+        q_t = (q_time0 + torch.arange(n_q_frames, device=device)).repeat_interleave(s)
+        k_t = (k_time0 + torch.arange(n_k_frames, device=device)).repeat_interleave(s)
+        q_y = ys.repeat(n_q_frames)
+        q_x = xs.repeat(n_q_frames)
+        k_y = ys.repeat(n_k_frames)
+        k_x = xs.repeat(n_k_frames)
+
+        dt = q_t.unsqueeze(1) - k_t.unsqueeze(0)
+        dh = q_y.unsqueeze(1) - k_y.unsqueeze(0)
+        dw = q_x.unsqueeze(1) - k_x.unsqueeze(0)
         invalid = (dt < 0) | (dt >= self.window_t)
-        mask = mask.masked_fill(invalid, float("-inf"))
-        if t == self.window_t:
-            rel = self.rel_pos_bias().mean(dim=-1).to(dtype=dtype, device=device)
-            mask = mask + rel
+
+        rel = self.rel_pos_bias.bias_from_deltas(dt, dh, dw).to(dtype=dtype)
+        # (Q, K, heads) -> (heads, Q, K)
+        mask = rel.permute(2, 0, 1).contiguous()
+        mask = mask.masked_fill(invalid.unsqueeze(0), float("-inf"))
         return mask
+
+    def _attend_with_rel_mask(self, q: Tensor, k: Tensor, v: Tensor, mask_heads: Tensor) -> Tensor:
+        """Run MHA with per-head additive mask of shape ``(num_heads, Q, K)``."""
+        n = q.shape[0]
+        attn_mask = mask_heads.unsqueeze(0).expand(n, -1, -1, -1).reshape(
+            n * self.num_heads, mask_heads.shape[-2], mask_heads.shape[-1]
+        )
+        out, _ = self.attn(q, k, v, attn_mask=attn_mask, need_weights=False)
+        return self.out_proj(out)
+
+    def _window_partition(self, x: Tensor) -> tuple[Tensor, int, int, int]:
+        """(T,B,C,H,W) -> (B*hp*wp, T, wh*ww, C)."""
+        t, b, c, h, w = x.shape
+        wh, ww = self.window_h, self.window_w
+        hp, wp = h // wh, w // ww
+        x = rearrange(
+            x,
+            "t b c (hp wh) (wp ww) -> (b hp wp) t (wh ww) c",
+            wh=wh,
+            ww=ww,
+            hp=hp,
+            wp=wp,
+        )
+        return x, b, hp, wp
 
     def forward(
         self,
@@ -606,20 +702,14 @@ class WindowSTAttention(TemporalCoreBase):
     ) -> tuple[Tensor, list[int]]:
         x5d, orig_meta = self._to_tbchw(in_vector_ll, meta)
         residual, _ = flatten_tbchw(x5d)
-        x5d, meta, _pads = self._pad_tbchw(x5d, self.window_t, self.window_h, self.window_w)
+        x5d, meta, _pads = self._pad_spatial(x5d)
         t, b, c, h, w = meta.t, meta.b, meta.c, meta.h, meta.w
-        wt, wh, ww = self.window_t, self.window_h, self.window_w
+        wh, ww = self.window_h, self.window_w
+        s = wh * ww
 
         x = norm_tbchw(x5d, self.norm)
-        x = self.pos_enc(x, layout="TBCHW")
-        x = rearrange(
-            x,
-            "t b c (hp wh) (wp ww) -> (b hp wp) t (wh ww) c",
-            wh=wh,
-            ww=ww,
-            hp=h // wh,
-            wp=w // ww,
-        )
+        x = self.pos_enc(x, layout="TBCHW", t_start=0)
+        x, _, hp, wp = self._window_partition(x)
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
@@ -627,15 +717,22 @@ class WindowSTAttention(TemporalCoreBase):
         k = rearrange(k, "n t s d -> n (t s) d")
         v = rearrange(v, "n t s d -> n (t s) d")
 
-        mask = self._build_window_causal_mask(t, wh, ww, q.device, q.dtype)
-        out = self.out_proj(self.attn(q, k, v, attn_mask=mask, need_weights=False)[0])
-        out = rearrange(out, "n (t s) d -> n t s d", t=t, s=wh * ww)
+        mask = self._build_sliding_attn_mask(
+            n_q_frames=t,
+            n_k_frames=t,
+            q_time0=0,
+            k_time0=0,
+            device=q.device,
+            dtype=q.dtype,
+        )
+        out = self._attend_with_rel_mask(q, k, v, mask)
+        out = rearrange(out, "n (t s) d -> n t s d", t=t, s=s)
         out = rearrange(
             out,
             "(b hp wp) t (wh ww) c -> t b c (hp wh) (wp ww)",
             b=b,
-            hp=h // wh,
-            wp=w // ww,
+            hp=hp,
+            wp=wp,
             wh=wh,
             ww=ww,
         )
@@ -644,13 +741,67 @@ class WindowSTAttention(TemporalCoreBase):
         return out_flat + residual, list(t_index_ll)
 
     def forward_online(self, in_vector: Tensor, time_instant: float) -> Tensor:
-        del time_instant
+        del time_instant  # PE / cache use monotonic _time_index from stream start
         if in_vector.ndim != 4:
             raise ValueError(f"WindowSTAttention online expects (B,C,H,W), got shape={tuple(in_vector.shape)}")
         b, c, h, w = in_vector.shape
+        residual = in_vector
         x5d = in_vector.unsqueeze(0)
-        out, _ = self.forward(x5d, [0])
-        return rearrange(out, "t (b h w) c -> b c h w", t=1, b=b, h=h, w=w)[0]
+        x5d, meta, _pads = self._pad_spatial(x5d)
+        _, _, _, h_pad, w_pad = meta.t, meta.b, meta.c, meta.h, meta.w
+        wh, ww = self.window_h, self.window_w
+        s = wh * ww
+        time_index = self._time_index
+
+        x = norm_tbchw(x5d, self.norm)
+        x = self.pos_enc(x, layout="TBCHW", t_start=time_index)
+        x, _, hp, wp = self._window_partition(x)  # (n, 1, S, C)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        if self._k_cache is None:
+            self._k_cache = k
+            self._v_cache = v
+            self._cache_hw = (h_pad, w_pad)
+        else:
+            if self._cache_hw != (h_pad, w_pad):
+                raise ValueError(
+                    f"WindowSTAttention online spatial size changed from {self._cache_hw} to {(h_pad, w_pad)}"
+                )
+            self._k_cache = torch.cat([self._k_cache, k], dim=1)
+            self._v_cache = torch.cat([self._v_cache, v], dim=1)
+            if self._k_cache.shape[1] > self.window_t:
+                self._k_cache = self._k_cache[:, -self.window_t :].contiguous()
+                self._v_cache = self._v_cache[:, -self.window_t :].contiguous()
+
+        tc = self._k_cache.shape[1]
+        k_time0 = time_index - tc + 1
+        q_flat = rearrange(q, "n t s d -> n (t s) d")
+        k_flat = rearrange(self._k_cache, "n t s d -> n (t s) d")
+        v_flat = rearrange(self._v_cache, "n t s d -> n (t s) d")
+        mask = self._build_sliding_attn_mask(
+            n_q_frames=1,
+            n_k_frames=tc,
+            q_time0=time_index,
+            k_time0=k_time0,
+            device=q.device,
+            dtype=q.dtype,
+        )
+        out = self._attend_with_rel_mask(q_flat, k_flat, v_flat, mask)
+        out = rearrange(out, "n (t s) d -> n t s d", t=1, s=s)
+        out = rearrange(
+            out,
+            "(b hp wp) t (wh ww) c -> t b c (hp wh) (wp ww)",
+            b=b,
+            hp=hp,
+            wp=wp,
+            wh=wh,
+            ww=ww,
+        )
+        out = out[0, :, :, :h, :w]
+        self._time_index = time_index + 1
+        return out + residual
 
 
 def count_parameters(module: nn.Module) -> int:

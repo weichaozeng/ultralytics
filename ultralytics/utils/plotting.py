@@ -878,7 +878,8 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
     files = list(save_dir.glob("results*.csv"))
     assert len(files), f"No results.csv files found in {save_dir.resolve()}, nothing to plot."
 
-    loss_keys, metric_keys = [], []
+    loss_keys, metric_keys, columns = [], [], []
+    fig, ax = None, None
     for i, f in enumerate(files):
         try:
             data = pl.read_csv(f, infer_schema_length=None)
@@ -892,8 +893,13 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
                 columns = (
                     loss_keys[:loss_mid] + metric_keys[:metric_mid] + loss_keys[loss_mid:] + metric_keys[metric_mid:]
                 )
-                fig, ax = plt.subplots(2, len(columns) // 2, figsize=(len(columns) + 2, 6), tight_layout=True)
-                ax = ax.ravel()
+                # SPAD / train-only runs can have an odd number of loss columns (no val/*_loss).
+                # Use ceil so subplot count is never smaller than the number of series.
+                ncols = max(1, (len(columns) + 1) // 2)
+                fig, ax = plt.subplots(2, ncols, figsize=(2 * ncols + 2, 6), tight_layout=True)
+                ax = ax.ravel() if hasattr(ax, "ravel") else [ax]
+                for unused in range(len(columns), len(ax)):
+                    ax[unused].set_visible(False)
             x = data.select(data.columns[0]).to_numpy().flatten()
             for i, j in enumerate(columns):
                 y = data.select(j).to_numpy().flatten().astype("float")
@@ -902,7 +908,12 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
                 ax[i].set_title(j, fontsize=12)
         except Exception as e:
             LOGGER.error(f"Plotting error for {f}: {e}")
-    ax[1].legend()
+    if fig is None or not columns:
+        return
+    if len(columns) > 1:
+        ax[1].legend()
+    else:
+        ax[0].legend()
     fname = save_dir / "results.png"
     fig.savefig(fname, dpi=200)
     plt.close()
