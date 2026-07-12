@@ -9,7 +9,7 @@ name: sequence_sum_ssd
 device: "2"
 epochs: 100
 spad_viz_period: 10
-batch: 4
+batch: 2
 workers: 0
 imgsz: 512
 

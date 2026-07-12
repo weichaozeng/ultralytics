@@ -9,7 +9,7 @@ name: frame_ppb
 device: "1"
 epochs: 100
 spad_viz_period: 10
-batch: 80
+batch: 40
 workers: 0
 imgsz: 512
 
