@@ -194,7 +194,7 @@ def parse_args():
     ap.add_argument("--det_thresh", type=float, default=0.4)
     ap.add_argument("--iou", type=float, default=0.7)
     ap.add_argument("--max_det", type=int, default=20)
-    ap.add_argument("--tracker", type=str, default="posetrack", choices=list(TRACKER_CHOICES))
+    ap.add_argument("--tracker", type=str, default="botsort", choices=list(TRACKER_CHOICES))
     ap.add_argument("--frame_rate", type=int, default=25, help="Tracker frame-rate hint")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument("--cache_mode", type=str, default="auto", choices=["auto", "raw", "rendered"])
