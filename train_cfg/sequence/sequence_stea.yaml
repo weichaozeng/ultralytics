@@ -9,8 +9,9 @@ spad_test_json: /home/zvc/Data/visionsim/outputs/test.json
 project: Runs/spad_pose
 name: sequence_stea
 device: "0"
-epochs: 30
-batch: 24
+epochs: 100
+spad_viz_period: 10
+batch: 10
 workers: 0
 imgsz: 512
 

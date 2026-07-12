@@ -168,7 +168,7 @@ spad_eval_max_batches: -1 # (int) max test batches for SPAD eval visualization (
 spad_eval_seed: 0 # (int) seed for SPAD eval sampling
 spad_viz_batches: 1 # (int) number of SPAD eval batches to visualize
 spad_viz_frames: 4 # (int) max reconstructed frames to visualize per eval batch
-spad_viz_period: 1 # (int) eval visualization period in epochs (0 disables periodic viz)
+spad_viz_period: 10 # (int) eval visualization period in epochs (0 disables periodic viz)
 spad_viz_conf: 0.25 # (float) confidence threshold used in SPAD eval visualization
 spad_viz_iou: 0.7 # (float) IoU threshold used in SPAD eval visualization
 spad_viz_max_det: 20 # (int) max detections per frame used in SPAD eval visualization
