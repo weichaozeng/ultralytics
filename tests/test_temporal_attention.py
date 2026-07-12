@@ -158,6 +158,55 @@ def test_sr_attention_plugin_shape():
     assert out_t == list(range(t))
 
 
+def test_sr_attention_causality():
+    torch.manual_seed(0)
+    t, b, c, h, w = 5, 2, 64, 8, 8
+    model = SRAttention(in_dim=c, state_dim=8, head_dim=16, sr_ratio=2)
+    model.eval()
+    x = torch.randn(t, b, c, h, w)
+    out_full, _ = model(x, list(range(t)))
+    for ti in range(t):
+        x_perturbed = x.clone()
+        x_perturbed[ti + 1 :] = torch.randn_like(x_perturbed[ti + 1 :])
+        out_perturbed, _ = model(x_perturbed, list(range(t)))
+        assert torch.allclose(out_full[: ti + 1], out_perturbed[: ti + 1], atol=1e-5, rtol=1e-5)
+
+
+def test_sr_attention_online_matches_batch():
+    torch.manual_seed(1)
+    t, b, c, h, w = 6, 2, 64, 8, 8
+    model = SRAttention(in_dim=c, state_dim=8, head_dim=16, sr_ratio=2)
+    model.eval()
+    x = torch.randn(t, b, c, h, w)
+    with torch.no_grad():
+        out_batch, _ = model(x, list(range(t)))
+        model.clear_hidden_state()
+        online = []
+        for ti in range(t):
+            online.append(model.forward_online(x[ti], time_instant=float(ti)))
+        out_online = torch.stack(online, dim=0)
+        out_online_flat, _ = flatten_tbchw(out_online)
+    assert torch.allclose(out_batch, out_online_flat, atol=1e-5, rtol=1e-5)
+
+
+def test_sr_attention_plugin_online():
+    torch.manual_seed(2)
+    t, b, c, h, w = 5, 2, 64, 8, 8
+    plugin = SRAttentionPlugin(in_dim=c, state_dim=8, head_dim=16, attn_kwargs={"sr_ratio": 2})
+    plugin.eval()
+    x = torch.randn(t, b, c, h, w)
+    with torch.no_grad():
+        out_batch, _ = plugin(x, list(range(t)))
+        plugin.set_online_mode(True)
+        plugin.clear_temporal_state()
+        online = []
+        for ti in range(t):
+            step, _ = plugin(x[ti : ti + 1], [ti])
+            online.append(step[0])
+        out_online = torch.stack(online, dim=0)
+    assert torch.allclose(out_batch, out_online, atol=1e-5, rtol=1e-5)
+
+
 def test_window_st_attention_shape():
     t, b, c, h, w = 4, 2, 64, 14, 14
     head_dim = 16

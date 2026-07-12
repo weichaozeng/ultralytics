@@ -10,7 +10,7 @@ name: frame_stea_ua
 device: "0"
 epochs: 100
 spad_viz_period: 10
-batch: 8
+batch: 80
 workers: 0
 imgsz: 512
 

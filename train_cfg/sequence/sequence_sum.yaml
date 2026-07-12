@@ -9,11 +9,11 @@ name: sequence_sum
 device: "2"
 epochs: 100
 spad_viz_period: 10
-batch: 8
+batch: 4
 workers: 0
 imgsz: 512
 
-spad_output_frames: 5
+spad_output_frames: 20
 spad_subsampling: 64
 spad_bins_per_gt: 64
 spad_stride_frames: 5

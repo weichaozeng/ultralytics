@@ -395,14 +395,17 @@ class SRAttention(TemporalCoreBase):
             dropout=self.dropout,
             batch_first=True,
         )
+        # Online K/V cache layout: (B, Tc * H_down * W_down, attn_dim)
         self._k_cache: Tensor | None = None
         self._v_cache: Tensor | None = None
-        self._cache_hw: tuple[int, int] | None = None
+        self._cache_hw: tuple[int, int] | None = None  # downsampled (H', W')
+        self._time_index = 0
 
     def clear_hidden_state(self) -> None:
         self._k_cache = None
         self._v_cache = None
         self._cache_hw = None
+        self._time_index = 0
 
     def _to_tbchw(self, in_vector_ll: Tensor, meta: TBCHWMeta | None) -> tuple[Tensor, TBCHWMeta]:
         if in_vector_ll.ndim == 5:
@@ -440,7 +443,7 @@ class SRAttention(TemporalCoreBase):
         residual, _ = flatten_tbchw(x5d)
 
         x = norm_tbchw(x5d, self.norm)
-        x = self.pos_enc(x, layout="TBCHW")
+        x = self.pos_enc(x, layout="TBCHW", t_start=0)
         q = rearrange(x, "t b c h w -> b (t h w) c")
         q = self.q_proj(q)
 
@@ -459,33 +462,48 @@ class SRAttention(TemporalCoreBase):
         return out, list(t_index_ll)
 
     def forward_online(self, in_vector: Tensor, time_instant: float) -> Tensor:
+        """One-step streaming update with growing reduced-spatial K/V cache.
+
+        Matches batch semantics for prefix ``0..t``: current-frame queries attend to
+        all cached keys from times ``<= t`` (no future keys exist online, so no mask).
+        """
         del time_instant
         if in_vector.ndim != 4 or in_vector.shape[1] != self.in_dim:
             raise ValueError(f"SRAttention online expects (B,C,H,W), got shape={tuple(in_vector.shape)}")
         b, c, h, w = in_vector.shape
-        x5d = in_vector.unsqueeze(0)
-        residual, _ = flatten_tbchw(x5d)
-        x = norm_tbchw(x5d, self.norm)
-        x = self.pos_enc(x, layout="TBCHW")
+        residual = in_vector
+        time_index = self._time_index
 
+        x5d = in_vector.unsqueeze(0)
+        x = norm_tbchw(x5d, self.norm)
+        x = self.pos_enc(x, layout="TBCHW", t_start=time_index)
         q = rearrange(x, "t b c h w -> b (t h w) c")
         q = self.q_proj(q)
-        x_down = self.sr_dw(in_vector)
+
+        # Use norm+PE features for spatial reduction (same as batch), not raw input.
+        x_down = self.sr_dw(x[0])
+        h_down, w_down = x_down.shape[-2], x_down.shape[-1]
         x_down_seq = rearrange(x_down, "b c h w -> b (h w) c")
-        k = self.k_proj(x_down_seq).unsqueeze(1)
-        v = self.v_proj(x_down_seq).unsqueeze(1)
+        k = self.k_proj(x_down_seq)
+        v = self.v_proj(x_down_seq)
 
         if self._k_cache is None:
             self._k_cache = k
             self._v_cache = v
-            self._cache_hw = (x_down.shape[2], x_down.shape[3])
+            self._cache_hw = (h_down, w_down)
         else:
+            if self._cache_hw != (h_down, w_down):
+                raise ValueError(
+                    f"SRAttention online spatial size changed from {self._cache_hw} to {(h_down, w_down)}"
+                )
             self._k_cache = torch.cat([self._k_cache, k], dim=1)
             self._v_cache = torch.cat([self._v_cache, v], dim=1)
 
+        # Current queries only; cache holds times 0..t, so attention is already causal.
         out = self.out_proj(self.attn(q, self._k_cache, self._v_cache, attn_mask=None, need_weights=False)[0])
-        out = rearrange(out, "b (t h w) c -> t (b h w) c", t=1, h=h, w=w) + residual
-        return unflatten_tbchw(out, TBCHWMeta(1, b, c, h, w))[0]
+        out = rearrange(out, "b (h w) c -> b c h w", h=h, w=w)
+        self._time_index = time_index + 1
+        return out + residual
 
 
 class RelativePositionBias3D(nn.Module):
