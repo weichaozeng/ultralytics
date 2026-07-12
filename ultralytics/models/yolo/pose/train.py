@@ -332,6 +332,7 @@ class SpadPoseSequenceTrainer(PoseTrainer):
             attn_dropout=float(getattr(self.args, "attn_dropout", 0.0)),
             attn_sr_ratio=int(getattr(self.args, "attn_sr_ratio", 2)),
             attn_window_size=tuple(getattr(self.args, "attn_window_size", (3, 7, 7))),
+            attn_max_history=int(getattr(self.args, "attn_max_history", 20)),
             spatial_reduce_ratio=int(getattr(self.args, "spad_spatial_reduce_ratio", 2)),
             spatial_kernel_size=int(getattr(self.args, "spad_spatial_kernel_size", 3)),
             plugin_alpha_init=float(getattr(self.args, "spad_plugin_alpha_init", 0.0)),

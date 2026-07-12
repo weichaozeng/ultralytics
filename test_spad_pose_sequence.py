@@ -756,7 +756,8 @@ def parse_args():
         "--spad_online",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Stream one chunk per forward and carry SSD hidden state across chunks (unlike training batch windows).",
+        help="Serial/online inference: carry detector temporal state across frames (default). "
+        "Use --no-spad_online for training-style windowed batch plugins without state carry.",
     )
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=5e-4)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
@@ -872,16 +873,19 @@ def main():
     else:
         spad_model.spad_cache_mode = "rendered"
 
-    spad_model.spad_set_online_inference(bool(args.spad_online) and resolved_cache_mode == "rendered")
-    if args.spad_online and resolved_cache_mode == "rendered":
-        print("Sequence inference: online streaming — 1 cached frame/forward, SSD state carried forward")
-    elif args.spad_online and resolved_cache_mode == "raw":
+    spad_model.spad_set_online_inference(bool(args.spad_online))
+    if args.spad_online:
         print(
-            "Note: --spad_online is only active with rendered cache (T=1/frame). "
-            "Raw-SPAD chunks may emit multiple frames per forward."
+            f"Sequence inference: online/serial streaming "
+            f"(cache_mode={resolved_cache_mode}; detector plugins carry state across frames)"
         )
+        if resolved_cache_mode == "raw":
+            print(
+                "Raw mode: each chunk may reconstruct multiple frames; "
+                "detector plugins step those frames serially within and across chunks."
+            )
     else:
-        print("Sequence inference: windowed SSD (state reset each forward)")
+        print("Sequence inference: windowed batch plugins (state not carried across forwards)")
 
     out_dir = _eval_dir(run_name, test_name)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -917,7 +921,7 @@ def main():
 
         if tracker is not None:
             tracker.reset()
-        if args.spad_online and resolved_cache_mode == "rendered" and hasattr(spad_model, "spad_clear_plugin_states"):
+        if args.spad_online and hasattr(spad_model, "spad_clear_plugin_states"):
             spad_model.spad_clear_plugin_states()
 
         global_frame_idx = 0
@@ -954,7 +958,7 @@ def main():
                 "spad_bins_per_gt": int(spad_bins_per_gt),
                 "spad_stride_frames": int(stride_frames),
                 "input_gamma": float(input_gamma),
-                "spad_online": bool(args.spad_online and resolved_cache_mode == "rendered"),
+                "spad_online": bool(args.spad_online),
                 "requested_spad_online": bool(args.spad_online),
                 "source_bin_convention": "chunk_end_bin",
             },

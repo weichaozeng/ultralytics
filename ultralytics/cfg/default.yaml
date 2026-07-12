@@ -192,6 +192,7 @@ attn_head_divisor: 4 # (int) derive attention head dim from channels // divisor
 attn_dropout: 0.0 # (float) dropout for attention temporal blocks
 attn_sr_ratio: 2 # (int) default spatial-reduction ratio for sr_attn plugins
 attn_window_size: [3, 7, 7] # (list) default window size [T,H,W] for window_st_attn plugins
+attn_max_history: 20 # (int) online KV cache length for temporal_attn / sr_attn (frames)
 spad_spatial_reduce_ratio: 2 # (int) channel bottleneck ratio for spatial detector plugins
 spad_spatial_kernel_size: 3 # (int) depthwise kernel size for spatial detector plugins
 spad_plugin_alpha_init: 0.0 # (float) initial residual gate value for detector plugins

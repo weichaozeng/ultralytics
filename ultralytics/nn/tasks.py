@@ -623,6 +623,7 @@ class SpadPoseModel(PoseModel):
         attn_dropout=0.0,
         attn_sr_ratio=2,
         attn_window_size=(3, 7, 7),
+        attn_max_history=20,
         attn_kwargs=None,
         spatial_reduce_ratio=2,
         spatial_kernel_size=3,
@@ -653,6 +654,7 @@ class SpadPoseModel(PoseModel):
         self.attn_dropout = float(attn_dropout)
         self.attn_sr_ratio = int(attn_sr_ratio)
         self.attn_window_size = tuple(int(v) for v in attn_window_size)
+        self.attn_max_history = max(int(attn_max_history), 1)
         self.attn_kwargs = dict(attn_kwargs or {})
         self.spatial_reduce_ratio = spatial_reduce_ratio
         self.spatial_kernel_size = spatial_kernel_size
@@ -665,6 +667,7 @@ class SpadPoseModel(PoseModel):
         self.ssd_kwargs.setdefault("current_bin_rate_hz", self.spad_current_bin_rate_hz)
         self.attn_kwargs.setdefault("reference_bin_rate_hz", self.spad_reference_bin_rate_hz)
         self.attn_kwargs.setdefault("current_bin_rate_hz", self.spad_current_bin_rate_hz)
+        self.attn_kwargs.setdefault("max_history", self.attn_max_history)
         if self.attn_dropout > 0:
             self.attn_kwargs.setdefault("dropout", self.attn_dropout)
         self.spad_packed_nch = 3
@@ -737,6 +740,7 @@ class SpadPoseModel(PoseModel):
         """Return attention-core kwargs scoped to the active plugin/core type."""
         core_name = self._active_attn_core_name()
         kwargs = dict(self.attn_kwargs)
+        kwargs.setdefault("max_history", self.attn_max_history)
         if core_name == "sr_attn":
             default_sr = {2: 4, 4: 2, 6: 1, 8: 1, 9: 1}
             kwargs["sr_ratio"] = int(default_sr.get(int(layer_idx), self.attn_sr_ratio))
@@ -744,6 +748,7 @@ class SpadPoseModel(PoseModel):
         elif core_name == "window_st_attn":
             kwargs["window_size"] = tuple(self.attn_window_size)
             kwargs.pop("sr_ratio", None)
+            kwargs.pop("max_history", None)  # window_st uses window_t rolling instead
         else:
             kwargs.pop("sr_ratio", None)
             kwargs.pop("window_size", None)
@@ -781,17 +786,53 @@ class SpadPoseModel(PoseModel):
                 )
 
     def spad_set_online_inference(self, enabled: bool) -> None:
-        """Switch detector SSD plugins to one-chunk online streaming (inference)."""
+        """Switch detector temporal plugins to one-frame online streaming (inference)."""
         self.spad_online_inference = bool(enabled)
         for plugin in self.plugins_by_layer.values():
             if hasattr(plugin, "set_online_mode"):
                 plugin.set_online_mode(enabled)
 
     def spad_clear_plugin_states(self) -> None:
-        """Reset SSD hidden states before processing a new sample/video stream."""
+        """Reset temporal plugin states before processing a new sample/video stream."""
         for plugin in self.plugins_by_layer.values():
             if hasattr(plugin, "clear_temporal_state"):
                 plugin.clear_temporal_state()
+
+    def _spad_apply_plugin(self, layer_idx, x, t_index_ll):
+        """Apply one detector plugin to a T,B,C,H,W temporal feature sequence.
+
+        When online inference is enabled and ``T>1`` (typical raw chunks), step the
+        plugin one frame at a time so detector state matches serial/app streaming.
+        """
+        if not torch.is_tensor(x) or x.ndim != 5:
+            raise ValueError(f"Plugin after layer {layer_idx} expected T,B,C,H,W, got {type(x)}")
+
+        plugin = self.plugins_by_layer[str(layer_idx)]
+        t = int(x.shape[0])
+        if (
+            getattr(self, "spad_online_inference", False)
+            and getattr(plugin, "online_mode", False)
+            and t > 1
+        ):
+            if t_index_ll is None or len(t_index_ll) != t:
+                raise ValueError(
+                    f"Online serial plugin after layer {layer_idx} requires t_index_ll length {t}, "
+                    f"got {None if t_index_ll is None else len(t_index_ll)}"
+                )
+            outs = []
+            out_t_index_ll = []
+            for ti in range(t):
+                step, step_t = plugin(x[ti : ti + 1], [int(t_index_ll[ti])])
+                outs.append(step)
+                out_t_index_ll.extend(step_t)
+            out = torch.cat(outs, dim=0)
+        else:
+            out, out_t_index_ll = plugin(x, t_index_ll)
+
+        out_t = out.shape[0]
+        self.spad_num_frame = int(out_t)
+        self.spad_t_index_ll = out_t_index_ll
+        return out, out_t_index_ll
 
     def _infer_backbone_plugin_layers(self) -> tuple[int, ...]:
         """Infer SSD insertion points after each backbone stage (before the FPN neck).
@@ -1105,18 +1146,6 @@ class SpadPoseModel(PoseModel):
         if bt != expected:
             raise ValueError(f"Expected flattened batch {expected}, got {bt}")
         return x.reshape(batch_size, num_frame, c, h, w).permute(1, 0, 2, 3, 4).contiguous()
-
-    def _spad_apply_plugin(self, layer_idx, x, t_index_ll):
-        """Apply one detector plugin to a T,B,C,H,W temporal feature sequence."""
-        if not torch.is_tensor(x) or x.ndim != 5:
-            raise ValueError(f"Plugin after layer {layer_idx} expected T,B,C,H,W, got {type(x)}")
-
-        out, out_t_index_ll = self.plugins_by_layer[str(layer_idx)](x, t_index_ll)
-        out_t = out.shape[0]
-
-        self.spad_num_frame = int(out_t)
-        self.spad_t_index_ll = out_t_index_ll
-        return out, out_t_index_ll
 
     def _spad_visualize_temporal(self, x, module, visualize):
         """Visualize the first temporal slice to keep Ultralytics feature visualization compatible."""

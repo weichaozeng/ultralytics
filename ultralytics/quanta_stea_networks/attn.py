@@ -215,6 +215,7 @@ class TemporalAttention(TemporalCoreBase):
         state_dim: int,
         head_dim: int,
         dropout: float = 0.0,
+        max_history: int = 20,
         reference_bin_rate_hz: float = 8000.0,
         current_bin_rate_hz: float | None = None,
     ):
@@ -227,6 +228,7 @@ class TemporalAttention(TemporalCoreBase):
         self.num_heads = self.in_dim // self.head_dim
         self.attn_dim = self.num_heads * self.state_dim
         self.dropout = float(dropout)
+        self.max_history = max(int(max_history), 1)
         self.reference_bin_rate_hz = float(reference_bin_rate_hz)
         self.current_bin_rate_hz = float(
             current_bin_rate_hz if current_bin_rate_hz is not None else reference_bin_rate_hz
@@ -247,6 +249,7 @@ class TemporalAttention(TemporalCoreBase):
 
         self._k_cache: Tensor | None = None
         self._v_cache: Tensor | None = None
+        self._time_index = 0
 
     @staticmethod
     def spatial_to_embedding(tensor: Tensor) -> tuple[Tensor, tuple[int, int]]:
@@ -260,6 +263,8 @@ class TemporalAttention(TemporalCoreBase):
 
     def _apply_temporal_pe_step(self, x: Tensor, time_index: int) -> Tensor:
         device, dtype = x.device, x.dtype
+        if time_index >= self.pos_enc.max_t:
+            raise ValueError(f"time_index={time_index} exceeds max_t={self.pos_enc.max_t}")
         enc_t = self.pos_enc.pe_t[time_index : time_index + 1, : self.pos_enc.dim_t].to(device=device, dtype=dtype)
         enc = repeat(enc_t, "1 dt -> b dt", b=x.shape[0])
         if enc.shape[-1] < self.in_dim:
@@ -272,6 +277,7 @@ class TemporalAttention(TemporalCoreBase):
     def clear_hidden_state(self) -> None:
         self._k_cache = None
         self._v_cache = None
+        self._time_index = 0
 
     def _project_qkv(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         return self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -279,6 +285,11 @@ class TemporalAttention(TemporalCoreBase):
     def _attend(self, q: Tensor, k: Tensor, v: Tensor, attn_mask: Tensor | None) -> Tensor:
         out, _ = self.attn(q, k, v, attn_mask=attn_mask, need_weights=False)
         return self.out_proj(out)
+
+    def _trim_kv_cache(self) -> None:
+        if self._k_cache is not None and self._k_cache.shape[1] > self.max_history:
+            self._k_cache = self._k_cache[:, -self.max_history :].contiguous()
+            self._v_cache = self._v_cache[:, -self.max_history :].contiguous()
 
     def forward(
         self,
@@ -326,7 +337,7 @@ class TemporalAttention(TemporalCoreBase):
 
         residual = in_vector
         x = self.norm(in_vector)
-        time_index = 0 if self._k_cache is None else self._k_cache.shape[1]
+        time_index = self._time_index
         x = self._apply_temporal_pe_step(x, time_index)
         q, k, v = self._project_qkv(x)
         q = q.unsqueeze(1)
@@ -339,9 +350,11 @@ class TemporalAttention(TemporalCoreBase):
         else:
             self._k_cache = torch.cat([self._k_cache, k], dim=1)
             self._v_cache = torch.cat([self._v_cache, v], dim=1)
+        self._trim_kv_cache()
 
         out = self._attend(q, self._k_cache, self._v_cache, attn_mask=None)
         out = out.squeeze(1) + residual
+        self._time_index = time_index + 1
         if is_spatial_input:
             out = self.embedding_to_spatial(out, height, width)
         return out
@@ -357,6 +370,7 @@ class SRAttention(TemporalCoreBase):
         head_dim: int,
         sr_ratio: int = 2,
         dropout: float = 0.0,
+        max_history: int = 20,
         reference_bin_rate_hz: float = 8000.0,
         current_bin_rate_hz: float | None = None,
     ):
@@ -370,6 +384,7 @@ class SRAttention(TemporalCoreBase):
         self.num_heads = self.in_dim // self.head_dim
         self.attn_dim = self.num_heads * self.state_dim
         self.dropout = float(dropout)
+        self.max_history = max(int(max_history), 1)
         self.reference_bin_rate_hz = float(reference_bin_rate_hz)
         self.current_bin_rate_hz = float(
             current_bin_rate_hz if current_bin_rate_hz is not None else reference_bin_rate_hz
@@ -430,6 +445,15 @@ class SRAttention(TemporalCoreBase):
         q_times = torch.arange(t, device=device).repeat_interleave(h * w)
         k_times = torch.arange(t, device=device).repeat_interleave(h_down * w_down)
         return build_temporal_causal_mask(q_len, k_len, q_times, k_times, device, dtype)
+
+    def _trim_kv_cache(self) -> None:
+        if self._k_cache is None or self._cache_hw is None:
+            return
+        tokens_per_frame = int(self._cache_hw[0] * self._cache_hw[1])
+        max_tokens = self.max_history * tokens_per_frame
+        if self._k_cache.shape[1] > max_tokens:
+            self._k_cache = self._k_cache[:, -max_tokens:].contiguous()
+            self._v_cache = self._v_cache[:, -max_tokens:].contiguous()
 
     def forward(
         self,
@@ -498,8 +522,9 @@ class SRAttention(TemporalCoreBase):
                 )
             self._k_cache = torch.cat([self._k_cache, k], dim=1)
             self._v_cache = torch.cat([self._v_cache, v], dim=1)
+        self._trim_kv_cache()
 
-        # Current queries only; cache holds times 0..t, so attention is already causal.
+        # Current queries only; rolling cache holds recent times, so attention is already causal.
         out = self.out_proj(self.attn(q, self._k_cache, self._v_cache, attn_mask=None, need_weights=False)[0])
         out = rearrange(out, "b (h w) c -> b c h w", h=h, w=w)
         self._time_index = time_index + 1

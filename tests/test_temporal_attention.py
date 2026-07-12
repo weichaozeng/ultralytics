@@ -95,7 +95,7 @@ def test_temporal_attention_online_matches_batch():
     torch.manual_seed(1)
     t, batch, c = 6, 12, 64
     head_dim = 16
-    model = TemporalAttention(in_dim=c, state_dim=8, head_dim=head_dim)
+    model = TemporalAttention(in_dim=c, state_dim=8, head_dim=head_dim, max_history=20)
     x = torch.randn(t, batch, c)
     out_batch, _ = model(x, list(range(t)))
 
@@ -105,6 +105,37 @@ def test_temporal_attention_online_matches_batch():
         online_out.append(model.forward_online(x[ti], time_instant=float(ti)))
     out_online = torch.stack(online_out, dim=0)
     assert torch.allclose(out_batch, out_online, atol=1e-5, rtol=1e-5)
+
+
+def test_temporal_attention_max_history_trims_cache():
+    torch.manual_seed(4)
+    batch, c = 8, 64
+    max_history = 3
+    model = TemporalAttention(in_dim=c, state_dim=8, head_dim=16, max_history=max_history)
+    model.eval()
+    with torch.no_grad():
+        for ti in range(10):
+            model.forward_online(torch.randn(batch, c), time_instant=float(ti))
+            assert model._k_cache is not None
+            assert model._k_cache.shape[1] <= max_history
+    assert model._k_cache.shape[1] == max_history
+    assert model._time_index == 10
+
+
+def test_sr_attention_max_history_trims_cache():
+    torch.manual_seed(5)
+    b, c, h, w = 2, 64, 8, 8
+    max_history = 3
+    model = SRAttention(in_dim=c, state_dim=8, head_dim=16, sr_ratio=2, max_history=max_history)
+    model.eval()
+    with torch.no_grad():
+        for ti in range(9):
+            model.forward_online(torch.randn(b, c, h, w), time_instant=float(ti))
+            tokens_per_frame = model._cache_hw[0] * model._cache_hw[1]
+            assert model._k_cache.shape[1] <= max_history * tokens_per_frame
+    tokens_per_frame = model._cache_hw[0] * model._cache_hw[1]
+    assert model._k_cache.shape[1] == max_history * tokens_per_frame
+    assert model._time_index == 9
 
 
 def test_temporal_attention_plugin_online():
