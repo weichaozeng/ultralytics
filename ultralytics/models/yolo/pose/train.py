@@ -231,6 +231,11 @@ class SpadPoseSequenceTrainer(PoseTrainer):
             }
         if preprocessor_name == "sum":
             return {"subsampling": spad_subsampling}
+        if preprocessor_name == "ema":
+            return {
+                "subsampling": spad_subsampling,
+                "ema_alpha": float(getattr(self.args, "ema_alpha", 0.0)),
+            }
         raise ValueError(f"Unsupported training preprocessor: {preprocessor_name!r}")
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):

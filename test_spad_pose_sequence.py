@@ -62,7 +62,7 @@ COLOR_KEYPOINT = (255, 255, 255)
 COLOR_WRIST = (255, 165, 0)
 
 TRACKER_CHOICES = ["none", "bytetrack", "botsort", "spad_tracker", "posetrack", "spad_posetrack"]
-PREPROCESSOR_CHOICES = ["model", "ppb", "sum", "stea", "hyb"]
+PREPROCESSOR_CHOICES = ["model", "ppb", "sum", "ema", "stea", "hyb"]
 
 
 @dataclass(frozen=True)
@@ -248,6 +248,8 @@ def _build_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsampling
         }
     if name == "sum":
         return {"subsampling": spad_subsampling}
+    if name == "ema":
+        return {"subsampling": spad_subsampling, "ema_alpha": float(args.ema_alpha)}
     if name == "hyb":
         return {
             "subsampling": spad_subsampling,
@@ -740,7 +742,7 @@ def parse_args():
         "--preprocessor-override",
         type=str,
         default="none",
-        choices=["none", "ppb", "sum", "stea", "hyb"],
+        choices=["none", "ppb", "sum", "ema", "stea", "hyb"],
         help="Deprecated alias for --preprocessor when --preprocessor model.",
     )
     ap.add_argument("--render_root", type=str, default=None, help="Optional explicit root for cached rendered frames")
@@ -763,6 +765,12 @@ def parse_args():
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.0,
+        help="EMA new-sample weight. <=0 uses 2/(subsampling+1) SMA-equivalent default.",
+    )
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
     ap.add_argument("--stea-temporal-window", type=int, default=5)

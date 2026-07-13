@@ -74,7 +74,7 @@ def load_visionsim_split_json(path: str | Path) -> list[dict[str, str]]:
         for key, value in entry.items():
             if not isinstance(key, str) or not value:
                 continue
-            if key in {"stea", "sum", "ppb"} or key.startswith("render_") or key.endswith("_confidence") or key.endswith("_meta"):
+            if key in {"stea", "sum", "ema", "ppb"} or key.startswith("render_") or key.endswith("_confidence") or key.endswith("_meta"):
                 if isinstance(value, str):
                     record[key] = str(Path(value).resolve())
         records.append(record)

@@ -158,7 +158,7 @@ spad_cache_mode: auto # (str) frame-mode detector input source: auto, raw, or re
 spad_render_root: # (str, optional) root directory containing cached rendered frames
 spad_render_contains_confidence: True # (bool) whether cached renders include confidence.npy for UA/residual adapters
 spad_source_render_dirname: renders-spc8kHz # (str) source render dirname used to infer sibling rendered cache roots
-spad_preprocessor: ppb # (str) detector input preprocessor: ppb, sum, stea
+spad_preprocessor: ppb # (str) detector input preprocessor: ppb, sum, ema, stea
 spad_plugin: temporal_ssd # (str) detector-side feature plugin: none, temporal_ssd, temporal_attn, sr_attn, window_st_attn, spatial_only, spatial_temporal
 spad_frame_adapter: ua # (str) frame-mode image-space adapter: none, residual, ua
 spad_plugin_scales: 16,19,22 # (str) comma-separated YOLO layer indices for detector plugins
@@ -176,6 +176,7 @@ ppb_bocpd_gamma: 0.0005 # (float) BOCPD hazard rate for PerPixelBayesian
 ppb_quantile: 1.0 # (float) normalization quantile for PerPixelBayesian
 ppb_normalize: True # (bool) normalize PerPixelBayesian reconstructions
 ppb_min_filter_size: 7 # (int) odd min-filter size for PerPixelBayesian
+ema_alpha: 0.0 # (float) EMA new-sample weight; <=0 => 2/(spad_subsampling+1) SMA-equivalent default
 stea_fast_window: 16 # (int) fast Gamma temporal basis length for STEA
 stea_slow_window: 128 # (int) slow boxcar temporal basis length for STEA
 stea_temporal_window: 5 # (int) causal evidence blur window for STEA

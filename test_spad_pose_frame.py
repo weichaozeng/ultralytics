@@ -56,7 +56,7 @@ from test_spad_pose_sequence import (
 
 
 TRACKER_CHOICES = ["none", "bytetrack", "botsort", "spad_tracker", "posetrack", "spad_posetrack"]
-PREPROCESSOR_CHOICES = ["model", "ppb", "sum", "stea", "hyb"]
+PREPROCESSOR_CHOICES = ["model", "ppb", "sum", "ema", "stea", "hyb"]
 
 
 @dataclass(frozen=True)
@@ -168,6 +168,8 @@ def _build_frame_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsa
         }
     if name == "sum":
         return {"subsampling": spad_subsampling}
+    if name == "ema":
+        return {"subsampling": spad_subsampling, "ema_alpha": float(args.ema_alpha)}
     if name == "hyb":
         # HYB shares STEA temporal/motion knobs; only warp_* are HYB-specific.
         return {
@@ -543,6 +545,12 @@ def parse_args():
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.0,
+        help="EMA new-sample weight. <=0 uses 2/(subsampling+1) SMA-equivalent default.",
+    )
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
     ap.add_argument("--stea-temporal-window", type=int, default=5)

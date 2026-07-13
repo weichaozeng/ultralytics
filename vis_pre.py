@@ -1,7 +1,7 @@
 """Visualize SPAD preprocessors on packed binary `.npy` inputs.
 
 This script is detector-free. It unpacks bit-packed binary arrays, runs one or
-more preprocessors (`sum`, `ppb`, `stea`, `pdrs`), saves per-method
+more preprocessors (`sum`, `ema`, `ppb`, `stea`, `pdrs`), saves per-method
 reconstructions, and writes side-by-side comparison mosaics.
 
 Supported input layouts
@@ -34,14 +34,16 @@ from ultralytics.data.spad_packed import (
     raw_plane_to_photon_cube,
     sum_raw_chunk_to_rgb,
 )
+from ultralytics.models.yolo.pose.spad_preprocessors import EmaPreprocessor
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
 from ultralytics.quanta_pdrs_networks.integrator import PoissonDualRateSplit
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation
 
 
-ALL_METHODS = ("sum", "ppb", "stea", "pdrs")
+ALL_METHODS = ("sum", "ema", "ppb", "stea", "pdrs")
 LABEL_COLORS = {
     "sum": (0, 255, 255),
+    "ema": (255, 165, 0),
     "ppb": (0, 255, 0),
     "stea": (255, 0, 255),
     "pdrs": (0, 128, 255),
@@ -52,20 +54,40 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Visualize SPAD preprocessors on packed binary npy inputs")
     ap.add_argument("--in_path", type=Path, required=True, help="Directory containing binary.npy or a direct .npy path")
     ap.add_argument("--save_dir", type=Path, required=True, help="Output root")
-    ap.add_argument("--pre", type=str, default="sum,ppb,stea,pdrs", help="Comma-separated preprocessors")
+    ap.add_argument("--pre", type=str, default="sum,ema,ppb,stea,pdrs", help="Comma-separated preprocessors")
     ap.add_argument("--bitdim", type=int, default=2, help="0-based axis to unpack with np.unpackbits")
     ap.add_argument("--expected_w", type=int, default=512, help="Crop unpacked bit dimension to this width")
     ap.add_argument("--bitorder", type=str, default="big", choices=["big", "little"])
     ap.add_argument("--flip_x", action="store_true", help="Flip frames left-right before preprocessing")
     ap.add_argument("--flip_y", action="store_true", help="Flip frames top-bottom before preprocessing")
-    ap.add_argument("--chunk_size", type=int, default=320)
+    ap.add_argument(
+        "--chunk_size",
+        type=int,
+        default=320,
+        help=(
+            "Raw bins per output frame (= preprocessor emit interval). "
+            "Example: 2 kHz SPAD at 25 FPS => chunk_size=80; 8 kHz at 125 FPS => 64."
+        ),
+    )
     ap.add_argument("--chunk_stride", type=int, default=0, help="0 means equal to chunk_size")
+    ap.add_argument(
+        "--independent-chunks",
+        action="store_true",
+        help=(
+            "Reset PPB/STEA/EMA state on every chunk (each window independent, like sum). "
+            "Default keeps causal state across contiguous non-overlapping chunks so background "
+            "statistics can stabilize — the intended online behavior."
+        ),
+    )
     ap.add_argument("--max_bins", type=int, default=0, help="Process at most this many time bins (0 = all)")
     ap.add_argument(
         "--max_chunks",
         type=int,
         default=0,
-        help="Save at most this many output frames per sample (0 = all). When >0, chunks are evenly spaced.",
+        help=(
+            "Save at most this many output frames per sample (0 = all). "
+            "When >0, chunks are evenly spaced (non-contiguous) and state is always reset."
+        ),
     )
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
@@ -80,6 +102,13 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
+    # EMA
+    ap.add_argument(
+        "--ema_alpha",
+        type=float,
+        default=0.0,
+        help="EMA new-sample weight. <=0 uses 2/(chunk_size+1) SMA-equivalent default.",
+    )
     # STEA
     ap.add_argument("--stea_fast_window", type=int, default=16)
     ap.add_argument("--stea_slow_window", type=int, default=128)
@@ -291,24 +320,37 @@ def _resolve_device(device: str) -> torch.device:
 
 
 def _build_pdrs_integrator_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    emit = max(int(args.chunk_size), 1)
     return {
-        "chunk_size": int(args.chunk_size),
+        "chunk_size": emit,
         "fast_window": int(args.pdrs_fast_window),
         "slow_window": int(args.pdrs_slow_window),
         "temporal_window": int(args.pdrs_temporal_window),
         "fast_tau": float(args.pdrs_fast_tau),
         "fusion_pool_size": int(args.pdrs_fusion_pool_size),
-        "subsampling": int(args.chunk_size),
+        "subsampling": emit,
         "normalize": bool(args.pdrs_normalize),
         "quantile": float(args.pdrs_quantile),
     }
 
 
 def _build_integrators(args: argparse.Namespace, device: torch.device, preprocessors: list[str]) -> dict[str, object]:
+    """Build stateful preprocessors.
+
+    In vis_pre, ``--chunk_size`` is the emit interval (bins per output frame), e.g.
+    80 for 2 kHz -> 25 FPS. That is exactly what PPB/STEA/EMA ``subsampling`` means
+    here — not the training ``spad_subsampling=64`` (8 kHz / 125 Hz alignment).
+    """
+    emit = max(int(args.chunk_size), 1)
     out: dict[str, object] = {}
+    if "ema" in preprocessors:
+        out["ema"] = EmaPreprocessor(
+            subsampling=emit,
+            ema_alpha=float(args.ema_alpha),
+        ).to(device)
     if "ppb" in preprocessors:
         out["ppb"] = PerPixelBayesian(
-            subsampling=int(args.chunk_size),
+            subsampling=emit,
             bocpd_gamma=float(args.ppb_gamma),
             normalize=bool(args.ppb_normalize),
             quantile=float(args.ppb_quantile),
@@ -316,7 +358,7 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
         ).to(device)
     if "stea" in preprocessors:
         out["stea"] = SpatioTemporalEvidenceAccumulation(
-            chunk_size=int(args.chunk_size),
+            chunk_size=emit,
             fast_window=int(args.stea_fast_window),
             slow_window=int(args.stea_kernel_size or args.stea_slow_window),
             temporal_window=int(args.stea_temporal_window),
@@ -325,7 +367,7 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             motion_threshold=float(args.stea_motion_threshold),
             eps=float(args.stea_eps),
             stable_prior=float(args.stea_blend_const),
-            subsampling=int(args.chunk_size),
+            subsampling=emit,
             normalize=bool(args.stea_normalize),
             quantile=float(args.stea_quantile),
         ).to(device)
@@ -334,11 +376,23 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
     return out
 
 
+def _emit_subsampling_for_chunk(raw_chunk: np.ndarray) -> int:
+    """Emit one reconstruction at the end of this chunk (handles short tails)."""
+    return max(int(raw_chunk.shape[0]), 1)
+
+
 def _reset_integrator_states(integrators: dict[str, object]) -> None:
     for integrator in integrators.values():
         reset = getattr(integrator, "reset", None)
         if callable(reset):
             reset()
+            continue
+        # PPB / STEA / PDRS: drop absolute time so the next clear_states path re-inits.
+        if hasattr(integrator, "t_absolute"):
+            integrator.t_absolute = 0
+        clear = getattr(integrator, "clear_states", None)
+        if callable(clear):
+            clear()
 
 
 def _gray_hwt_to_chw(recons: torch.Tensor) -> torch.Tensor:
@@ -361,6 +415,22 @@ def _preprocess_sum_gray(raw_chunk: np.ndarray, *, device: torch.device) -> torc
     return mean_hw.clamp(0, 1)
 
 
+def _preprocess_ema_gray(
+    raw_chunk: np.ndarray,
+    *,
+    device: torch.device,
+    integrator: EmaPreprocessor,
+    clear_states: bool,
+) -> torch.Tensor:
+    cube = _gray_chunk_to_cube(raw_chunk, device)
+    recons = integrator.process_photon_cube(
+        cube,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
+    return _gray_hwt_to_chw(recons)[-1:].contiguous()
+
+
 def _preprocess_ppb_gray(
     raw_chunk: np.ndarray,
     *,
@@ -369,7 +439,11 @@ def _preprocess_ppb_gray(
     clear_states: bool,
 ) -> torch.Tensor:
     cube = _gray_chunk_to_cube(raw_chunk, device)
-    recons = integrator.process_photon_cube(cube, clear_states=clear_states)
+    recons = integrator.process_photon_cube(
+        cube,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
     return _gray_hwt_to_chw(recons)[-1:].contiguous()
 
 
@@ -381,7 +455,11 @@ def _preprocess_stea_gray(
     clear_states: bool,
 ) -> torch.Tensor:
     cube = _gray_chunk_to_cube(raw_chunk, device)
-    recons = integrator.process_photon_cube(cube, clear_states=clear_states)
+    recons = integrator.process_photon_cube(
+        cube,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
     return _gray_hwt_to_chw(recons)[-1:].contiguous()
 
 
@@ -393,12 +471,33 @@ def _preprocess_pdrs_gray(
     clear_states: bool,
 ) -> torch.Tensor:
     cube = _gray_chunk_to_cube(raw_chunk, device)
-    recons = integrator.process_photon_cube(cube, clear_states=clear_states)
+    recons = integrator.process_photon_cube(
+        cube,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
     return _gray_hwt_to_chw(recons)[-1:].contiguous()
 
 
 def _preprocess_sum_rgb(raw_chunk: np.ndarray, *, device: torch.device) -> torch.Tensor:
     return sum_raw_chunk_to_rgb(raw_chunk, packed_nch=3, device=device)
+
+
+def _preprocess_ema_rgb(
+    raw_chunk: np.ndarray,
+    *,
+    device: torch.device,
+    integrator: EmaPreprocessor,
+    clear_states: bool,
+) -> torch.Tensor:
+    return integrate_raw_chunk_to_rgb(
+        integrator,
+        raw_chunk,
+        packed_nch=3,
+        device=device,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
 
 
 def _preprocess_ppb_rgb(
@@ -408,7 +507,14 @@ def _preprocess_ppb_rgb(
     integrator: PerPixelBayesian,
     clear_states: bool,
 ) -> torch.Tensor:
-    return integrate_raw_chunk_to_rgb(integrator, raw_chunk, packed_nch=3, device=device, clear_states=clear_states)
+    return integrate_raw_chunk_to_rgb(
+        integrator,
+        raw_chunk,
+        packed_nch=3,
+        device=device,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
 
 
 def _preprocess_stea_rgb(
@@ -418,7 +524,14 @@ def _preprocess_stea_rgb(
     integrator: SpatioTemporalEvidenceAccumulation,
     clear_states: bool,
 ) -> torch.Tensor:
-    return integrate_raw_chunk_to_rgb(integrator, raw_chunk, packed_nch=3, device=device, clear_states=clear_states)
+    return integrate_raw_chunk_to_rgb(
+        integrator,
+        raw_chunk,
+        packed_nch=3,
+        device=device,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
 
 
 def _preprocess_pdrs_rgb(
@@ -428,7 +541,14 @@ def _preprocess_pdrs_rgb(
     integrator: PoissonDualRateSplit,
     clear_states: bool,
 ) -> torch.Tensor:
-    return integrate_raw_chunk_to_rgb(integrator, raw_chunk, packed_nch=3, device=device, clear_states=clear_states)
+    return integrate_raw_chunk_to_rgb(
+        integrator,
+        raw_chunk,
+        packed_nch=3,
+        device=device,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
 
 
 def _apply_vis_scaling(x: np.ndarray, *, mode: str, gamma: float, percentile: float) -> np.ndarray:
@@ -525,6 +645,8 @@ def _preprocess_chunk(
     if kind == "single":
         if method == "sum":
             return _preprocess_sum_gray(raw_chunk, device=device)
+        if method == "ema":
+            return _preprocess_ema_gray(raw_chunk, device=device, integrator=integrators["ema"], clear_states=first_chunk)
         if method == "ppb":
             return _preprocess_ppb_gray(raw_chunk, device=device, integrator=integrators["ppb"], clear_states=first_chunk)
         if method == "stea":
@@ -540,6 +662,8 @@ def _preprocess_chunk(
 
     if method == "sum":
         return _preprocess_sum_rgb(raw_chunk, device=device)
+    if method == "ema":
+        return _preprocess_ema_rgb(raw_chunk, device=device, integrator=integrators["ema"], clear_states=first_chunk)
     if method == "ppb":
         return _preprocess_ppb_rgb(raw_chunk, device=device, integrator=integrators["ppb"], clear_states=first_chunk)
     if method == "stea":
@@ -600,7 +724,15 @@ def main() -> None:
         stride=stride,
         max_chunks=max_chunks,
     )
-    independent_chunks = max_chunks > 0
+    # Contiguous non-overlapping chunks: keep causal state (PPB background run-lengths, etc.).
+    # Reset when windows are independent by request, non-contiguous (max_chunks), or overlapping
+    # (stride < chunk_size would otherwise double-count bins under carried state).
+    contiguous_stream = (
+        max_chunks == 0
+        and stride >= int(args.chunk_size)
+        and not bool(args.independent_chunks)
+    )
+    reset_each_chunk = not contiguous_stream
     device = _resolve_device(args.device)
     integrators = _build_integrators(args, device, preprocessors)
     _reset_integrator_states(integrators)
@@ -613,8 +745,18 @@ def main() -> None:
 
     print(f"Loaded {npy}")
     print(f"packed: shape={packed.shape} kind={kind} n_bins={n_bins}")
+    print(
+        f"chunk_size={int(args.chunk_size)} (=emit interval) stride={stride} "
+        f"carry_state={contiguous_stream} reset_each_chunk={reset_each_chunk}"
+    )
     if max_chunks > 0:
-        print(f"max_chunks={max_chunks} (evenly spaced)")
+        print(f"max_chunks={max_chunks} (evenly spaced; always reset)")
+    elif stride < int(args.chunk_size):
+        print("Note: stride < chunk_size (overlapping windows) => state reset each chunk to avoid double-counting.")
+    elif bool(args.independent_chunks):
+        print("Note: --independent-chunks resets state every window (sum-like; background stats cannot accumulate).")
+    else:
+        print("State: causal carry across chunks (PPB/STEA/EMA online). Use --independent-chunks to disable.")
     print(f"writing outputs to: {out_dir}")
     print(f"preprocess flips: flip_x={bool(args.flip_x)} flip_y={bool(args.flip_y)} bitorder={args.bitorder}")
 
@@ -642,7 +784,7 @@ def main() -> None:
         stem = f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{frame_idx:07d}"
         labels: list[str] = []
         panels: list[np.ndarray] = []
-        clear_states = independent_chunks or cube_idx == 0
+        clear_states = reset_each_chunk or cube_idx == 0
         for method in preprocessors:
             frames = _preprocess_chunk(
                 method,

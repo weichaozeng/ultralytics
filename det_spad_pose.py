@@ -330,6 +330,8 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
         )
     elif name == "sum":
         kwargs = {"subsampling": spad_subsampling}
+    elif name == "ema":
+        kwargs = {"subsampling": spad_subsampling, "ema_alpha": float(getattr(args, "ema_alpha", 0.0))}
     else:
         raise ValueError(f"Unsupported --preprocessor-override: {name!r}")
 
@@ -464,7 +466,7 @@ def main():
         "--preprocessor-override",
         type=str,
         default="none",
-        choices=["none", "ppb", "sum", "stea", "hyb"],
+        choices=["none", "ppb", "sum", "ema", "stea", "hyb"],
         help="Optionally override the checkpoint's internal SPAD preprocessor at inference time.",
     )
     ap.add_argument("--spad-subsampling", type=int, default=320, help="Temporal subsampling used by override preprocessors.")
@@ -472,6 +474,12 @@ def main():
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.0,
+        help="EMA new-sample weight. <=0 uses 2/(subsampling+1) SMA-equivalent default.",
+    )
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
     ap.add_argument("--stea-temporal-window", type=int, default=5)

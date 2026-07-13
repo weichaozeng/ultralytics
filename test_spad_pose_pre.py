@@ -2,7 +2,7 @@
 """External SPAD preprocessor + standard YOLO detector evaluation.
 
 Sibling of ``test_spad_pose_sequence.py`` / ``test_rgb_pose.py``:
-- ``--preprocessor`` selects sum / ppb / stea.
+- ``--preprocessor`` selects sum / ema / ppb / stea.
 - ``--cache_mode`` auto|raw|rendered: use cached renders from the split JSON when
   available, otherwise reconstruct from raw SPAD.
 - Predictions come from the pretrained detector (``det.py`` / ``model.track``).
@@ -70,7 +70,7 @@ from test_spad_pose_sequence import (
     _vis_dir,
 )
 
-SUPPORTED_PREPROCESSORS = ("sum", "ppb", "stea")
+SUPPORTED_PREPROCESSORS = ("sum", "ema", "ppb", "stea")
 
 
 def _dated_run_name(preprocessor: str) -> str:
@@ -233,6 +233,12 @@ def parse_args():
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.0,
+        help="EMA new-sample weight. <=0 uses 2/(subsampling+1) SMA-equivalent default.",
+    )
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
     ap.add_argument("--stea-temporal-window", type=int, default=5)

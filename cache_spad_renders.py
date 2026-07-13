@@ -35,7 +35,7 @@ def parse_args():
         default="",
         help="Optional explicit cache root. If omitted, writes beside each sample's renders-spc8kHz tree.",
     )
-    ap.add_argument("--preprocessor", type=str, choices=["sum", "ppb", "stea", "pdrs"], required=True)
+    ap.add_argument("--preprocessor", type=str, choices=["sum", "ema", "ppb", "stea", "pdrs"], required=True)
     ap.add_argument("--chunk-size", type=int, default=320, help="Raw-bin chunk size per rendered frame.")
     ap.add_argument("--stride-bins", type=int, default=320, help="Stride in raw bins between cached chunks.")
     ap.add_argument("--spad-bins-per-gt", type=int, default=64, help="Raw bins corresponding to one GT frame.")
@@ -65,6 +65,12 @@ def parse_args():
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", type=str, default="true")
     ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.0,
+        help="EMA new-sample weight. <=0 uses 2/(subsampling+1) SMA-equivalent default.",
+    )
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
     ap.add_argument("--stea-temporal-window", type=int, default=5)
@@ -124,6 +130,8 @@ def _build_preprocessor_kwargs(args) -> dict[str, Any]:
     chunk_size = int(args.chunk_size)
     if name == "sum":
         return {"subsampling": subsampling}
+    if name == "ema":
+        return {"subsampling": subsampling, "ema_alpha": float(args.ema_alpha)}
     if name == "ppb":
         return {
             "subsampling": subsampling,
