@@ -325,7 +325,7 @@ class SpadPoseSequenceTrainer(PoseTrainer):
             plugin=str(getattr(self.args, "spad_plugin", "temporal_ssd")),
             plugin_layers=plugin_layers,
             temporal_core=str(getattr(self.args, "spad_temporal_core", "ssd")),
-            ssd_state_dim=int(getattr(self.args, "ssd_state_dim", 8)),
+            ssd_state_dim=int(getattr(self.args, "ssd_state_dim", 20)),
             ssd_head_divisor=int(getattr(self.args, "ssd_head_divisor", 4)),
             attn_state_dim=int(getattr(self.args, "attn_state_dim", 8)),
             attn_head_divisor=int(getattr(self.args, "attn_head_divisor", 4)),

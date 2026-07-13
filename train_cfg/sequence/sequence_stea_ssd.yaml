@@ -38,7 +38,7 @@ stea_quantile: 1.0
 # backbone SSD plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.
 spad_plugin: temporal_ssd
 spad_plugin_scales: backbone
-ssd_state_dim: 8
+ssd_state_dim: 20
 ssd_head_divisor: 4
 spad_spatial_reduce_ratio: 2
 spad_spatial_kernel_size: 3

@@ -185,7 +185,7 @@ stea_motion_threshold: 0.07 # (float) motion routing threshold for STEA
 stea_stable_prior: 16.0 # (float) stable-branch prior for STEA
 stea_normalize: True # (bool) normalize STEA reconstructions
 stea_quantile: 1.0 # (float) normalization quantile for STEA
-ssd_state_dim: 8 # (int) latent state dimension for SSD temporal blocks
+ssd_state_dim: 20 # (int) latent state dimension for SSD temporal blocks
 ssd_head_divisor: 4 # (int) derive SSD head dim from channels // divisor
 attn_state_dim: 8 # (int) bottleneck state width for attention temporal blocks (attn_dim = num_heads * attn_state_dim)
 attn_head_divisor: 4 # (int) derive attention head dim from channels // divisor

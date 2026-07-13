@@ -615,7 +615,7 @@ class SpadPoseModel(PoseModel):
         plugin="temporal_ssd",
         plugin_layers=None,
         temporal_core="ssd",
-        ssd_state_dim=8,
+        ssd_state_dim=20,
         ssd_head_divisor=4,
         ssd_kwargs=None,
         attn_state_dim=8,
