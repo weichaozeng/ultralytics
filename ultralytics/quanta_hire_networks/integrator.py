@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from ultralytics.quanta_neural_networks.ops.array_ops import torch_quantile
+
 
 def zoh_alpha(sample_rate_hz: float, tau_s: float) -> float:
     """Zero-order-hold discrete retention α = exp(-1/(f_s · τ))."""
@@ -73,6 +75,8 @@ class HIRE(nn.Module):
         gate_theta: float = 0.05,
         spatial_kernel: int = 3,
         eps: float = 1e-5,
+        normalize: bool = False,
+        quantile: float = 1.0,
     ):
         super().__init__()
         fs = float(bin_rate_hz) if bin_rate_hz is not None else float(sample_rate_hz)
@@ -96,6 +100,8 @@ class HIRE(nn.Module):
             raise ValueError(f"spatial_kernel must be odd and >= 1, got {spatial_kernel}")
         self.spatial_kernel = k
         self.eps = float(eps)
+        self.normalize = bool(normalize)
+        self.quantile = float(quantile)
 
         self.tau_fast = _resolve_tau(bins=self.fast_bins, ref_rate_hz=ref, tau_override=tau_fast)
         self.tau_slow = _resolve_tau(bins=self.slow_bins, ref_rate_hz=ref, tau_override=tau_slow)
@@ -213,6 +219,11 @@ class HIRE(nn.Module):
                 raise ValueError(f"eps must be > 0, got {eps}")
             self.eps = eps
 
+        if "normalize" in normalized:
+            self.normalize = bool(normalized["normalize"])
+        if "quantile" in normalized:
+            self.quantile = float(normalized["quantile"])
+
         tau_set = False
         for tau_key, bins_attr in (
             ("tau_fast", "fast_bins"),
@@ -304,7 +315,16 @@ class HIRE(nn.Module):
         self.i_out = None if i_out is None else i_out.detach()
         self.s_tilde = None if s_tilde is None else s_tilde.detach()
         self.gate = None if gate is None else gate.detach()
-        return torch.cat(frames, dim=-1)
+        return self.clamp_recons(torch.cat(frames, dim=-1))
+
+    def clamp_recons(self, recons: Tensor) -> Tensor:
+        if recons.numel() == 0:
+            return recons.float()
+        recons = recons.float()
+        max_value = 1.0
+        if self.normalize:
+            max_value = torch_quantile(recons, self.quantile).clamp(min=1e-6)
+        return (recons / max_value).clamp(0, 1)
 
     @torch.no_grad()
     def process_photon_cube(

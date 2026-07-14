@@ -177,6 +177,10 @@ ppb_quantile: 1.0 # (float) normalization quantile for PerPixelBayesian
 ppb_normalize: True # (bool) normalize PerPixelBayesian reconstructions
 ppb_min_filter_size: 7 # (int) odd min-filter size for PerPixelBayesian
 ema_alpha: 0.0 # (float) EMA new-sample weight; <=0 => 2/(spad_subsampling+1) SMA-equivalent default
+ema_normalize: True # (bool) normalize EMA reconstructions
+ema_quantile: 1.0 # (float) normalization quantile for EMA
+sum_normalize: True # (bool) normalize sum reconstructions
+sum_quantile: 1.0 # (float) normalization quantile for sum
 stea_fast_window: 16 # (int) fast Gamma temporal basis length for STEA
 stea_slow_window: 128 # (int) slow boxcar temporal basis length for STEA
 stea_temporal_window: 5 # (int) causal evidence blur window for STEA
@@ -195,6 +199,8 @@ hire_tau_slow: 0.0 # (float) optional wall-clock tau override (seconds); <=0 => 
 hire_tau_surprise: 0.0 # (float) optional wall-clock tau override (seconds); <=0 => from hire_surprise_bins
 hire_gate_theta: 0.05 # (float) soft gate scale g = S / (S + theta)
 hire_spatial_kernel: 3 # (int) odd spatial consensus kernel for surprise
+hire_normalize: True # (bool) normalize HIRE reconstructions
+hire_quantile: 1.0 # (float) normalization quantile for HIRE
 ssd_state_dim: 20 # (int) latent state dimension for SSD temporal blocks
 ssd_head_divisor: 4 # (int) derive SSD head dim from channels // divisor
 attn_state_dim: 8 # (int) bottleneck state width for attention temporal blocks (attn_dim = num_heads * attn_state_dim)

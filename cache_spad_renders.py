@@ -95,6 +95,12 @@ def parse_args():
     ap.add_argument("--hire-tau-surprise", type=float, default=0.0)
     ap.add_argument("--hire-gate-theta", type=float, default=0.05)
     ap.add_argument("--hire-spatial-kernel", type=int, default=3)
+    ap.add_argument("--sum-normalize", type=str, default="true")
+    ap.add_argument("--sum-quantile", type=float, default=1.0)
+    ap.add_argument("--ema-normalize", type=str, default="true")
+    ap.add_argument("--ema-quantile", type=float, default=1.0)
+    ap.add_argument("--hire-normalize", type=str, default="true")
+    ap.add_argument("--hire-quantile", type=float, default=1.0)
     return ap.parse_args()
 
 
@@ -122,9 +128,18 @@ def _build_preprocessor_kwargs(args) -> dict[str, Any]:
     name = str(args.preprocessor).strip().lower()
     subsampling = int(args.spad_bins_per_gt)
     if name == "sum":
-        return {"subsampling": subsampling}
+        return {
+            "subsampling": subsampling,
+            "normalize": _as_bool(getattr(args, "sum_normalize", True)),
+            "quantile": float(getattr(args, "sum_quantile", 1.0)),
+        }
     if name == "ema":
-        return {"subsampling": subsampling, "ema_alpha": float(args.ema_alpha)}
+        return {
+            "subsampling": subsampling,
+            "ema_alpha": float(args.ema_alpha),
+            "normalize": _as_bool(getattr(args, "ema_normalize", True)),
+            "quantile": float(getattr(args, "ema_quantile", 1.0)),
+        }
     if name == "ppb":
         return {
             "subsampling": subsampling,
@@ -162,6 +177,8 @@ def _build_preprocessor_kwargs(args) -> dict[str, Any]:
             "tau_surprise": _tau_or_none(args.hire_tau_surprise),
             "gate_theta": float(args.hire_gate_theta),
             "spatial_kernel": int(args.hire_spatial_kernel),
+            "normalize": _as_bool(getattr(args, "hire_normalize", True)),
+            "quantile": float(getattr(args, "hire_quantile", 1.0)),
         }
     raise ValueError(f"Unsupported preprocessor: {name!r}")
 

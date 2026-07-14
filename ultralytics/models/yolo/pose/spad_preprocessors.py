@@ -11,17 +11,35 @@ import torch.nn.functional as F
 from ultralytics.quanta_hire_networks.integrator import HIRE, HIREFrame
 from ultralytics.quanta_hyb_networks.integrator import HybridSpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
+from ultralytics.quanta_neural_networks.ops.array_ops import torch_quantile
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation, SpatioTemporalEvidenceFrame
+
+
+def clamp_recons(recons: torch.Tensor, *, normalize: bool, quantile: float) -> torch.Tensor:
+    """Optionally quantile-normalize then clamp to ``[0, 1]`` (same as PPB/STEA)."""
+    if recons.numel() == 0:
+        return recons.float()
+    recons = recons.float()
+    max_value = 1.0
+    if normalize:
+        max_value = torch_quantile(recons, float(quantile)).clamp(min=1e-6)
+    return (recons / max_value).clamp(0, 1)
 
 
 class SumPreprocessor(nn.Module):
     """Temporal-mean preprocessor that emits one frame per subsampling window."""
 
-    def __init__(self, subsampling: int = 1):
+    def __init__(self, subsampling: int = 1, normalize: bool = False, quantile: float = 1.0):
         super().__init__()
         self.subsampling = max(int(subsampling), 1)
+        self.normalize = bool(normalize)
+        self.quantile = float(quantile)
 
     def process_photon_cube(self, photon_cube: torch.Tensor, clear_states: bool = True, **kwargs) -> torch.Tensor:
+        if "normalize" in kwargs and kwargs["normalize"] is not None:
+            self.normalize = bool(kwargs["normalize"])
+        if "quantile" in kwargs and kwargs["quantile"] is not None:
+            self.quantile = float(kwargs["quantile"])
         if photon_cube.ndim != 3:
             raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
         if photon_cube.shape[-1] == 0:
@@ -30,13 +48,14 @@ class SumPreprocessor(nn.Module):
         raw = photon_cube.float()
         t_raw = int(raw.shape[-1])
         if t_raw <= self.subsampling:
-            return raw.mean(dim=-1, keepdim=True)
-
-        frames = []
-        for t0 in range(0, t_raw, self.subsampling):
-            t1 = min(t_raw, t0 + self.subsampling)
-            frames.append(raw[..., t0:t1].mean(dim=-1, keepdim=True))
-        return torch.cat(frames, dim=-1)
+            frames = raw.mean(dim=-1, keepdim=True)
+        else:
+            frames_ll = []
+            for t0 in range(0, t_raw, self.subsampling):
+                t1 = min(t_raw, t0 + self.subsampling)
+                frames_ll.append(raw[..., t0:t1].mean(dim=-1, keepdim=True))
+            frames = torch.cat(frames_ll, dim=-1)
+        return clamp_recons(frames, normalize=self.normalize, quantile=self.quantile)
 
     def recon_t_indices(self, t_raw: int, num_frames: int) -> list[int]:
         if t_raw <= 0 or num_frames <= 0:
@@ -79,6 +98,7 @@ class SumPreprocessor(nn.Module):
             confidence = photon_cube.new_zeros((1, h // 2, w // 2), dtype=torch.float32)
             return empty, confidence
         frame = photon_cube.float().mean(dim=-1, keepdim=True)
+        frame = clamp_recons(frame, normalize=self.normalize, quantile=self.quantile)
         confidence_hw = self._sobel_edge_confidence(frame.squeeze(-1))
         confidence = self._confidence_to_frame_space(confidence_hw).to(device=frame.device, dtype=frame.dtype)
         return frame, confidence
@@ -93,7 +113,7 @@ class EmaPreprocessor(nn.Module):
     ``2 / (subsampling + 1)`` (SMA-equivalent EMA length).
     """
 
-    def __init__(self, subsampling: int = 1, ema_alpha: float = 0.0):
+    def __init__(self, subsampling: int = 1, ema_alpha: float = 0.0, normalize: bool = False, quantile: float = 1.0):
         super().__init__()
         self.subsampling = max(int(subsampling), 1)
         alpha = float(ema_alpha)
@@ -102,6 +122,8 @@ class EmaPreprocessor(nn.Module):
         if not (0.0 < alpha <= 1.0):
             raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha}")
         self.ema_alpha = float(alpha)
+        self.normalize = bool(normalize)
+        self.quantile = float(quantile)
         self.ema_state: torch.Tensor | None = None
 
     def clear_states(self) -> None:
@@ -169,7 +191,7 @@ class EmaPreprocessor(nn.Module):
             frames.append(ema.unsqueeze(-1))
 
         self.ema_state = None if ema is None else ema.detach()
-        return torch.cat(frames, dim=-1)
+        return clamp_recons(torch.cat(frames, dim=-1), normalize=self.normalize, quantile=self.quantile)
 
     @torch.no_grad()
     def process_photon_cube(
@@ -179,6 +201,10 @@ class EmaPreprocessor(nn.Module):
         subsampling: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        if "normalize" in kwargs and kwargs["normalize"] is not None:
+            self.normalize = bool(kwargs["normalize"])
+        if "quantile" in kwargs and kwargs["quantile"] is not None:
+            self.quantile = float(kwargs["quantile"])
         prev = self.subsampling
         if subsampling is not None:
             self.subsampling = max(int(subsampling), 1)
@@ -195,6 +221,10 @@ class EmaPreprocessor(nn.Module):
         subsampling: int | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if "normalize" in kwargs and kwargs["normalize"] is not None:
+            self.normalize = bool(kwargs["normalize"])
+        if "quantile" in kwargs and kwargs["quantile"] is not None:
+            self.quantile = float(kwargs["quantile"])
         prev = self.subsampling
         if subsampling is not None:
             self.subsampling = max(int(subsampling), 1)

@@ -31,9 +31,8 @@ from ultralytics.data.spad_packed import (
     is_packed_spad,
     packed_frames_to_raw_video,
     raw_plane_to_photon_cube,
-    sum_raw_chunk_to_rgb,
 )
-from ultralytics.models.yolo.pose.spad_preprocessors import EmaPreprocessor
+from ultralytics.models.yolo.pose.spad_preprocessors import EmaPreprocessor, SumPreprocessor
 from ultralytics.quanta_hire_networks.integrator import HIRE
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation
@@ -101,6 +100,13 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
+    # Shared dynamic-range stretch (align brightness across methods)
+    ap.add_argument("--sum_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--sum_quantile", type=float, default=1.0)
+    ap.add_argument("--ema_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--ema_quantile", type=float, default=1.0)
+    ap.add_argument("--hire_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--hire_quantile", type=float, default=1.0)
     # EMA
     ap.add_argument(
         "--ema_alpha",
@@ -336,10 +342,18 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
     """
     emit = max(int(args.chunk_size), 1)
     out: dict[str, object] = {}
+    if "sum" in preprocessors:
+        out["sum"] = SumPreprocessor(
+            subsampling=emit,
+            normalize=bool(args.sum_normalize),
+            quantile=float(args.sum_quantile),
+        ).to(device)
     if "ema" in preprocessors:
         out["ema"] = EmaPreprocessor(
             subsampling=emit,
             ema_alpha=float(args.ema_alpha),
+            normalize=bool(args.ema_normalize),
+            quantile=float(args.ema_quantile),
         ).to(device)
     if "ppb" in preprocessors:
         out["ppb"] = PerPixelBayesian(
@@ -381,6 +395,8 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             gate_theta=float(args.hire_gate_theta),
             spatial_kernel=int(args.hire_spatial_kernel),
             eps=float(args.hire_eps),
+            normalize=bool(args.hire_normalize),
+            quantile=float(args.hire_quantile),
         ).to(device)
     return out
 
@@ -418,10 +434,20 @@ def _gray_chunk_to_cube(raw_chunk: np.ndarray, device: torch.device) -> torch.Te
     return raw_plane_to_photon_cube(plane, device=device, as_bool=True)
 
 
-def _preprocess_sum_gray(raw_chunk: np.ndarray, *, device: torch.device) -> torch.Tensor:
-    raw = torch.from_numpy(np.ascontiguousarray(raw_chunk[..., 0])).to(device).float()
-    mean_hw = raw.mean(dim=0, keepdim=True).unsqueeze(1)
-    return mean_hw.clamp(0, 1)
+def _preprocess_sum_gray(
+    raw_chunk: np.ndarray,
+    *,
+    device: torch.device,
+    integrator: SumPreprocessor,
+    clear_states: bool,
+) -> torch.Tensor:
+    cube = _gray_chunk_to_cube(raw_chunk, device)
+    recons = integrator.process_photon_cube(
+        cube,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
+    return _gray_hwt_to_chw(recons)[-1:].contiguous()
 
 
 def _preprocess_ema_gray(
@@ -488,8 +514,21 @@ def _preprocess_hire_gray(
     return _gray_hwt_to_chw(recons)[-1:].contiguous()
 
 
-def _preprocess_sum_rgb(raw_chunk: np.ndarray, *, device: torch.device) -> torch.Tensor:
-    return sum_raw_chunk_to_rgb(raw_chunk, packed_nch=3, device=device)
+def _preprocess_sum_rgb(
+    raw_chunk: np.ndarray,
+    *,
+    device: torch.device,
+    integrator: SumPreprocessor,
+    clear_states: bool,
+) -> torch.Tensor:
+    return integrate_raw_chunk_to_rgb(
+        integrator,
+        raw_chunk,
+        packed_nch=3,
+        device=device,
+        clear_states=clear_states,
+        subsampling=_emit_subsampling_for_chunk(raw_chunk),
+    )
 
 
 def _preprocess_ema_rgb(
@@ -653,7 +692,9 @@ def _preprocess_chunk(
 ) -> torch.Tensor:
     if kind == "single":
         if method == "sum":
-            return _preprocess_sum_gray(raw_chunk, device=device)
+            return _preprocess_sum_gray(
+                raw_chunk, device=device, integrator=integrators["sum"], clear_states=first_chunk
+            )
         if method == "ema":
             return _preprocess_ema_gray(raw_chunk, device=device, integrator=integrators["ema"], clear_states=first_chunk)
         if method == "ppb":
@@ -665,7 +706,9 @@ def _preprocess_chunk(
         raise ValueError(f"Unsupported grayscale preprocessor: {method!r}")
 
     if method == "sum":
-        return _preprocess_sum_rgb(raw_chunk, device=device)
+        return _preprocess_sum_rgb(
+            raw_chunk, device=device, integrator=integrators["sum"], clear_states=first_chunk
+        )
     if method == "ema":
         return _preprocess_ema_rgb(raw_chunk, device=device, integrator=integrators["ema"], clear_states=first_chunk)
     if method == "ppb":

@@ -230,11 +230,17 @@ class SpadPoseSequenceTrainer(PoseTrainer):
                 "quantile": float(getattr(self.args, "stea_quantile", 1.0)),
             }
         if preprocessor_name == "sum":
-            return {"subsampling": spad_subsampling}
+            return {
+                "subsampling": spad_subsampling,
+                "normalize": bool(getattr(self.args, "sum_normalize", True)),
+                "quantile": float(getattr(self.args, "sum_quantile", 1.0)),
+            }
         if preprocessor_name == "ema":
             return {
                 "subsampling": spad_subsampling,
                 "ema_alpha": float(getattr(self.args, "ema_alpha", 0.0)),
+                "normalize": bool(getattr(self.args, "ema_normalize", True)),
+                "quantile": float(getattr(self.args, "ema_quantile", 1.0)),
             }
         if preprocessor_name == "hire":
             def _tau_or_none(key: str) -> float | None:
@@ -255,6 +261,8 @@ class SpadPoseSequenceTrainer(PoseTrainer):
                 "tau_surprise": _tau_or_none("hire_tau_surprise"),
                 "gate_theta": float(getattr(self.args, "hire_gate_theta", 0.05)),
                 "spatial_kernel": int(getattr(self.args, "hire_spatial_kernel", 3)),
+                "normalize": bool(getattr(self.args, "hire_normalize", True)),
+                "quantile": float(getattr(self.args, "hire_quantile", 1.0)),
             }
         raise ValueError(f"Unsupported training preprocessor: {preprocessor_name!r}")
 
