@@ -1,7 +1,7 @@
 """Visualize SPAD preprocessors on packed binary `.npy` inputs.
 
 This script is detector-free. It unpacks bit-packed binary arrays, runs one or
-more preprocessors (`sum`, `ema`, `ppb`, `stea`, `pdrs`), saves per-method
+more preprocessors (`sum`, `ema`, `ppb`, `stea`, `hire`), saves per-method
 reconstructions, and writes side-by-side comparison mosaics.
 
 Supported input layouts
@@ -17,7 +17,6 @@ python ultralytics/vis_pre.py \
   --bitdim 2 \
   --expected_w 512
 """
-
 from __future__ import annotations
 
 import argparse
@@ -35,18 +34,18 @@ from ultralytics.data.spad_packed import (
     sum_raw_chunk_to_rgb,
 )
 from ultralytics.models.yolo.pose.spad_preprocessors import EmaPreprocessor
+from ultralytics.quanta_hire_networks.integrator import HIRE
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
-from ultralytics.quanta_pdrs_networks.integrator import PoissonDualRateSplit
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation
 
 
-ALL_METHODS = ("sum", "ema", "ppb", "stea", "pdrs")
+ALL_METHODS = ("sum", "ema", "ppb", "stea", "hire")
 LABEL_COLORS = {
     "sum": (0, 255, 255),
     "ema": (255, 165, 0),
     "ppb": (0, 255, 0),
     "stea": (255, 0, 255),
-    "pdrs": (0, 128, 255),
+    "hire": (0, 200, 255),
 }
 
 
@@ -54,7 +53,7 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Visualize SPAD preprocessors on packed binary npy inputs")
     ap.add_argument("--in_path", type=Path, required=True, help="Directory containing binary.npy or a direct .npy path")
     ap.add_argument("--save_dir", type=Path, required=True, help="Output root")
-    ap.add_argument("--pre", type=str, default="sum,ema,ppb,stea,pdrs", help="Comma-separated preprocessors")
+    ap.add_argument("--pre", type=str, default="sum,ema,ppb,stea,hire", help="Comma-separated preprocessors")
     ap.add_argument("--bitdim", type=int, default=2, help="0-based axis to unpack with np.unpackbits")
     ap.add_argument("--expected_w", type=int, default=512, help="Crop unpacked bit dimension to this width")
     ap.add_argument("--bitorder", type=str, default="big", choices=["big", "little"])
@@ -74,7 +73,7 @@ def _parse_args() -> argparse.Namespace:
         "--independent-chunks",
         action="store_true",
         help=(
-            "Reset PPB/STEA/EMA state on every chunk (each window independent, like sum). "
+            "Reset PPB/STEA/EMA/HIRE state on every chunk (each window independent, like sum). "
             "Default keeps causal state across contiguous non-overlapping chunks so background "
             "statistics can stabilize — the intended online behavior."
         ),
@@ -121,14 +120,23 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--stea_kernel_size", type=int, default=None)
     ap.add_argument("--stea_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea_quantile", type=float, default=1.0)
-    # PDRS (Poisson Dual-Rate Split)
-    ap.add_argument("--pdrs_fast_window", type=int, default=32)
-    ap.add_argument("--pdrs_slow_window", type=int, default=128)
-    ap.add_argument("--pdrs_temporal_window", type=int, default=5)
-    ap.add_argument("--pdrs_fast_tau", type=float, default=6.0)
-    ap.add_argument("--pdrs_fusion_pool_size", type=int, default=7)
-    ap.add_argument("--pdrs_normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--pdrs_quantile", type=float, default=1.0)
+    # HIRE (primary knob: SPAD bin rate; taus from reference-bin presets)
+    ap.add_argument(
+        "--bin_rate_hz",
+        type=float,
+        default=8000.0,
+        help="SPAD bin sample rate f_s for HIRE ZOH alphas.",
+    )
+    ap.add_argument("--hire_ref_rate_hz", type=float, default=8000.0)
+    ap.add_argument("--hire_fast_bins", type=int, default=16)
+    ap.add_argument("--hire_slow_bins", type=int, default=128)
+    ap.add_argument("--hire_surprise_bins", type=int, default=8)
+    ap.add_argument("--hire_tau_fast", type=float, default=0.0)
+    ap.add_argument("--hire_tau_slow", type=float, default=0.0)
+    ap.add_argument("--hire_tau_surprise", type=float, default=0.0)
+    ap.add_argument("--hire_gate_theta", type=float, default=0.05)
+    ap.add_argument("--hire_spatial_kernel", type=int, default=3)
+    ap.add_argument("--hire_eps", type=float, default=1e-5)
     return ap.parse_args()
 
 
@@ -319,26 +327,11 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-def _build_pdrs_integrator_kwargs(args: argparse.Namespace) -> dict[str, object]:
-    emit = max(int(args.chunk_size), 1)
-    return {
-        "chunk_size": emit,
-        "fast_window": int(args.pdrs_fast_window),
-        "slow_window": int(args.pdrs_slow_window),
-        "temporal_window": int(args.pdrs_temporal_window),
-        "fast_tau": float(args.pdrs_fast_tau),
-        "fusion_pool_size": int(args.pdrs_fusion_pool_size),
-        "subsampling": emit,
-        "normalize": bool(args.pdrs_normalize),
-        "quantile": float(args.pdrs_quantile),
-    }
-
-
 def _build_integrators(args: argparse.Namespace, device: torch.device, preprocessors: list[str]) -> dict[str, object]:
     """Build stateful preprocessors.
 
     In vis_pre, ``--chunk_size`` is the emit interval (bins per output frame), e.g.
-    80 for 2 kHz -> 25 FPS. That is exactly what PPB/STEA/EMA ``subsampling`` means
+    80 for 2 kHz -> 25 FPS. That is exactly what PPB/STEA/EMA/HIRE ``subsampling`` means
     here — not the training ``spad_subsampling=64`` (8 kHz / 125 Hz alignment).
     """
     emit = max(int(args.chunk_size), 1)
@@ -371,8 +364,24 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             normalize=bool(args.stea_normalize),
             quantile=float(args.stea_quantile),
         ).to(device)
-    if "pdrs" in preprocessors:
-        out["pdrs"] = PoissonDualRateSplit(**_build_pdrs_integrator_kwargs(args)).to(device)
+    if "hire" in preprocessors:
+        def _tau_or_none(val: float) -> float | None:
+            return None if float(val) <= 0.0 else float(val)
+
+        out["hire"] = HIRE(
+            subsampling=emit,
+            sample_rate_hz=float(args.bin_rate_hz),
+            ref_rate_hz=float(args.hire_ref_rate_hz),
+            fast_bins=int(args.hire_fast_bins),
+            slow_bins=int(args.hire_slow_bins),
+            surprise_bins=int(args.hire_surprise_bins),
+            tau_fast=_tau_or_none(args.hire_tau_fast),
+            tau_slow=_tau_or_none(args.hire_tau_slow),
+            tau_surprise=_tau_or_none(args.hire_tau_surprise),
+            gate_theta=float(args.hire_gate_theta),
+            spatial_kernel=int(args.hire_spatial_kernel),
+            eps=float(args.hire_eps),
+        ).to(device)
     return out
 
 
@@ -387,7 +396,7 @@ def _reset_integrator_states(integrators: dict[str, object]) -> None:
         if callable(reset):
             reset()
             continue
-        # PPB / STEA / PDRS: drop absolute time so the next clear_states path re-inits.
+        # PPB / STEA: drop absolute time so the next clear_states path re-inits.
         if hasattr(integrator, "t_absolute"):
             integrator.t_absolute = 0
         clear = getattr(integrator, "clear_states", None)
@@ -463,11 +472,11 @@ def _preprocess_stea_gray(
     return _gray_hwt_to_chw(recons)[-1:].contiguous()
 
 
-def _preprocess_pdrs_gray(
+def _preprocess_hire_gray(
     raw_chunk: np.ndarray,
     *,
     device: torch.device,
-    integrator: PoissonDualRateSplit,
+    integrator: HIRE,
     clear_states: bool,
 ) -> torch.Tensor:
     cube = _gray_chunk_to_cube(raw_chunk, device)
@@ -534,11 +543,11 @@ def _preprocess_stea_rgb(
     )
 
 
-def _preprocess_pdrs_rgb(
+def _preprocess_hire_rgb(
     raw_chunk: np.ndarray,
     *,
     device: torch.device,
-    integrator: PoissonDualRateSplit,
+    integrator: HIRE,
     clear_states: bool,
 ) -> torch.Tensor:
     return integrate_raw_chunk_to_rgb(
@@ -651,13 +660,8 @@ def _preprocess_chunk(
             return _preprocess_ppb_gray(raw_chunk, device=device, integrator=integrators["ppb"], clear_states=first_chunk)
         if method == "stea":
             return _preprocess_stea_gray(raw_chunk, device=device, integrator=integrators["stea"], clear_states=first_chunk)
-        if method == "pdrs":
-            return _preprocess_pdrs_gray(
-                raw_chunk,
-                device=device,
-                integrator=integrators[method],
-                clear_states=first_chunk,
-            )
+        if method == "hire":
+            return _preprocess_hire_gray(raw_chunk, device=device, integrator=integrators["hire"], clear_states=first_chunk)
         raise ValueError(f"Unsupported grayscale preprocessor: {method!r}")
 
     if method == "sum":
@@ -668,13 +672,8 @@ def _preprocess_chunk(
         return _preprocess_ppb_rgb(raw_chunk, device=device, integrator=integrators["ppb"], clear_states=first_chunk)
     if method == "stea":
         return _preprocess_stea_rgb(raw_chunk, device=device, integrator=integrators["stea"], clear_states=first_chunk)
-    if method == "pdrs":
-        return _preprocess_pdrs_rgb(
-            raw_chunk,
-            device=device,
-            integrator=integrators[method],
-            clear_states=first_chunk,
-        )
+    if method == "hire":
+        return _preprocess_hire_rgb(raw_chunk, device=device, integrator=integrators["hire"], clear_states=first_chunk)
     raise ValueError(f"Unsupported RGB preprocessor: {method!r}")
 
 
@@ -749,6 +748,19 @@ def main() -> None:
         f"chunk_size={int(args.chunk_size)} (=emit interval) stride={stride} "
         f"carry_state={contiguous_stream} reset_each_chunk={reset_each_chunk}"
     )
+    if "hire" in preprocessors:
+        print(
+            f"hire: bin_rate_hz={float(args.bin_rate_hz):g} "
+            f"ref_rate_hz={float(args.hire_ref_rate_hz):g} "
+            f"bins={int(args.hire_fast_bins)}/{int(args.hire_slow_bins)}/{int(args.hire_surprise_bins)} "
+            f"gate_theta={float(args.hire_gate_theta):g}"
+        )
+    if "ppb" in preprocessors:
+        print(
+            f"ppb: gamma={float(args.ppb_gamma):g} "
+            f"min_filter_size={int(args.ppb_min_filter_size)} "
+            f"normalize={bool(args.ppb_normalize)}"
+        )
     if max_chunks > 0:
         print(f"max_chunks={max_chunks} (evenly spaced; always reset)")
     elif stride < int(args.chunk_size):
@@ -756,7 +768,7 @@ def main() -> None:
     elif bool(args.independent_chunks):
         print("Note: --independent-chunks resets state every window (sum-like; background stats cannot accumulate).")
     else:
-        print("State: causal carry across chunks (PPB/STEA/EMA online). Use --independent-chunks to disable.")
+        print("State: causal carry across chunks (PPB/STEA/EMA/HIRE online). Use --independent-chunks to disable.")
     print(f"writing outputs to: {out_dir}")
     print(f"preprocess flips: flip_x={bool(args.flip_x)} flip_y={bool(args.flip_y)} bitorder={args.bitorder}")
 

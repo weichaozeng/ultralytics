@@ -158,7 +158,7 @@ spad_cache_mode: auto # (str) frame-mode detector input source: auto, raw, or re
 spad_render_root: # (str, optional) root directory containing cached rendered frames
 spad_render_contains_confidence: True # (bool) whether cached renders include confidence.npy for UA/residual adapters
 spad_source_render_dirname: renders-spc8kHz # (str) source render dirname used to infer sibling rendered cache roots
-spad_preprocessor: ppb # (str) detector input preprocessor: ppb, sum, ema, stea
+spad_preprocessor: ppb # (str) detector input preprocessor: ppb, sum, ema, stea, hire
 spad_plugin: temporal_ssd # (str) detector-side feature plugin: none, temporal_ssd, temporal_attn, sr_attn, window_st_attn, spatial_only, spatial_temporal
 spad_frame_adapter: ua # (str) frame-mode image-space adapter: none, residual, ua
 spad_plugin_scales: 16,19,22 # (str) comma-separated YOLO layer indices for detector plugins
@@ -186,6 +186,15 @@ stea_motion_threshold: 0.07 # (float) motion routing threshold for STEA
 stea_stable_prior: 16.0 # (float) stable-branch prior for STEA
 stea_normalize: True # (bool) normalize STEA reconstructions
 stea_quantile: 1.0 # (float) normalization quantile for STEA
+hire_ref_rate_hz: 8000.0 # (float) reference rate for interpreting hire_*_bins as wall-clock taus
+hire_fast_bins: 16 # (int) fast timescale in bins @ hire_ref_rate_hz (tau_fast = bins/ref)
+hire_slow_bins: 128 # (int) slow timescale in bins @ hire_ref_rate_hz
+hire_surprise_bins: 8 # (int) surprise-EMA timescale in bins @ hire_ref_rate_hz
+hire_tau_fast: 0.0 # (float) optional wall-clock tau override (seconds); <=0 => from hire_fast_bins
+hire_tau_slow: 0.0 # (float) optional wall-clock tau override (seconds); <=0 => from hire_slow_bins
+hire_tau_surprise: 0.0 # (float) optional wall-clock tau override (seconds); <=0 => from hire_surprise_bins
+hire_gate_theta: 0.05 # (float) soft gate scale g = S / (S + theta)
+hire_spatial_kernel: 3 # (int) odd spatial consensus kernel for surprise
 ssd_state_dim: 20 # (int) latent state dimension for SSD temporal blocks
 ssd_head_divisor: 4 # (int) derive SSD head dim from channels // divisor
 attn_state_dim: 8 # (int) bottleneck state width for attention temporal blocks (attn_dim = num_heads * attn_state_dim)

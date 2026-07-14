@@ -156,7 +156,7 @@ class SpadPoseSequenceTrainer(PoseTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
         """Initialize SPAD trainer while allowing custom SPAD args through Ultralytics cfg validation."""
         overrides = overrides or {}
-        custom_prefixes = ("spad_", "ppb_", "stea_", "ssd_", "attn_")
+        custom_prefixes = ("spad_", "ppb_", "stea_", "hire_", "ssd_", "attn_")
         if any(str(k).startswith(custom_prefixes) for k in overrides):
             cfg_dict = dict(vars(cfg)) if hasattr(cfg, "__dict__") else dict(cfg)
             cfg_dict.update({k: v for k, v in overrides.items() if str(k).startswith(custom_prefixes)})
@@ -235,6 +235,26 @@ class SpadPoseSequenceTrainer(PoseTrainer):
             return {
                 "subsampling": spad_subsampling,
                 "ema_alpha": float(getattr(self.args, "ema_alpha", 0.0)),
+            }
+        if preprocessor_name == "hire":
+            def _tau_or_none(key: str) -> float | None:
+                val = getattr(self.args, key, 0.0)
+                if val in {None, 0, 0.0}:
+                    return None
+                return float(val)
+
+            return {
+                "subsampling": spad_subsampling,
+                "sample_rate_hz": float(getattr(self.args, "spad_bin_rate_hz", 8000.0)),
+                "ref_rate_hz": float(getattr(self.args, "hire_ref_rate_hz", 8000.0)),
+                "fast_bins": int(getattr(self.args, "hire_fast_bins", 16)),
+                "slow_bins": int(getattr(self.args, "hire_slow_bins", 128)),
+                "surprise_bins": int(getattr(self.args, "hire_surprise_bins", 8)),
+                "tau_fast": _tau_or_none("hire_tau_fast"),
+                "tau_slow": _tau_or_none("hire_tau_slow"),
+                "tau_surprise": _tau_or_none("hire_tau_surprise"),
+                "gate_theta": float(getattr(self.args, "hire_gate_theta", 0.05)),
+                "spatial_kernel": int(getattr(self.args, "hire_spatial_kernel", 3)),
             }
         raise ValueError(f"Unsupported training preprocessor: {preprocessor_name!r}")
 

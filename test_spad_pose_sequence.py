@@ -62,7 +62,7 @@ COLOR_KEYPOINT = (255, 255, 255)
 COLOR_WRIST = (255, 165, 0)
 
 TRACKER_CHOICES = ["none", "bytetrack", "botsort", "spad_tracker", "posetrack", "spad_posetrack"]
-PREPROCESSOR_CHOICES = ["model", "ppb", "sum", "ema", "stea", "hyb"]
+PREPROCESSOR_CHOICES = ["model", "ppb", "sum", "ema", "stea", "hyb", "hire"]
 
 
 @dataclass(frozen=True)
@@ -250,6 +250,23 @@ def _build_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsampling
         return {"subsampling": spad_subsampling}
     if name == "ema":
         return {"subsampling": spad_subsampling, "ema_alpha": float(args.ema_alpha)}
+    if name == "hire":
+        def _tau_or_none(val: float) -> float | None:
+            return None if float(val) <= 0.0 else float(val)
+
+        return {
+            "subsampling": spad_subsampling,
+            "sample_rate_hz": float(getattr(args, "spad_bin_rate_hz", 8000.0)),
+            "ref_rate_hz": float(getattr(args, "hire_ref_rate_hz", 8000.0)),
+            "fast_bins": int(getattr(args, "hire_fast_bins", 16)),
+            "slow_bins": int(getattr(args, "hire_slow_bins", 128)),
+            "surprise_bins": int(getattr(args, "hire_surprise_bins", 8)),
+            "tau_fast": _tau_or_none(float(getattr(args, "hire_tau_fast", 0.0))),
+            "tau_slow": _tau_or_none(float(getattr(args, "hire_tau_slow", 0.0))),
+            "tau_surprise": _tau_or_none(float(getattr(args, "hire_tau_surprise", 0.0))),
+            "gate_theta": float(getattr(args, "hire_gate_theta", 0.05)),
+            "spatial_kernel": int(getattr(args, "hire_spatial_kernel", 3)),
+        }
     if name == "hyb":
         return {
             "subsampling": spad_subsampling,
@@ -742,7 +759,7 @@ def parse_args():
         "--preprocessor-override",
         type=str,
         default="none",
-        choices=["none", "ppb", "sum", "ema", "stea", "hyb"],
+        choices=["none", "ppb", "sum", "ema", "stea", "hyb", "hire"],
         help="Deprecated alias for --preprocessor when --preprocessor model.",
     )
     ap.add_argument("--render_root", type=str, default=None, help="Optional explicit root for cached rendered frames")
@@ -780,6 +797,15 @@ def parse_args():
     ap.add_argument("--stea-stable-prior", type=float, default=16.0)
     ap.add_argument("--stea-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea-quantile", type=float, default=1.0)
+    ap.add_argument("--hire-ref-rate-hz", type=float, default=8000.0)
+    ap.add_argument("--hire-fast-bins", type=int, default=16)
+    ap.add_argument("--hire-slow-bins", type=int, default=128)
+    ap.add_argument("--hire-surprise-bins", type=int, default=8)
+    ap.add_argument("--hire-tau-fast", type=float, default=0.0)
+    ap.add_argument("--hire-tau-slow", type=float, default=0.0)
+    ap.add_argument("--hire-tau-surprise", type=float, default=0.0)
+    ap.add_argument("--hire-gate-theta", type=float, default=0.05)
+    ap.add_argument("--hire-spatial-kernel", type=int, default=3)
     ap.add_argument("--hyb-motion-sharpness", type=float, default=60.0)
     ap.add_argument("--hyb-motion-threshold", type=float, default=0.05)
     ap.add_argument("--hyb-warp-block-size", type=int, default=16)

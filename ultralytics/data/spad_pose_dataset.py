@@ -45,6 +45,12 @@ def load_visionsim_split_json(path: str | Path) -> list[dict[str, str]]:
     if not isinstance(raw_samples, dict) or not raw_samples:
         raise ValueError(f"No samples found in split JSON: {json_path}")
 
+    def _abs_path(value: str) -> Path:
+        # Prefer absolute() so symlink-based renders-spc8kHz paths stay intact.
+        # exists() still follows the symlink to validate the target.
+        path_value = Path(value)
+        return path_value if path_value.is_absolute() else (json_path.parent / path_value).absolute()
+
     records: list[dict[str, str]] = []
     for sample_id, entry in sorted(raw_samples.items()):
         if not isinstance(entry, dict):
@@ -54,29 +60,29 @@ def load_visionsim_split_json(path: str | Path) -> list[dict[str, str]]:
         if not gt or not spad:
             raise ValueError(f"Sample {sample_id!r} must include gt and spad paths in {json_path}")
 
-        gt_path = Path(gt)
-        spad_path = Path(spad)
-        if not gt_path.is_file():
+        gt_path = _abs_path(gt)
+        spad_path = _abs_path(spad)
+        if not gt_path.exists():
             raise FileNotFoundError(f"GT annotation not found for {sample_id!r}: {gt_path}")
-        if not spad_path.is_file():
+        if not spad_path.exists():
             raise FileNotFoundError(f"SPAD frames not found for {sample_id!r}: {spad_path}")
 
         record = {
             "id": str(sample_id),
-            "gt": str(gt_path.resolve()),
-            "spad": str(spad_path.resolve()),
+            "gt": str(gt_path),
+            "spad": str(spad_path),
             "version": str(entry.get("version", "")),
             "name": str(entry.get("name", Path(sample_id).name)),
         }
         rgb = entry.get("rgb")
         if rgb:
-            record["rgb"] = str(Path(rgb).resolve())
+            record["rgb"] = str(_abs_path(rgb))
         for key, value in entry.items():
             if not isinstance(key, str) or not value:
                 continue
-            if key in {"stea", "sum", "ema", "ppb"} or key.startswith("render_") or key.endswith("_confidence") or key.endswith("_meta"):
+            if key in {"stea", "sum", "ema", "ppb", "hire"} or key.startswith("render_") or key.endswith("_confidence") or key.endswith("_meta"):
                 if isinstance(value, str):
-                    record[key] = str(Path(value).resolve())
+                    record[key] = str(_abs_path(value))
         records.append(record)
 
     return records

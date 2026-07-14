@@ -35,7 +35,7 @@ def parse_args():
         default="",
         help="Optional explicit cache root. If omitted, writes beside each sample's renders-spc8kHz tree.",
     )
-    ap.add_argument("--preprocessor", type=str, choices=["sum", "ema", "ppb", "stea", "pdrs"], required=True)
+    ap.add_argument("--preprocessor", type=str, choices=["sum", "ema", "ppb", "stea", "hire"], required=True)
     ap.add_argument("--chunk-size", type=int, default=320, help="Raw-bin chunk size per rendered frame.")
     ap.add_argument("--stride-bins", type=int, default=320, help="Stride in raw bins between cached chunks.")
     ap.add_argument("--spad-bins-per-gt", type=int, default=64, help="Raw bins corresponding to one GT frame.")
@@ -80,13 +80,21 @@ def parse_args():
     ap.add_argument("--stea-stable-prior", type=float, default=16.0)
     ap.add_argument("--stea-normalize", type=str, default="true")
     ap.add_argument("--stea-quantile", type=float, default=1.0)
-    ap.add_argument("--pdrs-fast-window", type=int, default=32)
-    ap.add_argument("--pdrs-slow-window", type=int, default=128)
-    ap.add_argument("--pdrs-temporal-window", type=int, default=5)
-    ap.add_argument("--pdrs-fast-tau", type=float, default=6.0)
-    ap.add_argument("--pdrs-fusion-pool-size", type=int, default=7)
-    ap.add_argument("--pdrs-normalize", type=str, default="true")
-    ap.add_argument("--pdrs-quantile", type=float, default=1.0)
+    ap.add_argument(
+        "--spad-bin-rate-hz",
+        type=float,
+        default=8000.0,
+        help="SPAD bin sample rate f_s used by HIRE ZOH alphas.",
+    )
+    ap.add_argument("--hire-ref-rate-hz", type=float, default=8000.0)
+    ap.add_argument("--hire-fast-bins", type=int, default=16)
+    ap.add_argument("--hire-slow-bins", type=int, default=128)
+    ap.add_argument("--hire-surprise-bins", type=int, default=8)
+    ap.add_argument("--hire-tau-fast", type=float, default=0.0)
+    ap.add_argument("--hire-tau-slow", type=float, default=0.0)
+    ap.add_argument("--hire-tau-surprise", type=float, default=0.0)
+    ap.add_argument("--hire-gate-theta", type=float, default=0.05)
+    ap.add_argument("--hire-spatial-kernel", type=int, default=3)
     return ap.parse_args()
 
 
@@ -110,24 +118,9 @@ def _apply_input_gamma(frame_tchw: torch.Tensor, gamma: float) -> torch.Tensor:
     return torch.pow(torch.clamp(frame_tchw, 0.0, 1.0), 1.0 / gamma)
 
 
-def _build_pdrs_kwargs(args, *, subsampling: int, chunk_size: int) -> dict[str, Any]:
-    return {
-        "subsampling": int(subsampling),
-        "chunk_size": int(chunk_size),
-        "fast_window": int(args.pdrs_fast_window),
-        "slow_window": int(args.pdrs_slow_window),
-        "temporal_window": int(args.pdrs_temporal_window),
-        "fast_tau": float(args.pdrs_fast_tau),
-        "fusion_pool_size": int(args.pdrs_fusion_pool_size),
-        "normalize": _as_bool(args.pdrs_normalize),
-        "quantile": float(args.pdrs_quantile),
-    }
-
-
 def _build_preprocessor_kwargs(args) -> dict[str, Any]:
     name = str(args.preprocessor).strip().lower()
     subsampling = int(args.spad_bins_per_gt)
-    chunk_size = int(args.chunk_size)
     if name == "sum":
         return {"subsampling": subsampling}
     if name == "ema":
@@ -153,8 +146,23 @@ def _build_preprocessor_kwargs(args) -> dict[str, Any]:
             "normalize": _as_bool(args.stea_normalize),
             "quantile": float(args.stea_quantile),
         }
-    if name == "pdrs":
-        return _build_pdrs_kwargs(args, subsampling=subsampling, chunk_size=chunk_size)
+    if name == "hire":
+        def _tau_or_none(val: float) -> float | None:
+            return None if float(val) <= 0.0 else float(val)
+
+        return {
+            "subsampling": subsampling,
+            "sample_rate_hz": float(args.spad_bin_rate_hz),
+            "ref_rate_hz": float(args.hire_ref_rate_hz),
+            "fast_bins": int(args.hire_fast_bins),
+            "slow_bins": int(args.hire_slow_bins),
+            "surprise_bins": int(args.hire_surprise_bins),
+            "tau_fast": _tau_or_none(args.hire_tau_fast),
+            "tau_slow": _tau_or_none(args.hire_tau_slow),
+            "tau_surprise": _tau_or_none(args.hire_tau_surprise),
+            "gate_theta": float(args.hire_gate_theta),
+            "spatial_kernel": int(args.hire_spatial_kernel),
+        }
     raise ValueError(f"Unsupported preprocessor: {name!r}")
 
 

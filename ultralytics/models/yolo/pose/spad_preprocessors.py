@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ultralytics.quanta_hire_networks.integrator import HIRE, HIREFrame
 from ultralytics.quanta_hyb_networks.integrator import HybridSpatioTemporalEvidenceAccumulation
 from ultralytics.quanta_neural_networks.integrator import PerPixelBayesian
-from ultralytics.quanta_pdrs_networks.integrator import PoissonDualRateSplit, PoissonDualRateSplitFrame
 from ultralytics.quanta_stea_networks.integrator import SpatioTemporalEvidenceAccumulation, SpatioTemporalEvidenceFrame
 
 
@@ -254,14 +254,14 @@ def build_spad_preprocessor(name: str, *, kwargs: dict[str, Any]) -> nn.Module:
         return PerPixelBayesian(**kwargs)
     if name == "stea":
         return SpatioTemporalEvidenceAccumulation(**kwargs)
-    if name in {"pdrs", "dual_rate", "dual-rate"}:
-        return PoissonDualRateSplit(**kwargs)
     if name == "hyb":
         return HybridSpatioTemporalEvidenceAccumulation(**kwargs)
     if name == "sum":
         return SumPreprocessor(**kwargs)
     if name == "ema":
         return EmaPreprocessor(**kwargs)
+    if name == "hire":
+        return HIRE(**kwargs)
     raise ValueError(f"Unsupported SPAD preprocessor: {name!r}")
 
 
@@ -272,10 +272,10 @@ def build_spad_frame_preprocessor(name: str, *, kwargs: dict[str, Any]) -> nn.Mo
         return PerPixelBayesianFrame(**kwargs)
     if name == "stea":
         return SpatioTemporalEvidenceFrame(**kwargs)
-    if name in {"pdrs", "dual_rate", "dual-rate"}:
-        return PoissonDualRateSplitFrame(**kwargs)
     if name == "sum":
         return SumPreprocessor(**kwargs)
     if name == "ema":
         return EmaPreprocessor(**kwargs)
+    if name == "hire":
+        return HIREFrame(**kwargs)
     raise ValueError(f"Unsupported frame-mode SPAD preprocessor: {name!r}")
