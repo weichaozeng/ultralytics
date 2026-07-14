@@ -3,7 +3,7 @@
 
 Writes per-chunk outputs under ``{save_dir}/{sample}/videoXXXXX/``:
 
-- ``{stem}_hire_stats.txt`` — percentile summary of HIRE tensors
+- ``{stem}_hire_stats.txt`` — percentile summary (only with ``--write_stats``; slow)
 - ``{stem}_hire_compare.png`` — sum vs hire reconstruction
 - ``{stem}_hire_scores.png`` — last-frame maps (I^f, I, KL, gate, tau, …)
 - ``{stem}_hire_temporal.png`` — evenly spaced time slices of key volumes
@@ -288,6 +288,7 @@ def _save_visuals(
     score_vmax: float,
     score_percentile: float,
     temporal_slices: int,
+    write_stats: bool,
 ) -> None:
     percentiles = (1.0, 5.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0)
     display_hw = recon_bgr.shape[:2]
@@ -421,6 +422,9 @@ def _save_visuals(
         _stitch_panels([sum_bgr, recon_bgr], ["sum", "hire"]),
     )
 
+    if not write_stats:
+        return
+
     # Reconstruct gate from S and theta to sanity-check.
     gate_from_s = maps["s_tilde"] / (maps["s_tilde"] + float(hire.gate_theta))
     gate_err = np.abs(gate_from_s - maps["gate"])
@@ -494,6 +498,12 @@ def main() -> None:
     ap.add_argument("--score_vmax", type=float, default=0.0, help="Fixed vmax for surprise heatmaps (0=percentile)")
     ap.add_argument("--score_percentile", type=float, default=99.5)
     ap.add_argument("--temporal_slices", type=int, default=6)
+    ap.add_argument(
+        "--write_stats",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write *_hire_stats.txt with full percentile summaries (slow on large maps). Default: off.",
+    )
     args = ap.parse_args()
 
     in_path = Path(args.in_path)
@@ -574,6 +584,7 @@ def main() -> None:
                 score_vmax=float(args.score_vmax),
                 score_percentile=float(args.score_percentile),
                 temporal_slices=int(args.temporal_slices),
+                write_stats=bool(args.write_stats),
             )
             frame_idx += 1
 
