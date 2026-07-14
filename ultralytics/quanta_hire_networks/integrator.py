@@ -261,8 +261,11 @@ class HIRE(nn.Module):
         x = surprise_hw.unsqueeze(0).unsqueeze(0)
         return F.avg_pool2d(x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
 
-    def _step(self, xt: Tensor, i_fast: Tensor, i_out: Tensor, s_tilde: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """One-bin HIRE update; returns (i_fast, i_out, s_tilde, gate)."""
+    def _step(self, xt: Tensor, i_fast: Tensor, i_out: Tensor, s_tilde: Tensor) -> tuple[Tensor, ...]:
+        """One-bin HIRE update.
+
+        Returns ``(i_fast, i_out, s_tilde, gate, s_raw, s_spat, tau, alpha)``.
+        """
         a_f = self.alpha_fast
         a_s = self.alpha_surprise
         eps = self.eps
@@ -279,24 +282,39 @@ class HIRE(nn.Module):
         tau = torch.exp(log_tau).clamp(min=eps)
         alpha = torch.exp(-1.0 / (self.sample_rate_hz * tau))
         i_out = alpha * i_out + (1.0 - alpha) * xt
-        return i_fast, i_out, s_tilde, gate
+        return i_fast, i_out, s_tilde, gate, s_raw, s_spat, tau, alpha
 
     def _update_causal(self, photon_cube: Tensor, *, clear_states: bool) -> Tensor:
+        recons, _ = self._update_causal_with_debug(photon_cube, clear_states=clear_states, record_debug=False)
+        return recons
+
+    def _update_causal_with_debug(
+        self,
+        photon_cube: Tensor,
+        *,
+        clear_states: bool,
+        record_debug: bool = True,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
         if photon_cube.ndim != 3:
             raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
         if clear_states:
             self.clear_states()
-        if photon_cube.shape[-1] == 0:
-            h, w = map(int, photon_cube.shape[:2])
-            return photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
+
+        h, w, t_raw = map(int, photon_cube.shape)
+        empty_debug: dict[str, Tensor] = {}
+        if t_raw == 0:
+            empty = photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
+            return empty, empty_debug
 
         raw = photon_cube.float()
-        t_raw = int(raw.shape[-1])
         i_fast = self.i_fast
         i_out = self.i_out
         s_tilde = self.s_tilde
         gate = self.gate
         frames: list[Tensor] = []
+
+        dbg_keys = ("i_fast", "i_out", "s_raw", "s_spat", "s_tilde", "gate", "tau", "alpha")
+        dbg_lists: dict[str, list[Tensor]] = {k: [] for k in dbg_keys} if record_debug else {}
 
         for t0 in range(0, t_raw, self.subsampling):
             t1 = min(t_raw, t0 + self.subsampling)
@@ -307,15 +325,48 @@ class HIRE(nn.Module):
                     i_out = xt.clone()
                     s_tilde = xt.new_zeros(xt.shape)
                     gate = xt.new_zeros(xt.shape)
+                    s_raw = xt.new_zeros(xt.shape)
+                    s_spat = xt.new_zeros(xt.shape)
+                    # Warm-start: stay on slow τ (g=0).
+                    tau = xt.new_full(xt.shape, self.tau_slow)
+                    alpha = xt.new_full(
+                        xt.shape, float(math.exp(-1.0 / (self.sample_rate_hz * self.tau_slow)))
+                    )
                 else:
-                    i_fast, i_out, s_tilde, gate = self._step(xt, i_fast, i_out, s_tilde)
+                    i_fast, i_out, s_tilde, gate, s_raw, s_spat, tau, alpha = self._step(
+                        xt, i_fast, i_out, s_tilde
+                    )
+                if record_debug:
+                    dbg_lists["i_fast"].append(i_fast)
+                    dbg_lists["i_out"].append(i_out)
+                    dbg_lists["s_raw"].append(s_raw)
+                    dbg_lists["s_spat"].append(s_spat)
+                    dbg_lists["s_tilde"].append(s_tilde)
+                    dbg_lists["gate"].append(gate)
+                    dbg_lists["tau"].append(tau)
+                    dbg_lists["alpha"].append(alpha)
             frames.append(i_out.unsqueeze(-1))
 
         self.i_fast = None if i_fast is None else i_fast.detach()
         self.i_out = None if i_out is None else i_out.detach()
         self.s_tilde = None if s_tilde is None else s_tilde.detach()
         self.gate = None if gate is None else gate.detach()
-        return self.clamp_recons(torch.cat(frames, dim=-1))
+
+        recons_prenorm = torch.cat(frames, dim=-1)
+        recons = self.clamp_recons(recons_prenorm)
+
+        if not record_debug:
+            return recons, empty_debug
+
+        debug: dict[str, Tensor] = {"recons_prenorm": recons_prenorm, "recons": recons}
+        for key, parts in dbg_lists.items():
+            vol = torch.stack(parts, dim=-1)
+            debug[f"{key}_hwt"] = vol
+            debug[f"{key}_last"] = vol[..., -1]
+            debug[f"{key}_peak"] = vol.amax(dim=-1)
+            debug[f"{key}_mean"] = vol.mean(dim=-1)
+        debug["conf_last"] = (1.0 - debug["gate_last"]).clamp(0.0, 1.0)
+        return recons, debug
 
     def clamp_recons(self, recons: Tensor) -> Tensor:
         if recons.numel() == 0:
@@ -339,6 +390,23 @@ class HIRE(nn.Module):
             self.update_hyperparams(subsampling=subsampling, **kwargs)
         try:
             return self._update_causal(photon_cube, clear_states=clear_states)
+        finally:
+            self.subsampling = prev
+
+    @torch.no_grad()
+    def process_photon_cube_with_debug(
+        self,
+        photon_cube: Tensor,
+        clear_states: bool = True,
+        subsampling: int | None = None,
+        **kwargs: Any,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Return reconstructions plus per-bin intermediate maps for visualization."""
+        prev = self.subsampling
+        if subsampling is not None or kwargs:
+            self.update_hyperparams(subsampling=subsampling, **kwargs)
+        try:
+            return self._update_causal_with_debug(photon_cube, clear_states=clear_states, record_debug=True)
         finally:
             self.subsampling = prev
 
