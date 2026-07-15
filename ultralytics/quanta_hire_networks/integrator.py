@@ -78,7 +78,7 @@ class HIRE(nn.Module):
         S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
         λ   = n_s / (n_s + κ);  I_out = λ I^s + (1-λ) I^f
         S̄  = avg_pool_k(S);  enter if S̄>θ_on; leave if S̄<θ_off
-        at c==C_min: I^s←I^f, n_s←1, S←0 (+ short cooldown)
+        at c==C_min: I^s←I^f, n_s←W_f (match fast age), S←0 (+ short cooldown)
 
     with ``α_* = exp(-1/W_*)`` from ``*_bins`` (unless ``tau_*>0`` ZOH override).
     ``κ = mix_kappa`` (config ``hire_mix_kappa``).
@@ -407,8 +407,10 @@ class HIRE(nn.Module):
             & (confirm_count >= float(c_min) - 1e-6)
             & (confirm_count < float(c_min) + 1.0 - 1e-6)
         )
+        # Inherit platform + match mature fast age so next-step β_s≈β_f (avoid
+        # cold-start 1/n_s=1 while n_f≈W_f ⇒ spurious KL / re-reset loop).
         i_slow = torch.where(can_reset, i_fast, i_slow)
-        n_slow = torch.where(can_reset, xt.new_ones(xt.shape), n_slow)
+        n_slow = torch.where(can_reset, xt.new_full(xt.shape, n_f_max), n_slow)
         # Drop surprise / change latch so residual S cannot immediately re-enter.
         s_tilde = torch.where(can_reset, xt.new_zeros(xt.shape), s_tilde)
         in_change = torch.where(can_reset, xt.new_zeros(xt.shape), in_change)
