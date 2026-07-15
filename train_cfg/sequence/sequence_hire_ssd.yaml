@@ -39,6 +39,8 @@ hire_confirm_bins: 1
 hire_cooldown_bins: 3
 hire_spatial_kernel: 3
 hire_gate_pool: max
+hire_reset_open: 1
+hire_reset_dilate: 5
 
 # backbone SSD plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.
 spad_plugin: temporal_ssd

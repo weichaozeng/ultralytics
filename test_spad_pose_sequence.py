@@ -275,6 +275,8 @@ def _build_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsampling
             "cooldown_bins": int(getattr(args, "hire_cooldown_bins", 3)),
             "spatial_kernel": int(getattr(args, "hire_spatial_kernel", 3)),
             "gate_pool": str(getattr(args, "hire_gate_pool", "max")),
+            "reset_open": int(getattr(args, "hire_reset_open", 1)),
+            "reset_dilate": int(getattr(args, "hire_reset_dilate", 5)),
         }
     if name == "hyb":
         return {

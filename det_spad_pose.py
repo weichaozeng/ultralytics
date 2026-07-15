@@ -361,6 +361,8 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
                 "cooldown_bins": int(getattr(args, "hire_cooldown_bins", 3)),
                 "spatial_kernel": int(getattr(args, "hire_spatial_kernel", 3)),
                 "gate_pool": str(getattr(args, "hire_gate_pool", "max")),
+                "reset_open": int(getattr(args, "hire_reset_open", 1)),
+                "reset_dilate": int(getattr(args, "hire_reset_dilate", 5)),
             }
         )
     else:

@@ -274,6 +274,8 @@ class SpadPoseSequenceTrainer(PoseTrainer):
                 "cooldown_bins": int(getattr(self.args, "hire_cooldown_bins", 3)),
                 "spatial_kernel": int(getattr(self.args, "hire_spatial_kernel", 3)),
                 "gate_pool": str(getattr(self.args, "hire_gate_pool", "max")),
+                "reset_open": int(getattr(self.args, "hire_reset_open", 1)),
+                "reset_dilate": int(getattr(self.args, "hire_reset_dilate", 5)),
                 "normalize": bool(getattr(self.args, "hire_normalize", True)),
                 "quantile": float(getattr(self.args, "hire_quantile", 1.0)),
             }

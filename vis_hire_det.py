@@ -509,6 +509,7 @@ def _save_visuals(
             f"theta_on/off={hire.theta_on:g}/{hire.theta_off:g} "
             f"confirm={hire.confirm_bins} cooldown={hire.cooldown_bins} "
             f"spatial_kernel={hire.spatial_kernel} gate_pool={hire.gate_pool} "
+            f"reset_open/dilate={hire.reset_open}/{hire.reset_dilate} "
             f"normalize={hire.normalize} quantile={hire.quantile:g}"
         ),
         (
@@ -516,7 +517,7 @@ def _save_visuals(
             f"alpha_surprise={hire.alpha_surprise:.6f}"
         ),
         f"s_tilde_vmax={s_vmax:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
-        "Pipeline: I^f/I^s → BernKL → S EMA → pool gate → hard reset → g=max(hold+exp, S̄/(S̄+θ)) → I_out",
+        "Pipeline: I^f/I^s → BernKL → S EMA → pool → hard reset + morph expand → g=max(hold+exp, soft) → I_out",
         f"g_soft_lift_over_reset_max={float(g_soft_lift.max()):.6f} mean={float(g_soft_lift.mean()):.6f}",
         (
             f"reset_any_frac={float(reset_any.mean()):.6f} holding_frac={float(maps['holding'].mean()):.6f} "
@@ -590,6 +591,18 @@ def main() -> None:
         choices=["max", "avg"],
         help="Spatial pool on S for gate/reset: max=connect blobs, avg=denoise isolated spikes",
     )
+    ap.add_argument(
+        "--hire_reset_open",
+        type=int,
+        default=1,
+        help="Odd morph open on can_reset (1=off). >1 kills thin edge seeds — prefer avg gate",
+    )
+    ap.add_argument(
+        "--hire_reset_dilate",
+        type=int,
+        default=5,
+        help="Odd morph dilate after open: expand sparse confirmed resets into continuous bands",
+    )
     ap.add_argument("--hire_eps", type=float, default=1e-5)
     ap.add_argument("--hire_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hire_quantile", type=float, default=1.0)
@@ -640,6 +653,8 @@ def main() -> None:
         cooldown_bins=int(args.hire_cooldown_bins),
         spatial_kernel=int(args.hire_spatial_kernel),
         gate_pool=str(args.hire_gate_pool),
+        reset_open=int(args.hire_reset_open),
+        reset_dilate=int(args.hire_reset_dilate),
         eps=float(args.hire_eps),
         normalize=bool(args.hire_normalize),
         quantile=float(args.hire_quantile),

@@ -164,6 +164,8 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--hire_cooldown_bins", type=int, default=3)
     ap.add_argument("--hire_spatial_kernel", type=int, default=3)
     ap.add_argument("--hire_gate_pool", type=str, default="max", choices=["max", "avg"])
+    ap.add_argument("--hire_reset_open", type=int, default=1)
+    ap.add_argument("--hire_reset_dilate", type=int, default=5)
     ap.add_argument("--hire_eps", type=float, default=1e-5)
     return ap.parse_args()
 
@@ -423,6 +425,8 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             cooldown_bins=int(args.hire_cooldown_bins),
             spatial_kernel=int(args.hire_spatial_kernel),
             gate_pool=str(args.hire_gate_pool),
+            reset_open=int(args.hire_reset_open),
+            reset_dilate=int(args.hire_reset_dilate),
             eps=float(args.hire_eps),
             normalize=bool(args.hire_normalize),
             quantile=float(args.hire_quantile),
@@ -829,7 +833,8 @@ def main() -> None:
             f"mix_θ={float(args.hire_mix_theta):g} "
             f"theta_on/off={float(args.hire_theta_on):g}/{float(args.hire_theta_off):g} "
             f"confirm={int(args.hire_confirm_bins)} cooldown={int(args.hire_cooldown_bins)} "
-            f"gate_pool={str(args.hire_gate_pool)}"
+            f"gate_pool={str(args.hire_gate_pool)} "
+            f"reset_open/dilate={int(args.hire_reset_open)}/{int(args.hire_reset_dilate)}"
         )
     if "ppb" in preprocessors:
         print(

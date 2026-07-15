@@ -77,17 +77,19 @@ class HIRE(nn.Module):
         β_s = max(1/n_s, 1-α_s),   I^s ← (1-β_s) I^s + β_s x
         S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
         S̄  = pool_k(S)   (``gate_pool`` = max | avg);  enter if S̄>θ_on; leave if S̄<θ_off
-        at c==C_min: I^s←I^f, n_s←W_f, S←0, t_mix←0 (+ short cooldown)
-        t_mix ← t_mix+1 (else);  g_reset = 1 if t_mix<H else exp(-(t_mix-H)/τ)
+        at c==C_min: seed hard-reset mask → open (kill speckles) → dilate (thicken lines)
+                     then I^s←I^f, n_s←W_f, S←0, t_mix←0 on expanded mask (+ cooldown)
+        t_mix ← t_mix+1 (else);  g_reset = 1 if t_mix<H else exp(-(t-H)/τ)
         g_soft = S̄/(S̄+θ_mix)   (θ_mix = ``mix_theta`` > 0, else 0 → disabled)
         g = max(g_reset, g_soft);   I_out = (1-g) I^s + g I^f
 
     ``H = mix_hold_bins`` (≤0 → ``subsampling`` / chunk_size), ``τ = mix_bins``.
 
-    ``g_soft`` is a safety-net: wherever current pooled surprise is high the output
-    leans to I^f **without** waiting for a confirmed hard reset — this rescues brief /
-    fast motion that never sustains long enough to earn a reset (else it fragments and
-    ghosts). Background S is low → g_soft≈0 → clean I^s. Set ``mix_theta<=0`` to disable.
+    ``g_soft`` is a safety-net for output only (does **not** age/reset I^s). Thin motion
+    edges often light ``g_soft`` while hysteresis barely seeds hard resets — hence
+    ``n_slow`` stays old on most of the silhouette. Morphological ``reset_open`` then
+    ``reset_dilate`` expand confirmed seeds into continuous lines without promoting
+    isolated background speckles (killed by open + avg gate_pool).
     """
 
     def __init__(
@@ -113,6 +115,8 @@ class HIRE(nn.Module):
         cooldown_bins: int = 3,
         spatial_kernel: int = 3,
         gate_pool: str = "max",
+        reset_open: int = 1,
+        reset_dilate: int = 5,
         eps: float = 1e-5,
         normalize: bool = False,
         quantile: float = 1.0,
@@ -159,6 +163,8 @@ class HIRE(nn.Module):
         if gp not in ("max", "avg"):
             raise ValueError(f"gate_pool must be 'max' or 'avg', got {gate_pool}")
         self.gate_pool = gp
+        self.reset_open = self._validate_odd_kernel(reset_open, "reset_open")
+        self.reset_dilate = self._validate_odd_kernel(reset_dilate, "reset_dilate")
         self.eps = float(eps)
         self.normalize = bool(normalize)
         self.quantile = float(quantile)
@@ -195,8 +201,16 @@ class HIRE(nn.Module):
             f"mix_hold={self.effective_mix_hold_bins()} mix_τ={self.mix_bins:g} mix_θ={self.mix_theta:g}, "
             f"theta_on/off={self.theta_on:g}/{self.theta_off:g}, "
             f"confirm={self.confirm_bins}, cooldown={self.cooldown_bins}, "
-            f"gate_pool={self.gate_pool}, subsampling={self.subsampling})"
+            f"gate_pool={self.gate_pool}, reset_open/dilate={self.reset_open}/{self.reset_dilate}, "
+            f"subsampling={self.subsampling})"
         )
+
+    @staticmethod
+    def _validate_odd_kernel(value: int, name: str) -> int:
+        k = int(value)
+        if k < 1 or k % 2 == 0:
+            raise ValueError(f"{name} must be odd and >= 1, got {value}")
+        return k
 
     def _sync_tau_display(self) -> None:
         """Wall-clock τ for logging: override or W/f_s."""
@@ -284,6 +298,8 @@ class HIRE(nn.Module):
             "hire_spatial_kernel": "spatial_kernel",
             "hire_mix_theta": "mix_theta",
             "hire_gate_pool": "gate_pool",
+            "hire_reset_open": "reset_open",
+            "hire_reset_dilate": "reset_dilate",
             "hire_tau_fast": "tau_fast",
             "hire_tau_slow": "tau_slow",
             "hire_tau_surprise": "tau_surprise",
@@ -356,6 +372,11 @@ class HIRE(nn.Module):
                 raise ValueError(f"gate_pool must be 'max' or 'avg', got {gp}")
             self.gate_pool = gp
 
+        if "reset_open" in normalized:
+            self.reset_open = self._validate_odd_kernel(normalized["reset_open"], "reset_open")
+        if "reset_dilate" in normalized:
+            self.reset_dilate = self._validate_odd_kernel(normalized["reset_dilate"], "reset_dilate")
+
         if "eps" in normalized:
             eps = float(normalized["eps"])
             if eps <= 0.0:
@@ -406,6 +427,28 @@ class HIRE(nn.Module):
         else:
             pooled = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
         return pooled.squeeze(0).squeeze(0)
+
+    def _expand_reset_mask(self, seed: Tensor) -> Tensor:
+        """Kill isolated reset speckles (open), then thicken line-like seeds (dilate).
+
+        Opening = erode ∘ dilate via min/max pools. Dilate alone would also grow noise
+        seeds; open first so only spatially-coexisting seeds survive to expand.
+        Kernels of 1 leave the mask unchanged.
+        """
+        if self.reset_open <= 1 and self.reset_dilate <= 1:
+            return seed
+        x = seed.to(dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        if self.reset_open > 1:
+            k = self.reset_open
+            pad = k // 2
+            # erode = min-pool = -max_pool(-x)
+            x = -F.max_pool2d(-x, kernel_size=k, stride=1, padding=pad)
+            x = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
+        if self.reset_dilate > 1:
+            k = self.reset_dilate
+            pad = k // 2
+            x = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
+        return x.squeeze(0).squeeze(0) > 0.5
 
     def _step(
         self,
@@ -464,6 +507,8 @@ class HIRE(nn.Module):
             & (confirm_count >= float(c_min) - 1e-6)
             & (confirm_count < float(c_min) + 1.0 - 1e-6)
         )
+        # Expand sparse confirmed seeds into continuous edge bands; open kills speckles.
+        can_reset = self._expand_reset_mask(can_reset)
         i_slow = torch.where(can_reset, i_fast, i_slow)
         n_slow = torch.where(can_reset, xt.new_full(xt.shape, n_f_max), n_slow)
         s_tilde = torch.where(can_reset, xt.new_zeros(xt.shape), s_tilde)

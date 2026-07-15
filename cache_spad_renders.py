@@ -102,6 +102,8 @@ def parse_args():
     ap.add_argument("--hire-cooldown-bins", type=int, default=3)
     ap.add_argument("--hire-spatial-kernel", type=int, default=3)
     ap.add_argument("--hire-gate-pool", type=str, default="max", choices=["max", "avg"])
+    ap.add_argument("--hire-reset-open", type=int, default=1)
+    ap.add_argument("--hire-reset-dilate", type=int, default=5)
     ap.add_argument("--sum-normalize", type=str, default="true")
     ap.add_argument("--sum-quantile", type=float, default=1.0)
     ap.add_argument("--ema-normalize", type=str, default="true")
@@ -191,6 +193,8 @@ def _build_preprocessor_kwargs(args) -> dict[str, Any]:
             "cooldown_bins": int(args.hire_cooldown_bins),
             "spatial_kernel": int(args.hire_spatial_kernel),
             "gate_pool": str(args.hire_gate_pool),
+            "reset_open": int(args.hire_reset_open),
+            "reset_dilate": int(args.hire_reset_dilate),
             "normalize": _as_bool(getattr(args, "hire_normalize", True)),
             "quantile": float(getattr(args, "hire_quantile", 1.0)),
         }
