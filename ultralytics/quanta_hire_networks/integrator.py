@@ -68,10 +68,11 @@ class HIRE(nn.Module):
     Formulas (per bin)::
 
         β_f = max(1/n_f, 1-α_f),   I^f ← (1-β_f) I^f + β_f x,   n_f ← min(n_f+1, W_f)
-        β_s = max(1/n_s, 1-α_s),   I^s ← … (frozen if in_change or cooldown)
+        β_s = max(1/n_s, 1-α_s),   I^s ← … (frozen only on cooldown)
         S   ← α_S S + (1-α_S) spat(BernKL(I^f || I^s))
+        w   = max(S, spat)/(·+θ);  I^s ← (1-w)I^s + w I^f   # soft surprise chase
         enter if S>θ_on; leave if S<θ_off; at c==C_min: I^s←I^f, n_s←1
-        g = S/(S+θ_g);  g_out = g if change else g²;  I_out = (1-g_out) I^s + g_out I^f
+        g_out = max(S/(S+θ), w);  I_out = (1-g_out) I^s + g_out I^f
 
     with ``α_* = exp(-1/W_*)`` from ``*_bins`` (unless ``tau_*>0`` ZOH override).
     """
@@ -368,29 +369,40 @@ class HIRE(nn.Module):
         i_fast = (1.0 - beta_f) * i_fast + beta_f * xt
         n_fast = torch.minimum(n_fast + 1.0, xt.new_tensor(n_f_max))
 
-        # --- slow: freeze in change or cooldown ---
-        freeze = (in_change > 0.5) | (cooldown > 0.0)
+        # --- slow EMA: freeze ONLY during post-reset cooldown (not entire in_change) ---
+        # Freezing for the whole change window pinned old I^s and caused onset trails while
+        # s_spat / s_tilde already outlined motion clearly.
+        freeze = cooldown > 0.0
         beta_s = torch.maximum(1.0 / n_slow, xt.new_tensor(self.beta_slow_floor))
         i_slow_upd = (1.0 - beta_s) * i_slow + beta_s * xt
         n_slow_upd = torch.minimum(n_slow + 1.0, xt.new_tensor(n_s_max))
         i_slow = torch.where(freeze, i_slow, i_slow_upd)
         n_slow = torch.where(freeze, n_slow, n_slow_upd)
 
-        # --- evidence ---
+        # --- evidence vs I^s *before* surprise-driven chase (keeps KL informative) ---
         s_raw = self._bernoulli_kl(i_fast, i_slow, eps)
         s_spat = self._spatial_mean(s_raw)
         a_s = self.alpha_surprise
         s_tilde = a_s * s_tilde + (1.0 - a_s) * s_spat
 
-        # --- hysteresis + confirm (before applying this-step reset) ---
+        # --- S / s_spat directly drive update region: chase I^f where surprise is high ---
+        # Soft mask (no hard θ_on): w = S/(S+θ); take max with snappier s_spat.
+        w_s = s_tilde / (s_tilde + theta_g)
+        w_spat = s_spat / (s_spat + theta_g)
+        w_chase = torch.maximum(w_s, w_spat)
+        # Skip chase on pixels still in post-reset cooldown.
+        chase = w_chase * (1.0 - (cooldown > 0.0).to(dtype=xt.dtype))
+        i_slow = (1.0 - chase) * i_slow + chase * i_fast
+        n_slow = (1.0 - chase) * n_slow + chase * xt.new_ones(xt.shape)
+        n_slow = torch.minimum(n_slow, xt.new_tensor(n_s_max))
+
+        # --- hysteresis + confirm: hard edge reset when evidence sustains ---
         enter = s_tilde > self.theta_on
         leave = s_tilde < self.theta_off
         in_change = torch.where(enter, xt.new_ones(xt.shape), in_change)
         in_change = torch.where(leave, xt.new_zeros(xt.shape), in_change)
 
-        # Confirm count only while in change; leaves reset c → 0.
         confirm_count = torch.where(in_change > 0.5, confirm_count + 1.0, xt.new_zeros(xt.shape))
-        # Edge reset once when c first hits C_min (not on later steps); blocked during cooldown.
         can_reset = (
             (in_change > 0.5)
             & (cooldown <= 0.0)
@@ -404,8 +416,8 @@ class HIRE(nn.Module):
         cooldown = torch.clamp(cooldown - 1.0, min=0.0)
 
         gate = s_tilde / (s_tilde + theta_g)
-        # Off change: square g so shot-noise surprise does not leak I^f into the background.
-        gate_out = torch.where(in_change > 0.5, gate, gate * gate)
+        # Output follows the same soft surprise mass (already chased into I^s where S is high).
+        gate_out = torch.maximum(gate, w_chase)
         i_out = (1.0 - gate_out) * i_slow + gate_out * i_fast
         return (
             i_fast,
