@@ -76,12 +76,18 @@ class HIRE(nn.Module):
         β_f = max(1/n_f, 1-α_f),   I^f ← (1-β_f) I^f + β_f x
         β_s = max(1/n_s, 1-α_s),   I^s ← (1-β_s) I^s + β_s x
         S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
-        S̄  = max_pool_k(S);  enter if S̄>θ_on; leave if S̄<θ_off
+        S̄  = pool_k(S)   (``gate_pool`` = max | avg);  enter if S̄>θ_on; leave if S̄<θ_off
         at c==C_min: I^s←I^f, n_s←W_f, S←0, t_mix←0 (+ short cooldown)
-        t_mix ← t_mix+1 (else);  g=1 if t_mix<H else exp(-(t_mix-H)/τ)
-        I_out = (1-g) I^s + g I^f
+        t_mix ← t_mix+1 (else);  g_reset = 1 if t_mix<H else exp(-(t_mix-H)/τ)
+        g_soft = S̄/(S̄+θ_mix)   (θ_mix = ``mix_theta`` > 0, else 0 → disabled)
+        g = max(g_reset, g_soft);   I_out = (1-g) I^s + g I^f
 
     ``H = mix_hold_bins`` (≤0 → ``subsampling`` / chunk_size), ``τ = mix_bins``.
+
+    ``g_soft`` is a safety-net: wherever current pooled surprise is high the output
+    leans to I^f **without** waiting for a confirmed hard reset — this rescues brief /
+    fast motion that never sustains long enough to earn a reset (else it fragments and
+    ghosts). Background S is low → g_soft≈0 → clean I^s. Set ``mix_theta<=0`` to disable.
     """
 
     def __init__(
@@ -98,6 +104,7 @@ class HIRE(nn.Module):
         tau_surprise: float | None = None,
         mix_hold_bins: int = 0,
         mix_bins: float = 16.0,
+        mix_theta: float = 0.1,
         mix_kappa: float | None = None,  # legacy → mix_bins
         gate_theta: float | None = None,  # legacy → mix_bins
         theta_on: float = 0.15,
@@ -105,6 +112,7 @@ class HIRE(nn.Module):
         confirm_bins: int = 1,
         cooldown_bins: int = 3,
         spatial_kernel: int = 3,
+        gate_pool: str = "max",
         eps: float = 1e-5,
         normalize: bool = False,
         quantile: float = 1.0,
@@ -133,6 +141,8 @@ class HIRE(nn.Module):
             raise ValueError(f"mix_bins must be > 0, got {self.mix_bins}")
         # Back-compat attribute used by older logs/vis.
         self.mix_kappa = self.mix_bins
+        # Soft output gate threshold (<=0 disables the safety-net gate).
+        self.mix_theta = float(mix_theta)
         self.theta_on = float(theta_on)
         self.theta_off = float(theta_off)
         if not (self.theta_on > self.theta_off > 0.0):
@@ -145,6 +155,10 @@ class HIRE(nn.Module):
         if k < 1 or k % 2 == 0:
             raise ValueError(f"spatial_kernel must be odd and >= 1, got {spatial_kernel}")
         self.spatial_kernel = k
+        gp = str(gate_pool).lower()
+        if gp not in ("max", "avg"):
+            raise ValueError(f"gate_pool must be 'max' or 'avg', got {gate_pool}")
+        self.gate_pool = gp
         self.eps = float(eps)
         self.normalize = bool(normalize)
         self.quantile = float(quantile)
@@ -178,10 +192,10 @@ class HIRE(nn.Module):
             f"{self.__class__.__name__}(fs={self.sample_rate_hz:g}, "
             f"W_f/s/S={self.fast_bins}/{self.slow_bins}/{self.surprise_bins}, "
             f"α_f/s/S={self.alpha_fast:.4f}/{self.alpha_slow:.4f}/{self.alpha_surprise:.4f}, "
-            f"mix_hold={self.effective_mix_hold_bins()} mix_τ={self.mix_bins:g}, "
+            f"mix_hold={self.effective_mix_hold_bins()} mix_τ={self.mix_bins:g} mix_θ={self.mix_theta:g}, "
             f"theta_on/off={self.theta_on:g}/{self.theta_off:g}, "
             f"confirm={self.confirm_bins}, cooldown={self.cooldown_bins}, "
-            f"subsampling={self.subsampling})"
+            f"gate_pool={self.gate_pool}, subsampling={self.subsampling})"
         )
 
     def _sync_tau_display(self) -> None:
@@ -268,6 +282,8 @@ class HIRE(nn.Module):
             "hire_confirm_bins": "confirm_bins",
             "hire_cooldown_bins": "cooldown_bins",
             "hire_spatial_kernel": "spatial_kernel",
+            "hire_mix_theta": "mix_theta",
+            "hire_gate_pool": "gate_pool",
             "hire_tau_fast": "tau_fast",
             "hire_tau_slow": "tau_slow",
             "hire_tau_surprise": "tau_surprise",
@@ -310,6 +326,8 @@ class HIRE(nn.Module):
                 raise ValueError(f"mix_bins must be > 0, got {tau}")
             self.mix_bins = tau
             self.mix_kappa = tau
+        if "mix_theta" in normalized:
+            self.mix_theta = float(normalized["mix_theta"])
 
         if "theta_on" in normalized:
             self.theta_on = float(normalized["theta_on"])
@@ -331,6 +349,12 @@ class HIRE(nn.Module):
             if k < 1 or k % 2 == 0:
                 raise ValueError(f"spatial_kernel must be odd and >= 1, got {k}")
             self.spatial_kernel = k
+
+        if "gate_pool" in normalized:
+            gp = str(normalized["gate_pool"]).lower()
+            if gp not in ("max", "avg"):
+                raise ValueError(f"gate_pool must be 'max' or 'avg', got {gp}")
+            self.gate_pool = gp
 
         if "eps" in normalized:
             eps = float(normalized["eps"])
@@ -366,13 +390,22 @@ class HIRE(nn.Module):
         return p * torch.log(p / q) + (1.0 - p) * torch.log((1.0 - p) / (1.0 - q))
 
     def _spatial_mean(self, surprise_hw: Tensor) -> Tensor:
-        """Local max-pool on S before in_change thresholds (connect motion blobs)."""
+        """Local pool on S before in_change / soft-gate thresholds.
+
+        ``gate_pool='max'`` dilates/connects motion blobs (but propagates isolated
+        spikes); ``gate_pool='avg'`` requires spatial mass, killing single-pixel
+        background noise while filling small holes in real blobs.
+        """
         k = self.spatial_kernel
         if k == 1:
             return surprise_hw
         pad = k // 2
         x = surprise_hw.unsqueeze(0).unsqueeze(0)
-        return F.max_pool2d(x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
+        if self.gate_pool == "avg":
+            pooled = F.avg_pool2d(x, kernel_size=k, stride=1, padding=pad)
+        else:
+            pooled = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
+        return pooled.squeeze(0).squeeze(0)
 
     def _step(
         self,
@@ -417,7 +450,7 @@ class HIRE(nn.Module):
         a_s = self.alpha_surprise
         s_tilde = a_s * s_tilde + (1.0 - a_s) * s_spat
 
-        # --- hysteresis on max-pooled S ---
+        # --- hysteresis on pooled S (also feeds soft output gate below) ---
         s_chg = self._spatial_mean(s_tilde)
         enter = s_chg > self.theta_on
         leave = s_chg < self.theta_off
@@ -442,13 +475,20 @@ class HIRE(nn.Module):
 
         # --- hold+exp mix age (independent of n_s) ---
         t_mix = torch.where(can_reset, xt.new_zeros(xt.shape), t_mix + 1.0)
-        # g=1 for t<H (full I^f); then exp(-(t-H)/τ) toward I^s
+        # g_reset=1 for t<H (full I^f); then exp(-(t-H)/τ) toward I^s
         over = torch.clamp(t_mix - hold_h, min=0.0)
-        g_fast = torch.where(
+        g_reset = torch.where(
             t_mix < hold_h,
             xt.new_ones(xt.shape),
             torch.exp(-over / tau_mix),
         )
+        # Soft safety-net: lean I^f wherever current pooled surprise is high, even
+        # without a confirmed reset (rescues brief/fast motion from fragmentation).
+        if self.mix_theta > 0.0:
+            g_soft = s_chg / (s_chg + self.mix_theta)
+            g_fast = torch.maximum(g_reset, g_soft)
+        else:
+            g_fast = g_reset
         w_slow = 1.0 - g_fast
         i_out = w_slow * i_slow + g_fast * i_fast
 

@@ -32,11 +32,13 @@ hire_slow_bins: 160
 hire_surprise_bins: 8
 hire_mix_hold_bins: 0
 hire_mix_bins: 16.0
+hire_mix_theta: 0.1
 hire_theta_on: 0.15
 hire_theta_off: 0.06
 hire_confirm_bins: 1
 hire_cooldown_bins: 3
 hire_spatial_kernel: 3
+hire_gate_pool: max
 
 # detector-side sequence plugin
 spad_plugin: temporal_ssd

@@ -354,11 +354,13 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
                         getattr(args, "hire_mix_kappa", getattr(args, "hire_gate_theta", 16.0)),
                     )
                 ),
+                "mix_theta": float(getattr(args, "hire_mix_theta", 0.1)),
                 "theta_on": float(getattr(args, "hire_theta_on", 0.15)),
                 "theta_off": float(getattr(args, "hire_theta_off", 0.06)),
                 "confirm_bins": int(getattr(args, "hire_confirm_bins", 1)),
                 "cooldown_bins": int(getattr(args, "hire_cooldown_bins", 3)),
                 "spatial_kernel": int(getattr(args, "hire_spatial_kernel", 3)),
+                "gate_pool": str(getattr(args, "hire_gate_pool", "max")),
             }
         )
     else:

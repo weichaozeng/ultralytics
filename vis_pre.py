@@ -152,11 +152,18 @@ def _parse_args() -> argparse.Namespace:
         default=16.0,
         help="τ after hold: g=exp(-(t-H)/τ) toward I^s",
     )
+    ap.add_argument(
+        "--hire_mix_theta",
+        type=float,
+        default=0.1,
+        help="Soft output gate g_soft=S̄/(S̄+θ); leans I^f on live surprise (<=0 disables)",
+    )
     ap.add_argument("--hire_theta_on", type=float, default=0.15)
     ap.add_argument("--hire_theta_off", type=float, default=0.06)
     ap.add_argument("--hire_confirm_bins", type=int, default=1)
     ap.add_argument("--hire_cooldown_bins", type=int, default=3)
     ap.add_argument("--hire_spatial_kernel", type=int, default=3)
+    ap.add_argument("--hire_gate_pool", type=str, default="max", choices=["max", "avg"])
     ap.add_argument("--hire_eps", type=float, default=1e-5)
     return ap.parse_args()
 
@@ -409,11 +416,13 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             tau_surprise=_tau_or_none(args.hire_tau_surprise),
             mix_hold_bins=int(args.hire_mix_hold_bins),
             mix_bins=float(args.hire_mix_bins),
+            mix_theta=float(args.hire_mix_theta),
             theta_on=float(args.hire_theta_on),
             theta_off=float(args.hire_theta_off),
             confirm_bins=int(args.hire_confirm_bins),
             cooldown_bins=int(args.hire_cooldown_bins),
             spatial_kernel=int(args.hire_spatial_kernel),
+            gate_pool=str(args.hire_gate_pool),
             eps=float(args.hire_eps),
             normalize=bool(args.hire_normalize),
             quantile=float(args.hire_quantile),
@@ -817,8 +826,10 @@ def main() -> None:
             f"ref_rate_hz={float(args.hire_ref_rate_hz):g} "
             f"bins={int(args.hire_fast_bins)}/{int(args.hire_slow_bins)}/{int(args.hire_surprise_bins)} "
             f"mix_hold={int(args.hire_mix_hold_bins)}(0=chunk) mix_τ={float(args.hire_mix_bins):g} "
+            f"mix_θ={float(args.hire_mix_theta):g} "
             f"theta_on/off={float(args.hire_theta_on):g}/{float(args.hire_theta_off):g} "
-            f"confirm={int(args.hire_confirm_bins)} cooldown={int(args.hire_cooldown_bins)}"
+            f"confirm={int(args.hire_confirm_bins)} cooldown={int(args.hire_cooldown_bins)} "
+            f"gate_pool={str(args.hire_gate_pool)}"
         )
     if "ppb" in preprocessors:
         print(

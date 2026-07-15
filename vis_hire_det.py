@@ -495,8 +495,9 @@ def _save_visuals(
     hold_h = float(hire.effective_mix_hold_bins())
     tau_m = float(hire.mix_bins)
     t_m = maps["t_mix"]
-    g_from_t = np.where(t_m < hold_h, 1.0, np.exp(-np.maximum(t_m - hold_h, 0.0) / tau_m))
-    g_err = np.abs(g_from_t.astype(np.float64) - maps["g_fast"].astype(np.float64))
+    # g_reset from hold+exp; g_fast = max(g_reset, g_soft), so the gap is the soft-gate lift.
+    g_reset = np.where(t_m < hold_h, 1.0, np.exp(-np.maximum(t_m - hold_h, 0.0) / tau_m))
+    g_soft_lift = np.clip(maps["g_fast"].astype(np.float64) - g_reset.astype(np.float64), 0.0, None)
 
     stats_lines = [
         f"stem={stem}",
@@ -504,18 +505,19 @@ def _save_visuals(
             f"fs={hire.sample_rate_hz:g} ref={hire.ref_rate_hz:g} "
             f"bins={hire.fast_bins}/{hire.slow_bins}/{hire.surprise_bins} "
             f"tau={hire.tau_fast:g}/{hire.tau_slow:g}/{hire.tau_surprise:g} "
-            f"mix_hold={hire.effective_mix_hold_bins()} mix_τ={hire.mix_bins:g} "
+            f"mix_hold={hire.effective_mix_hold_bins()} mix_τ={hire.mix_bins:g} mix_θ={hire.mix_theta:g} "
             f"theta_on/off={hire.theta_on:g}/{hire.theta_off:g} "
             f"confirm={hire.confirm_bins} cooldown={hire.cooldown_bins} "
-            f"spatial_kernel={hire.spatial_kernel} normalize={hire.normalize} quantile={hire.quantile:g}"
+            f"spatial_kernel={hire.spatial_kernel} gate_pool={hire.gate_pool} "
+            f"normalize={hire.normalize} quantile={hire.quantile:g}"
         ),
         (
             f"alpha_fast={hire.alpha_fast:.6f} alpha_slow={hire.alpha_slow:.6f} "
             f"alpha_surprise={hire.alpha_surprise:.6f}"
         ),
         f"s_tilde_vmax={s_vmax:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
-        "Pipeline: I^f/I^s → BernKL → S EMA → max-pool gate → hard reset → I_out hold+exp(g)",
-        f"g_fast_from_t_abs_err_max={float(g_err.max()):.8f} mean={float(g_err.mean()):.8f}",
+        "Pipeline: I^f/I^s → BernKL → S EMA → pool gate → hard reset → g=max(hold+exp, S̄/(S̄+θ)) → I_out",
+        f"g_soft_lift_over_reset_max={float(g_soft_lift.max()):.6f} mean={float(g_soft_lift.mean()):.6f}",
         (
             f"reset_any_frac={float(reset_any.mean()):.6f} holding_frac={float(maps['holding'].mean()):.6f} "
             f"n_slow_mean={float(n_last.mean()):.3f} g_fast_mean={float(maps['g_fast'].mean()):.4f}"
@@ -570,11 +572,24 @@ def main() -> None:
         default=16.0,
         help="τ after hold: g=exp(-(t-H)/τ) toward I^s",
     )
+    ap.add_argument(
+        "--hire_mix_theta",
+        type=float,
+        default=0.1,
+        help="Soft output gate: g_soft=S̄/(S̄+θ); leans I^f on live surprise (<=0 disables)",
+    )
     ap.add_argument("--hire_theta_on", type=float, default=0.15)
     ap.add_argument("--hire_theta_off", type=float, default=0.06)
     ap.add_argument("--hire_confirm_bins", type=int, default=1)
     ap.add_argument("--hire_cooldown_bins", type=int, default=3)
     ap.add_argument("--hire_spatial_kernel", type=int, default=3)
+    ap.add_argument(
+        "--hire_gate_pool",
+        type=str,
+        default="max",
+        choices=["max", "avg"],
+        help="Spatial pool on S for gate/reset: max=connect blobs, avg=denoise isolated spikes",
+    )
     ap.add_argument("--hire_eps", type=float, default=1e-5)
     ap.add_argument("--hire_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hire_quantile", type=float, default=1.0)
@@ -618,11 +633,13 @@ def main() -> None:
         tau_surprise=_tau_or_none(args.hire_tau_surprise),
         mix_hold_bins=int(args.hire_mix_hold_bins),
         mix_bins=float(args.hire_mix_bins),
+        mix_theta=float(args.hire_mix_theta),
         theta_on=float(args.hire_theta_on),
         theta_off=float(args.hire_theta_off),
         confirm_bins=int(args.hire_confirm_bins),
         cooldown_bins=int(args.hire_cooldown_bins),
         spatial_kernel=int(args.hire_spatial_kernel),
+        gate_pool=str(args.hire_gate_pool),
         eps=float(args.hire_eps),
         normalize=bool(args.hire_normalize),
         quantile=float(args.hire_quantile),
