@@ -259,7 +259,9 @@ class SpadPoseSequenceTrainer(PoseTrainer):
                 "tau_fast": _tau_or_none("hire_tau_fast"),
                 "tau_slow": _tau_or_none("hire_tau_slow"),
                 "tau_surprise": _tau_or_none("hire_tau_surprise"),
-                "gate_theta": float(getattr(self.args, "hire_gate_theta", 0.2)),
+                "mix_kappa": float(
+                    getattr(self.args, "hire_mix_kappa", getattr(self.args, "hire_gate_theta", 16.0))
+                ),
                 "theta_on": float(getattr(self.args, "hire_theta_on", 0.15)),
                 "theta_off": float(getattr(self.args, "hire_theta_off", 0.06)),
                 "confirm_bins": int(getattr(self.args, "hire_confirm_bins", 1)),

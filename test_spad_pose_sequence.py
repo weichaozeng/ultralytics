@@ -264,7 +264,7 @@ def _build_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsampling
             "tau_fast": _tau_or_none(float(getattr(args, "hire_tau_fast", 0.0))),
             "tau_slow": _tau_or_none(float(getattr(args, "hire_tau_slow", 0.0))),
             "tau_surprise": _tau_or_none(float(getattr(args, "hire_tau_surprise", 0.0))),
-            "gate_theta": float(getattr(args, "hire_gate_theta", 0.2)),
+            "mix_kappa": float(getattr(args, "hire_mix_kappa", getattr(args, "hire_gate_theta", 16.0))),
             "theta_on": float(getattr(args, "hire_theta_on", 0.15)),
             "theta_off": float(getattr(args, "hire_theta_off", 0.06)),
             "confirm_bins": int(getattr(args, "hire_confirm_bins", 1)),
