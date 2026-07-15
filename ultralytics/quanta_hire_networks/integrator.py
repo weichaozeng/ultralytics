@@ -63,16 +63,22 @@ def taus_from_presets(
 
 
 class HIRE(nn.Module):
-    """I^f / I^s rate estimator with 1/n age and hysteresis change-point reset.
+    """I^f / I^s rate estimator with soft output mix and hard I^s reset.
 
-    Formulas (per bin)::
+    Roles (per bin)::
 
-        β_f = max(1/n_f, 1-α_f),   I^f ← (1-β_f) I^f + β_f x,   n_f ← min(n_f+1, W_f)
-        β_s = max(1/n_s, 1-α_s),   I^s ← … (frozen only on cooldown)
+        I^f  — fast probe (always EMA)
+        I^s  — slow bank: normal EMA only; hard ``I^s←I^f`` when S stays above θ_on
+        I_out — soft mix by surprise weight w; never soft-blends into I^s
+
+    Formulas::
+
+        β_f = max(1/n_f, 1-α_f),   I^f ← (1-β_f) I^f + β_f x
+        β_s = max(1/n_s, 1-α_s),   I^s ← (1-β_s) I^s + β_s x     # always
         S   ← α_S S + (1-α_S) spat(BernKL(I^f || I^s))
-        w   = max(S, spat)/(·+θ);  I^s ← (1-w)I^s + w I^f   # soft surprise chase
-        enter if S>θ_on; leave if S<θ_off; at c==C_min: I^s←I^f, n_s←1
-        g_out = max(S/(S+θ), w);  I_out = (1-g_out) I^s + g_out I^f
+        w   = max(S/(S+θ), spat/(spat+θ))
+        I_out = (1-w) I^s + w I^f
+        enter if S>θ_on; leave if S<θ_off; at c==C_min: I^s←I^f, n_s←1 (+ cooldown)
 
     with ``α_* = exp(-1/W_*)`` from ``*_bins`` (unless ``tau_*>0`` ZOH override).
     """
@@ -92,7 +98,7 @@ class HIRE(nn.Module):
         gate_theta: float = 0.2,
         theta_on: float = 0.15,
         theta_off: float = 0.06,
-        confirm_bins: int = 5,
+        confirm_bins: int = 1,
         cooldown_bins: int = 8,
         spatial_kernel: int = 3,
         eps: float = 1e-5,
@@ -351,7 +357,7 @@ class HIRE(nn.Module):
         confirm_count: Tensor,
         cooldown: Tensor,
     ) -> tuple[Tensor, ...]:
-        """One-bin HIRE v0.3 update.
+        """One-bin HIRE update.
 
         Returns
         ``(i_fast, i_slow, n_fast, n_slow, s_tilde, in_change, confirm_count,
@@ -369,34 +375,25 @@ class HIRE(nn.Module):
         i_fast = (1.0 - beta_f) * i_fast + beta_f * xt
         n_fast = torch.minimum(n_fast + 1.0, xt.new_tensor(n_f_max))
 
-        # --- slow EMA: freeze ONLY during post-reset cooldown (not entire in_change) ---
-        # Freezing for the whole change window pinned old I^s and caused onset trails while
-        # s_spat / s_tilde already outlined motion clearly.
-        freeze = cooldown > 0.0
+        # --- slow bank: normal EMA only (no soft mix with I^f) ---
         beta_s = torch.maximum(1.0 / n_slow, xt.new_tensor(self.beta_slow_floor))
-        i_slow_upd = (1.0 - beta_s) * i_slow + beta_s * xt
-        n_slow_upd = torch.minimum(n_slow + 1.0, xt.new_tensor(n_s_max))
-        i_slow = torch.where(freeze, i_slow, i_slow_upd)
-        n_slow = torch.where(freeze, n_slow, n_slow_upd)
+        i_slow = (1.0 - beta_s) * i_slow + beta_s * xt
+        n_slow = torch.minimum(n_slow + 1.0, xt.new_tensor(n_s_max))
 
-        # --- evidence vs I^s *before* surprise-driven chase (keeps KL informative) ---
+        # --- evidence ---
         s_raw = self._bernoulli_kl(i_fast, i_slow, eps)
         s_spat = self._spatial_mean(s_raw)
         a_s = self.alpha_surprise
         s_tilde = a_s * s_tilde + (1.0 - a_s) * s_spat
 
-        # --- S / s_spat directly drive update region: chase I^f where surprise is high ---
-        # Soft mask (no hard θ_on): w = S/(S+θ); take max with snappier s_spat.
+        # --- soft W only for display/output mix (does not rewrite I^s) ---
         w_s = s_tilde / (s_tilde + theta_g)
         w_spat = s_spat / (s_spat + theta_g)
-        w_chase = torch.maximum(w_s, w_spat)
-        # Skip chase on pixels still in post-reset cooldown.
-        chase = w_chase * (1.0 - (cooldown > 0.0).to(dtype=xt.dtype))
-        i_slow = (1.0 - chase) * i_slow + chase * i_fast
-        n_slow = (1.0 - chase) * n_slow + chase * xt.new_ones(xt.shape)
-        n_slow = torch.minimum(n_slow, xt.new_tensor(n_s_max))
+        w = torch.maximum(w_s, w_spat)
+        i_out = (1.0 - w) * i_slow + w * i_fast
 
-        # --- hysteresis + confirm: hard edge reset when evidence sustains ---
+        # --- hysteresis: hard I^s←I^f once S stays above θ_on for confirm_bins ---
+        # confirm_bins=1 => reset on the first bin that enters change (fast path).
         enter = s_tilde > self.theta_on
         leave = s_tilde < self.theta_off
         in_change = torch.where(enter, xt.new_ones(xt.shape), in_change)
@@ -415,10 +412,6 @@ class HIRE(nn.Module):
             cooldown = torch.where(can_reset, xt.new_full(xt.shape, t_cd), cooldown)
         cooldown = torch.clamp(cooldown - 1.0, min=0.0)
 
-        gate = s_tilde / (s_tilde + theta_g)
-        # Output follows the same soft surprise mass (already chased into I^s where S is high).
-        gate_out = torch.maximum(gate, w_chase)
-        i_out = (1.0 - gate_out) * i_slow + gate_out * i_fast
         return (
             i_fast,
             i_slow,
@@ -429,7 +422,7 @@ class HIRE(nn.Module):
             confirm_count,
             cooldown,
             i_out,
-            gate_out,
+            w,
             s_raw,
             s_spat,
         )

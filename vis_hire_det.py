@@ -500,7 +500,7 @@ def main() -> None:
     ap.add_argument("--hire_gate_theta", type=float, default=0.2)
     ap.add_argument("--hire_theta_on", type=float, default=0.15)
     ap.add_argument("--hire_theta_off", type=float, default=0.06)
-    ap.add_argument("--hire_confirm_bins", type=int, default=5)
+    ap.add_argument("--hire_confirm_bins", type=int, default=1)
     ap.add_argument("--hire_cooldown_bins", type=int, default=8)
     ap.add_argument("--hire_spatial_kernel", type=int, default=3)
     ap.add_argument("--hire_eps", type=float, default=1e-5)

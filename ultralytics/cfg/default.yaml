@@ -198,11 +198,11 @@ hire_surprise_bins: 8 # (int) W_S: α_S=exp(-1/W_S) for surprise EMA
 hire_tau_fast: 0.0 # (float) >0 => ZOH α=exp(-1/(f_s·τ)) override (rate experiments)
 hire_tau_slow: 0.0
 hire_tau_surprise: 0.0
-hire_gate_theta: 0.2 # (float) g=S/(S+θ); quiet uses g²
-hire_theta_on: 0.15 # (float) enter change if S>θ_on
+hire_gate_theta: 0.2 # (float) w=S/(S+θ) (and s_spat); soft mix for I_out only
+hire_theta_on: 0.15 # (float) enter change if S>θ_on → hard I^s←I^f after confirm
 hire_theta_off: 0.06 # (float) leave change if S<θ_off
-hire_confirm_bins: 5 # (int) edge reset when confirm count hits C_min
-hire_cooldown_bins: 8 # (int) bins after reset that block another inheritance
+hire_confirm_bins: 1 # (int) bins in-change before hard I^s reset (1 = immediate)
+hire_cooldown_bins: 8 # (int) bins after reset that block another hard inheritance
 hire_spatial_kernel: 3 # (int) odd spatial mean on KL
 hire_normalize: True
 hire_quantile: 1.0
