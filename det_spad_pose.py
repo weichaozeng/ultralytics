@@ -254,7 +254,7 @@ def _reference_bin_rate_hz(model) -> float:
     if hasattr(model, "spad_reference_bin_rate_hz"):
         return float(getattr(model, "spad_reference_bin_rate_hz"))
     train_args = getattr(model, "args", None)
-    return float(_cfg_get(train_args, "spad_bin_rate_hz", 8000.0))
+    return float(_cfg_get(train_args, "spad_bin_rate_hz", 2000.0))
 
 
 def _configure_model_spad_bin_rate(model, *, current_bin_rate_hz: float) -> None:
@@ -338,10 +338,10 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
 
         kwargs.update(
             {
-                "sample_rate_hz": float(getattr(args, "spad_bin_rate_hz", 8000.0)),
-                "ref_rate_hz": float(getattr(args, "hire_ref_rate_hz", 8000.0)),
+                "sample_rate_hz": float(getattr(args, "spad_bin_rate_hz", 2000.0)),
+                "ref_rate_hz": float(getattr(args, "hire_ref_rate_hz", 2000.0)),
                 "fast_bins": int(getattr(args, "hire_fast_bins", 16)),
-                "slow_bins": int(getattr(args, "hire_slow_bins", 128)),
+                "slow_bins": int(getattr(args, "hire_slow_bins", 160)),
                 "surprise_bins": int(getattr(args, "hire_surprise_bins", 8)),
                 "tau_fast": _tau_or_none(float(getattr(args, "hire_tau_fast", 0.0))),
                 "tau_slow": _tau_or_none(float(getattr(args, "hire_tau_slow", 0.0))),

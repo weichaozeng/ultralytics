@@ -14,6 +14,7 @@ python ultralytics/vis_hire_det.py \\
   --in_path /path/to/sample \\
   --save_dir /tmp/hire_vis \\
   --chunk_size 80 \\
+  --bin_rate_hz 2000 \\
   --hire_theta_on 0.15 --hire_theta_off 0.06
 """
 
@@ -483,16 +484,16 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Visualize HIRE v0.3 I^f/I^s change-point intermediates")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory or .npy path")
     ap.add_argument("--save_dir", type=str, required=True, help="Output root directory")
-    ap.add_argument("--chunk_size", type=int, default=320)
+    ap.add_argument("--chunk_size", type=int, default=80)
     ap.add_argument("--chunk_stride", type=int, default=0)
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
-    # HIRE
-    ap.add_argument("--bin_rate_hz", type=float, default=8000.0, help="SPAD bin rate f_s")
-    ap.add_argument("--hire_ref_rate_hz", type=float, default=8000.0)
-    ap.add_argument("--hire_fast_bins", type=int, default=16)
-    ap.add_argument("--hire_slow_bins", type=int, default=128)
-    ap.add_argument("--hire_surprise_bins", type=int, default=8)
+    # HIRE (2 kHz / chunk=80; α=exp(-1/W) from *_bins)
+    ap.add_argument("--bin_rate_hz", type=float, default=2000.0, help="SPAD bin rate f_s (logging / tau override)")
+    ap.add_argument("--hire_ref_rate_hz", type=float, default=2000.0)
+    ap.add_argument("--hire_fast_bins", type=int, default=16, help="W_f: α_f=exp(-1/W_f)")
+    ap.add_argument("--hire_slow_bins", type=int, default=160, help="W_s: α_s=exp(-1/W_s), n_s cap")
+    ap.add_argument("--hire_surprise_bins", type=int, default=8, help="W_S: α_S=exp(-1/W_S)")
     ap.add_argument("--hire_tau_fast", type=float, default=0.0)
     ap.add_argument("--hire_tau_slow", type=float, default=0.0)
     ap.add_argument("--hire_tau_surprise", type=float, default=0.0)

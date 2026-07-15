@@ -13,21 +13,22 @@ batch: 2
 workers: 0
 imgsz: 512
 
-# sequence windowing (10 consecutive cached frames per sample)
+# sequence windowing @ 2 kHz / emit 80
 spad_output_frames: 20
-spad_chunk_size: 320
-spad_subsampling: 64
-spad_bins_per_gt: 64
+spad_chunk_size: 80
+spad_subsampling: 80
+spad_bins_per_gt: 80
 spad_stride_frames: 5
 spad_image_size: 512
 spad_packed_ch_order: RGB
 spad_cache_mode: auto
 
-# HIRE offline cache (forward skips online preprocessing when cache_mode=rendered)
+# HIRE offline cache @ 2 kHz; α=exp(-1/W) from *_bins
 spad_preprocessor: hire
-hire_ref_rate_hz: 8000.0
+spad_bin_rate_hz: 2000.0
+hire_ref_rate_hz: 2000.0
 hire_fast_bins: 16
-hire_slow_bins: 128
+hire_slow_bins: 160
 hire_surprise_bins: 8
 hire_gate_theta: 0.2
 hire_theta_on: 0.15

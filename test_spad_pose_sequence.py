@@ -256,10 +256,10 @@ def _build_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsampling
 
         return {
             "subsampling": spad_subsampling,
-            "sample_rate_hz": float(getattr(args, "spad_bin_rate_hz", 8000.0)),
-            "ref_rate_hz": float(getattr(args, "hire_ref_rate_hz", 8000.0)),
+            "sample_rate_hz": float(getattr(args, "spad_bin_rate_hz", 2000.0)),
+            "ref_rate_hz": float(getattr(args, "hire_ref_rate_hz", 2000.0)),
             "fast_bins": int(getattr(args, "hire_fast_bins", 16)),
-            "slow_bins": int(getattr(args, "hire_slow_bins", 128)),
+            "slow_bins": int(getattr(args, "hire_slow_bins", 160)),
             "surprise_bins": int(getattr(args, "hire_surprise_bins", 8)),
             "tau_fast": _tau_or_none(float(getattr(args, "hire_tau_fast", 0.0))),
             "tau_slow": _tau_or_none(float(getattr(args, "hire_tau_slow", 0.0))),

@@ -83,12 +83,12 @@ def parse_args():
     ap.add_argument(
         "--spad-bin-rate-hz",
         type=float,
-        default=8000.0,
-        help="SPAD bin sample rate f_s used by HIRE ZOH alphas.",
+        default=2000.0,
+        help="SPAD bin rate f_s (HIRE: logging / optional tau_* ZOH; alphas default α=exp(-1/W)).",
     )
-    ap.add_argument("--hire-ref-rate-hz", type=float, default=8000.0)
+    ap.add_argument("--hire-ref-rate-hz", type=float, default=2000.0)
     ap.add_argument("--hire-fast-bins", type=int, default=16)
-    ap.add_argument("--hire-slow-bins", type=int, default=128)
+    ap.add_argument("--hire-slow-bins", type=int, default=160)
     ap.add_argument("--hire-surprise-bins", type=int, default=8)
     ap.add_argument("--hire-tau-fast", type=float, default=0.0)
     ap.add_argument("--hire-tau-slow", type=float, default=0.0)

@@ -61,10 +61,10 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--chunk_size",
         type=int,
-        default=320,
+        default=80,
         help=(
             "Raw bins per output frame (= preprocessor emit interval). "
-            "Example: 2 kHz SPAD at 25 FPS => chunk_size=80; 8 kHz at 125 FPS => 64."
+            "HIRE defaults assume 2 kHz @ 25 FPS => chunk_size=80."
         ),
     )
     ap.add_argument("--chunk_stride", type=int, default=0, help="0 means equal to chunk_size")
@@ -126,17 +126,17 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--stea_kernel_size", type=int, default=None)
     ap.add_argument("--stea_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea_quantile", type=float, default=1.0)
-    # HIRE (primary knob: SPAD bin rate; taus from reference-bin presets)
+    # HIRE (2 kHz / chunk=80; α=exp(-1/W) from *_bins)
     ap.add_argument(
         "--bin_rate_hz",
         type=float,
-        default=8000.0,
-        help="SPAD bin sample rate f_s for HIRE ZOH alphas.",
+        default=2000.0,
+        help="SPAD bin rate f_s (logging / optional tau_* ZOH override).",
     )
-    ap.add_argument("--hire_ref_rate_hz", type=float, default=8000.0)
-    ap.add_argument("--hire_fast_bins", type=int, default=16)
-    ap.add_argument("--hire_slow_bins", type=int, default=128)
-    ap.add_argument("--hire_surprise_bins", type=int, default=8)
+    ap.add_argument("--hire_ref_rate_hz", type=float, default=2000.0)
+    ap.add_argument("--hire_fast_bins", type=int, default=16, help="W_f: α_f=exp(-1/W_f)")
+    ap.add_argument("--hire_slow_bins", type=int, default=160, help="W_s: α_s=exp(-1/W_s), n_s cap")
+    ap.add_argument("--hire_surprise_bins", type=int, default=8, help="W_S: α_S=exp(-1/W_S)")
     ap.add_argument("--hire_tau_fast", type=float, default=0.0)
     ap.add_argument("--hire_tau_slow", type=float, default=0.0)
     ap.add_argument("--hire_tau_surprise", type=float, default=0.0)
