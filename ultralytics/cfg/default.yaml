@@ -190,14 +190,19 @@ stea_motion_threshold: 0.07 # (float) motion routing threshold for STEA
 stea_stable_prior: 16.0 # (float) stable-branch prior for STEA
 stea_normalize: True # (bool) normalize STEA reconstructions
 stea_quantile: 1.0 # (float) normalization quantile for STEA
+# HIRE v0.3: I^f/I^s + 1/n age + hysteresis change-point (I^s<-I^f when confirmed)
 hire_ref_rate_hz: 8000.0 # (float) reference rate for interpreting hire_*_bins as wall-clock taus
-hire_fast_bins: 16 # (int) fast timescale in bins @ hire_ref_rate_hz (tau_fast = bins/ref)
-hire_slow_bins: 128 # (int) slow timescale in bins @ hire_ref_rate_hz
+hire_fast_bins: 16 # (int) fast EMA / n_f cap in bins @ hire_ref_rate_hz
+hire_slow_bins: 128 # (int) slow EMA floor / n_s cap in bins @ hire_ref_rate_hz
 hire_surprise_bins: 8 # (int) surprise-EMA timescale in bins @ hire_ref_rate_hz
 hire_tau_fast: 0.0 # (float) optional wall-clock tau override (seconds); <=0 => from hire_fast_bins
 hire_tau_slow: 0.0 # (float) optional wall-clock tau override (seconds); <=0 => from hire_slow_bins
 hire_tau_surprise: 0.0 # (float) optional wall-clock tau override (seconds); <=0 => from hire_surprise_bins
-hire_gate_theta: 0.05 # (float) soft gate scale g = S / (S + theta)
+hire_gate_theta: 0.2 # (float) output mix g = S / (S + theta); quiet scenes need larger theta
+hire_theta_on: 0.15 # (float) hysteresis enter change when S > theta_on
+hire_theta_off: 0.06 # (float) hysteresis leave change when S < theta_off
+hire_confirm_bins: 5 # (int) consecutive change bins before edge reset I^s<-I^f
+hire_cooldown_bins: 8 # (int) bins after reset that block another inheritance
 hire_spatial_kernel: 3 # (int) odd spatial consensus kernel for surprise
 hire_normalize: True # (bool) normalize HIRE reconstructions
 hire_quantile: 1.0 # (float) normalization quantile for HIRE

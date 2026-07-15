@@ -29,7 +29,11 @@ hire_ref_rate_hz: 8000.0
 hire_fast_bins: 16
 hire_slow_bins: 128
 hire_surprise_bins: 8
-hire_gate_theta: 0.05
+hire_gate_theta: 0.2
+hire_theta_on: 0.15
+hire_theta_off: 0.06
+hire_confirm_bins: 5
+hire_cooldown_bins: 8
 hire_spatial_kernel: 3
 
 # backbone SSD plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.

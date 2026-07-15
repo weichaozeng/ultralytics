@@ -1,4 +1,4 @@
-"""HIRE: Hardened IIR Rate Estimation with soft τ-routing."""
+"""HIRE v0.3: dual-rate I^f / I^s with 1/n cold-start and hysteresis change-point reset."""
 
 from __future__ import annotations
 
@@ -53,11 +53,14 @@ def _resolve_tau(
 
 
 class HIRE(nn.Module):
-    """τ-anchored dual-rate IIR with Bernoulli-KL soft routing.
+    """I^f / I^s rate estimator with 1/n slow age and hysteresis change-point reset.
 
-    Primary user knob is ``sample_rate_hz`` (SPAD bin rate). Wall-clock
-    ``tau_*`` are derived from reference-bin presets at ``ref_rate_hz`` unless
-    explicit ``tau_*`` overrides are set ``> 0``.
+    - Fast: hybrid step ``β_f = max(1/n_f, 1-α_f)`` (near-weighted EMA, sum-to-1).
+    - Slow: same hybrid with ``n_s``; frozen while in change or cooldown.
+    - Evidence: BernKL(I^f || I^s) → spatial mean → surprise EMA ``S``.
+    - Hysteresis: ``S > θ_on`` enters change (confirm count ``c``); ``S < θ_off`` leaves.
+    - Edge reset: when ``c == confirm_bins``, ``I^s ← I^f``, ``n_s ← 1``, start cooldown.
+    - Output: ``g = S/(S+θ)``; off-change use ``g²`` then ``I_out = (1-g) I^s + g I^f``.
     """
 
     def __init__(
@@ -72,7 +75,11 @@ class HIRE(nn.Module):
         tau_fast: float | None = None,
         tau_slow: float | None = None,
         tau_surprise: float | None = None,
-        gate_theta: float = 0.05,
+        gate_theta: float = 0.2,
+        theta_on: float = 0.15,
+        theta_off: float = 0.06,
+        confirm_bins: int = 5,
+        cooldown_bins: int = 8,
         spatial_kernel: int = 3,
         eps: float = 1e-5,
         normalize: bool = False,
@@ -95,6 +102,14 @@ class HIRE(nn.Module):
         self.gate_theta = float(gate_theta)
         if self.gate_theta <= 0.0:
             raise ValueError(f"gate_theta must be > 0, got {gate_theta}")
+        self.theta_on = float(theta_on)
+        self.theta_off = float(theta_off)
+        if not (self.theta_on > self.theta_off > 0.0):
+            raise ValueError(
+                f"require theta_on > theta_off > 0, got on={theta_on}, off={theta_off}"
+            )
+        self.confirm_bins = max(int(confirm_bins), 1)
+        self.cooldown_bins = max(int(cooldown_bins), 0)
         k = int(spatial_kernel)
         if k < 1 or k % 2 == 0:
             raise ValueError(f"spatial_kernel must be odd and >= 1, got {spatial_kernel}")
@@ -108,15 +123,17 @@ class HIRE(nn.Module):
         self.tau_surprise = _resolve_tau(bins=self.surprise_bins, ref_rate_hz=ref, tau_override=tau_surprise)
         if not (self.tau_fast > 0.0 and self.tau_slow > 0.0 and self.tau_surprise > 0.0):
             raise ValueError("All taus must be > 0")
-        if self.tau_fast > self.tau_slow:
-            # Soft-routing still works; keep the user's / preset values.
-            pass
 
         self._rebuild_alphas()
 
         self.i_fast: Tensor | None = None
-        self.i_out: Tensor | None = None
+        self.i_slow: Tensor | None = None
+        self.n_fast: Tensor | None = None
+        self.n_slow: Tensor | None = None
         self.s_tilde: Tensor | None = None
+        self.in_change: Tensor | None = None
+        self.confirm_count: Tensor | None = None
+        self.cooldown: Tensor | None = None
         self.gate: Tensor | None = None
 
     def __repr__(self) -> str:
@@ -124,19 +141,27 @@ class HIRE(nn.Module):
             f"{self.__class__.__name__}(fs={self.sample_rate_hz:g}, "
             f"tau_fast={self.tau_fast:g}, tau_slow={self.tau_slow:g}, "
             f"tau_surprise={self.tau_surprise:g}, gate_theta={self.gate_theta:g}, "
+            f"theta_on={self.theta_on:g}, theta_off={self.theta_off:g}, "
+            f"confirm_bins={self.confirm_bins}, cooldown_bins={self.cooldown_bins}, "
             f"subsampling={self.subsampling})"
         )
 
     def _rebuild_alphas(self) -> None:
         self.alpha_fast = zoh_alpha(self.sample_rate_hz, self.tau_fast)
+        self.alpha_slow = zoh_alpha(self.sample_rate_hz, self.tau_slow)
         self.alpha_surprise = zoh_alpha(self.sample_rate_hz, self.tau_surprise)
-        self.log_tau_fast = float(math.log(self.tau_fast))
-        self.log_tau_slow = float(math.log(self.tau_slow))
+        self.beta_fast_floor = 1.0 - self.alpha_fast
+        self.beta_slow_floor = 1.0 - self.alpha_slow
 
     def clear_states(self) -> None:
         self.i_fast = None
-        self.i_out = None
+        self.i_slow = None
+        self.n_fast = None
+        self.n_slow = None
         self.s_tilde = None
+        self.in_change = None
+        self.confirm_count = None
+        self.cooldown = None
         self.gate = None
 
     def reset(self) -> None:
@@ -166,6 +191,10 @@ class HIRE(nn.Module):
             "hire_slow_bins": "slow_bins",
             "hire_surprise_bins": "surprise_bins",
             "hire_gate_theta": "gate_theta",
+            "hire_theta_on": "theta_on",
+            "hire_theta_off": "theta_off",
+            "hire_confirm_bins": "confirm_bins",
+            "hire_cooldown_bins": "cooldown_bins",
             "hire_spatial_kernel": "spatial_kernel",
             "hire_tau_fast": "tau_fast",
             "hire_tau_slow": "tau_slow",
@@ -206,6 +235,21 @@ class HIRE(nn.Module):
             if theta <= 0.0:
                 raise ValueError(f"gate_theta must be > 0, got {theta}")
             self.gate_theta = theta
+
+        if "theta_on" in normalized:
+            self.theta_on = float(normalized["theta_on"])
+        if "theta_off" in normalized:
+            self.theta_off = float(normalized["theta_off"])
+        if "theta_on" in normalized or "theta_off" in normalized:
+            if not (self.theta_on > self.theta_off > 0.0):
+                raise ValueError(
+                    f"require theta_on > theta_off > 0, got on={self.theta_on}, off={self.theta_off}"
+                )
+
+        if "confirm_bins" in normalized:
+            self.confirm_bins = max(int(normalized["confirm_bins"]), 1)
+        if "cooldown_bins" in normalized:
+            self.cooldown_bins = max(int(normalized["cooldown_bins"]), 0)
 
         if "spatial_kernel" in normalized:
             k = int(normalized["spatial_kernel"])
@@ -261,28 +305,89 @@ class HIRE(nn.Module):
         x = surprise_hw.unsqueeze(0).unsqueeze(0)
         return F.avg_pool2d(x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
 
-    def _step(self, xt: Tensor, i_fast: Tensor, i_out: Tensor, s_tilde: Tensor) -> tuple[Tensor, ...]:
-        """One-bin HIRE update.
+    def _step(
+        self,
+        xt: Tensor,
+        i_fast: Tensor,
+        i_slow: Tensor,
+        n_fast: Tensor,
+        n_slow: Tensor,
+        s_tilde: Tensor,
+        in_change: Tensor,
+        confirm_count: Tensor,
+        cooldown: Tensor,
+    ) -> tuple[Tensor, ...]:
+        """One-bin HIRE v0.3 update.
 
-        Returns ``(i_fast, i_out, s_tilde, gate, s_raw, s_spat, tau, alpha)``.
+        Returns
+        ``(i_fast, i_slow, n_fast, n_slow, s_tilde, in_change, confirm_count,
+          cooldown, i_out, gate, s_raw, s_spat)``.
         """
-        a_f = self.alpha_fast
-        a_s = self.alpha_surprise
         eps = self.eps
-        theta = self.gate_theta
+        theta_g = self.gate_theta
+        c_min = self.confirm_bins
+        t_cd = float(self.cooldown_bins)
+        n_f_max = float(self.fast_bins)
+        n_s_max = float(self.slow_bins)
 
-        i_fast = a_f * i_fast + (1.0 - a_f) * xt
-        s_raw = self._bernoulli_kl(i_fast, i_out, eps)
+        # --- fast always updates ---
+        beta_f = torch.maximum(1.0 / n_fast, xt.new_tensor(self.beta_fast_floor))
+        i_fast = (1.0 - beta_f) * i_fast + beta_f * xt
+        n_fast = torch.minimum(n_fast + 1.0, xt.new_tensor(n_f_max))
+
+        # --- slow: freeze in change or cooldown ---
+        freeze = (in_change > 0.5) | (cooldown > 0.0)
+        beta_s = torch.maximum(1.0 / n_slow, xt.new_tensor(self.beta_slow_floor))
+        i_slow_upd = (1.0 - beta_s) * i_slow + beta_s * xt
+        n_slow_upd = torch.minimum(n_slow + 1.0, xt.new_tensor(n_s_max))
+        i_slow = torch.where(freeze, i_slow, i_slow_upd)
+        n_slow = torch.where(freeze, n_slow, n_slow_upd)
+
+        # --- evidence ---
+        s_raw = self._bernoulli_kl(i_fast, i_slow, eps)
         s_spat = self._spatial_mean(s_raw)
+        a_s = self.alpha_surprise
         s_tilde = a_s * s_tilde + (1.0 - a_s) * s_spat
-        gate = s_tilde / (s_tilde + theta)
 
-        # τ soft-interpolation in log space, then ZOH α map.
-        log_tau = (1.0 - gate) * self.log_tau_slow + gate * self.log_tau_fast
-        tau = torch.exp(log_tau).clamp(min=eps)
-        alpha = torch.exp(-1.0 / (self.sample_rate_hz * tau))
-        i_out = alpha * i_out + (1.0 - alpha) * xt
-        return i_fast, i_out, s_tilde, gate, s_raw, s_spat, tau, alpha
+        # --- hysteresis + confirm (before applying this-step reset) ---
+        enter = s_tilde > self.theta_on
+        leave = s_tilde < self.theta_off
+        in_change = torch.where(enter, xt.new_ones(xt.shape), in_change)
+        in_change = torch.where(leave, xt.new_zeros(xt.shape), in_change)
+
+        # Confirm count only while in change; leaves reset c → 0.
+        confirm_count = torch.where(in_change > 0.5, confirm_count + 1.0, xt.new_zeros(xt.shape))
+        # Edge reset once when c first hits C_min (not on later steps); blocked during cooldown.
+        can_reset = (
+            (in_change > 0.5)
+            & (cooldown <= 0.0)
+            & (confirm_count >= float(c_min) - 1e-6)
+            & (confirm_count < float(c_min) + 1.0 - 1e-6)
+        )
+        i_slow = torch.where(can_reset, i_fast, i_slow)
+        n_slow = torch.where(can_reset, xt.new_ones(xt.shape), n_slow)
+        if t_cd > 0.0:
+            cooldown = torch.where(can_reset, xt.new_full(xt.shape, t_cd), cooldown)
+        cooldown = torch.clamp(cooldown - 1.0, min=0.0)
+
+        gate = s_tilde / (s_tilde + theta_g)
+        # Off change: square g so shot-noise surprise does not leak I^f into the background.
+        gate_out = torch.where(in_change > 0.5, gate, gate * gate)
+        i_out = (1.0 - gate_out) * i_slow + gate_out * i_fast
+        return (
+            i_fast,
+            i_slow,
+            n_fast,
+            n_slow,
+            s_tilde,
+            in_change,
+            confirm_count,
+            cooldown,
+            i_out,
+            gate_out,
+            s_raw,
+            s_spat,
+        )
 
     def _update_causal(self, photon_cube: Tensor, *, clear_states: bool) -> Tensor:
         recons, _ = self._update_causal_with_debug(photon_cube, clear_states=clear_states, record_debug=False)
@@ -308,48 +413,97 @@ class HIRE(nn.Module):
 
         raw = photon_cube.float()
         i_fast = self.i_fast
-        i_out = self.i_out
+        i_slow = self.i_slow
+        n_fast = self.n_fast
+        n_slow = self.n_slow
         s_tilde = self.s_tilde
+        in_change = self.in_change
+        confirm_count = self.confirm_count
+        cooldown = self.cooldown
         gate = self.gate
         frames: list[Tensor] = []
 
-        dbg_keys = ("i_fast", "i_out", "s_raw", "s_spat", "s_tilde", "gate", "tau", "alpha")
+        dbg_keys = (
+            "i_fast",
+            "i_slow",
+            "i_out",
+            "s_raw",
+            "s_spat",
+            "s_tilde",
+            "gate",
+            "n_slow",
+            "n_fast",
+            "in_change",
+            "confirm",
+            "cooldown",
+        )
         dbg_lists: dict[str, list[Tensor]] = {k: [] for k in dbg_keys} if record_debug else {}
 
         for t0 in range(0, t_raw, self.subsampling):
             t1 = min(t_raw, t0 + self.subsampling)
             for t in range(t0, t1):
                 xt = raw[..., t]
-                if i_fast is None or i_out is None or s_tilde is None:
+                if i_fast is None or i_slow is None or s_tilde is None:
                     i_fast = xt.clone()
-                    i_out = xt.clone()
+                    i_slow = xt.clone()
+                    n_fast = xt.new_ones(xt.shape)
+                    n_slow = xt.new_ones(xt.shape)
                     s_tilde = xt.new_zeros(xt.shape)
+                    in_change = xt.new_zeros(xt.shape)
+                    confirm_count = xt.new_zeros(xt.shape)
+                    cooldown = xt.new_zeros(xt.shape)
                     gate = xt.new_zeros(xt.shape)
                     s_raw = xt.new_zeros(xt.shape)
                     s_spat = xt.new_zeros(xt.shape)
-                    # Warm-start: stay on slow τ (g=0).
-                    tau = xt.new_full(xt.shape, self.tau_slow)
-                    alpha = xt.new_full(
-                        xt.shape, float(math.exp(-1.0 / (self.sample_rate_hz * self.tau_slow)))
-                    )
+                    i_out = i_slow
                 else:
-                    i_fast, i_out, s_tilde, gate, s_raw, s_spat, tau, alpha = self._step(
-                        xt, i_fast, i_out, s_tilde
+                    (
+                        i_fast,
+                        i_slow,
+                        n_fast,
+                        n_slow,
+                        s_tilde,
+                        in_change,
+                        confirm_count,
+                        cooldown,
+                        i_out,
+                        gate,
+                        s_raw,
+                        s_spat,
+                    ) = self._step(
+                        xt,
+                        i_fast,
+                        i_slow,
+                        n_fast,
+                        n_slow,
+                        s_tilde,
+                        in_change,
+                        confirm_count,
+                        cooldown,
                     )
                 if record_debug:
                     dbg_lists["i_fast"].append(i_fast)
+                    dbg_lists["i_slow"].append(i_slow)
                     dbg_lists["i_out"].append(i_out)
                     dbg_lists["s_raw"].append(s_raw)
                     dbg_lists["s_spat"].append(s_spat)
                     dbg_lists["s_tilde"].append(s_tilde)
                     dbg_lists["gate"].append(gate)
-                    dbg_lists["tau"].append(tau)
-                    dbg_lists["alpha"].append(alpha)
+                    dbg_lists["n_slow"].append(n_slow)
+                    dbg_lists["n_fast"].append(n_fast)
+                    dbg_lists["in_change"].append(in_change)
+                    dbg_lists["confirm"].append(confirm_count)
+                    dbg_lists["cooldown"].append(cooldown)
             frames.append(i_out.unsqueeze(-1))
 
         self.i_fast = None if i_fast is None else i_fast.detach()
-        self.i_out = None if i_out is None else i_out.detach()
+        self.i_slow = None if i_slow is None else i_slow.detach()
+        self.n_fast = None if n_fast is None else n_fast.detach()
+        self.n_slow = None if n_slow is None else n_slow.detach()
         self.s_tilde = None if s_tilde is None else s_tilde.detach()
+        self.in_change = None if in_change is None else in_change.detach()
+        self.confirm_count = None if confirm_count is None else confirm_count.detach()
+        self.cooldown = None if cooldown is None else cooldown.detach()
         self.gate = None if gate is None else gate.detach()
 
         recons_prenorm = torch.cat(frames, dim=-1)

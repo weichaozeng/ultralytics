@@ -1,11 +1,11 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Visualize HIRE soft-routing intermediates and reconstructions.
+"""Visualize HIRE v0.3 (I^f / I^s + hysteresis change-point) intermediates.
 
 Writes per-chunk outputs under ``{save_dir}/{sample}/videoXXXXX/``:
 
 - ``{stem}_hire_stats.txt`` — percentile summary (only with ``--write_stats``; slow)
-- ``{stem}_hire_compare.png`` — sum vs hire reconstruction
-- ``{stem}_hire_scores.png`` — last-frame maps (I^f, I, KL, gate, tau, …)
+- ``{stem}_hire_compare.png`` — sum / hire / i_fast / i_slow / in_change
+- ``{stem}_hire_scores.png`` — last-frame maps
 - ``{stem}_hire_temporal.png`` — evenly spaced time slices of key volumes
 
 Example
@@ -14,15 +14,12 @@ python ultralytics/vis_hire_det.py \\
   --in_path /path/to/sample \\
   --save_dir /tmp/hire_vis \\
   --chunk_size 80 \\
-  --bin_rate_hz 2000 \\
-  --hire_slow_bins 256 \\
-  --hire_gate_theta 0.1
+  --hire_theta_on 0.15 --hire_theta_off 0.06
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -295,32 +292,30 @@ def _save_visuals(
 
     s_tilde_hwt = _np(debug["s_tilde_hwt"])
     gate_hwt = _np(debug["gate_hwt"])
-    tau_hwt = _np(debug["tau_hwt"])
-    alpha_hwt = _np(debug["alpha_hwt"])
     s_raw_hwt = _np(debug["s_raw_hwt"])
-    s_spat_hwt = _np(debug["s_spat_hwt"])
     i_fast_hwt = _np(debug["i_fast_hwt"])
+    i_slow_hwt = _np(debug["i_slow_hwt"])
     i_out_hwt = _np(debug["i_out_hwt"])
+    in_change_hwt = _np(debug["in_change_hwt"])
+    n_slow_hwt = _np(debug["n_slow_hwt"])
 
     maps: dict[str, np.ndarray] = {
         "i_fast": _np(debug["i_fast_last"]),
+        "i_slow": _np(debug["i_slow_last"]),
         "i_out": _np(debug["i_out_last"]),
         "s_raw": _np(debug["s_raw_last"]),
         "s_spat": _np(debug["s_spat_last"]),
         "s_tilde": _np(debug["s_tilde_last"]),
-        "s_tilde_peak": _np(debug["s_tilde_peak"]),
         "gate": _np(debug["gate_last"]),
-        "gate_peak": _np(debug["gate_peak"]),
-        "gate_mean": _np(debug["gate_mean"]),
         "conf": _np(debug["conf_last"]),
-        "tau": _np(debug["tau_last"]),
-        "tau_mean": _np(debug["tau_mean"]),
-        "alpha": _np(debug["alpha_last"]),
-        "alpha_mean": _np(debug["alpha_mean"]),
+        "n_slow": _np(debug["n_slow_last"]),
+        "in_change": _np(debug["in_change_last"]),
+        "confirm": _np(debug["confirm_last"]),
+        "cooldown": _np(debug["cooldown_last"]),
     }
 
     s_vmax = _resolve_vmax(s_tilde_hwt, fixed_vmax=score_vmax, percentile=score_percentile)
-    tau_vmax = max(float(hire.tau_slow), float(hire.tau_fast), float(np.percentile(tau_hwt, 99.5)))
+    n_vmax = max(float(hire.slow_bins), float(np.percentile(n_slow_hwt, 99.5)), 1.0)
 
     score_panels = []
     score_labels = []
@@ -329,14 +324,14 @@ def _save_visuals(
             panel = _panel_from_map(
                 score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=s_vmax
             )
-        elif label.startswith("tau"):
+        elif label == "n_slow":
             panel = _panel_from_map(
-                score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=tau_vmax
+                score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=n_vmax
             )
-        elif label.startswith(("gate", "conf", "alpha", "i_")):
-            vmax = 1.0
+        elif label in {"confirm", "cooldown"}:
+            vmax = max(float(np.max(score_map)), 1.0)
             panel = _panel_from_map(
-                score_map, display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=vmax
+                score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=vmax
             )
         else:
             panel = _panel_from_map(
@@ -357,6 +352,15 @@ def _save_visuals(
             max_slices=temporal_slices,
         ),
         _temporal_strip(
+            in_change_hwt,
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="in_change",
+            mode="gray",
+            vmax=1.0,
+            max_slices=temporal_slices,
+        ),
+        _temporal_strip(
             gate_hwt,
             display_hw=display_hw,
             cmap_id=cmap_id,
@@ -366,12 +370,12 @@ def _save_visuals(
             max_slices=temporal_slices,
         ),
         _temporal_strip(
-            tau_hwt,
+            i_slow_hwt,
             display_hw=display_hw,
             cmap_id=cmap_id,
-            label_prefix="tau",
-            mode="heatmap",
-            vmax=tau_vmax,
+            label_prefix="i_slow",
+            mode="gray",
+            vmax=1.0,
             max_slices=temporal_slices,
         ),
         _temporal_strip(
@@ -384,21 +388,21 @@ def _save_visuals(
             max_slices=temporal_slices,
         ),
         _temporal_strip(
-            s_raw_hwt,
-            display_hw=display_hw,
-            cmap_id=cmap_id,
-            label_prefix="s_raw",
-            mode="heatmap",
-            vmax=s_vmax,
-            max_slices=temporal_slices,
-        ),
-        _temporal_strip(
             i_fast_hwt,
             display_hw=display_hw,
             cmap_id=cmap_id,
             label_prefix="i_fast",
             mode="gray",
             vmax=1.0,
+            max_slices=temporal_slices,
+        ),
+        _temporal_strip(
+            s_raw_hwt,
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="s_raw",
+            mode="heatmap",
+            vmax=s_vmax,
             max_slices=temporal_slices,
         ),
     ]
@@ -419,18 +423,23 @@ def _save_visuals(
 
     cv2.imwrite(
         str(out_dir / f"{stem}_hire_compare.png"),
-        _stitch_panels([sum_bgr, recon_bgr], ["sum", "hire"]),
+        _stitch_panels(
+            [
+                sum_bgr,
+                recon_bgr,
+                _panel_from_map(maps["i_fast"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
+                _panel_from_map(maps["i_slow"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
+                _panel_from_map(maps["in_change"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
+            ],
+            ["sum", "hire", "i_fast", "i_slow", "in_change"],
+        ),
     )
 
     if not write_stats:
         return
 
-    # Reconstruct gate from S and theta to sanity-check.
     gate_from_s = maps["s_tilde"] / (maps["s_tilde"] + float(hire.gate_theta))
     gate_err = np.abs(gate_from_s - maps["gate"])
-    expected_tau = np.exp(
-        (1.0 - maps["gate"]) * math.log(hire.tau_slow) + maps["gate"] * math.log(hire.tau_fast)
-    )
 
     stats_lines = [
         f"stem={stem}",
@@ -438,16 +447,18 @@ def _save_visuals(
             f"fs={hire.sample_rate_hz:g} ref={hire.ref_rate_hz:g} "
             f"bins={hire.fast_bins}/{hire.slow_bins}/{hire.surprise_bins} "
             f"tau={hire.tau_fast:g}/{hire.tau_slow:g}/{hire.tau_surprise:g} "
-            f"gate_theta={hire.gate_theta:g} spatial_kernel={hire.spatial_kernel} "
-            f"normalize={hire.normalize} quantile={hire.quantile:g}"
+            f"gate_theta={hire.gate_theta:g} theta_on/off={hire.theta_on:g}/{hire.theta_off:g} "
+            f"confirm={hire.confirm_bins} cooldown={hire.cooldown_bins} "
+            f"spatial_kernel={hire.spatial_kernel} normalize={hire.normalize} quantile={hire.quantile:g}"
         ),
-        f"alpha_fast={hire.alpha_fast:.6f} alpha_surprise={hire.alpha_surprise:.6f}",
+        (
+            f"alpha_fast={hire.alpha_fast:.6f} alpha_slow={hire.alpha_slow:.6f} "
+            f"alpha_surprise={hire.alpha_surprise:.6f}"
+        ),
         f"s_tilde_vmax={s_vmax:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
-        "Pipeline: I^f IIR → BernKL(I^f||I) → spatial mean → S~ EMA → g=S~/(S~+θ) → τ-interp → I IIR",
-        "gate∈[0,1]: 0→τ_slow (smooth), 1→τ_fast (responsive); conf=1-gate",
+        "Pipeline: I^f/I^s hybrid-1/n → BernKL → S EMA → hysteresis+confirm → edge I^s<-I^f → out mix",
         f"gate_from_s_abs_err_max={float(gate_err.max()):.8f} mean={float(gate_err.mean()):.8f}",
-        f"tau_vs_formula_abs_err_max={float(np.abs(expected_tau - maps['tau']).max()):.8e}",
-        f"gate_mean_last={float(maps['gate'].mean()):.6f} gate_peak_mean={float(maps['gate_peak'].mean()):.6f}",
+        f"in_change_mean={float(maps['in_change'].mean()):.6f} n_slow_mean={float(maps['n_slow'].mean()):.3f}",
         "",
     ]
     for label, values in maps.items():
@@ -455,13 +466,13 @@ def _save_visuals(
         stats_lines.append("")
     for label, values in {
         "s_raw_hwt": s_raw_hwt,
-        "s_spat_hwt": s_spat_hwt,
         "s_tilde_hwt": s_tilde_hwt,
         "gate_hwt": gate_hwt,
-        "tau_hwt": tau_hwt,
-        "alpha_hwt": alpha_hwt,
         "i_fast_hwt": i_fast_hwt,
+        "i_slow_hwt": i_slow_hwt,
         "i_out_hwt": i_out_hwt,
+        "in_change_hwt": in_change_hwt,
+        "n_slow_hwt": n_slow_hwt,
     }.items():
         stats_lines.extend(_percentile_summary(values, name=label, percentiles=percentiles))
         stats_lines.append("")
@@ -469,7 +480,7 @@ def _save_visuals(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Visualize HIRE soft-routing intermediates and reconstructions")
+    ap = argparse.ArgumentParser(description="Visualize HIRE v0.3 I^f/I^s change-point intermediates")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory or .npy path")
     ap.add_argument("--save_dir", type=str, required=True, help="Output root directory")
     ap.add_argument("--chunk_size", type=int, default=320)
@@ -485,7 +496,11 @@ def main() -> None:
     ap.add_argument("--hire_tau_fast", type=float, default=0.0)
     ap.add_argument("--hire_tau_slow", type=float, default=0.0)
     ap.add_argument("--hire_tau_surprise", type=float, default=0.0)
-    ap.add_argument("--hire_gate_theta", type=float, default=0.05)
+    ap.add_argument("--hire_gate_theta", type=float, default=0.2)
+    ap.add_argument("--hire_theta_on", type=float, default=0.15)
+    ap.add_argument("--hire_theta_off", type=float, default=0.06)
+    ap.add_argument("--hire_confirm_bins", type=int, default=5)
+    ap.add_argument("--hire_cooldown_bins", type=int, default=8)
     ap.add_argument("--hire_spatial_kernel", type=int, default=3)
     ap.add_argument("--hire_eps", type=float, default=1e-5)
     ap.add_argument("--hire_normalize", action=argparse.BooleanOptionalAction, default=True)
@@ -529,6 +544,10 @@ def main() -> None:
         tau_slow=_tau_or_none(args.hire_tau_slow),
         tau_surprise=_tau_or_none(args.hire_tau_surprise),
         gate_theta=float(args.hire_gate_theta),
+        theta_on=float(args.hire_theta_on),
+        theta_off=float(args.hire_theta_off),
+        confirm_bins=int(args.hire_confirm_bins),
+        cooldown_bins=int(args.hire_cooldown_bins),
         spatial_kernel=int(args.hire_spatial_kernel),
         eps=float(args.hire_eps),
         normalize=bool(args.hire_normalize),
@@ -540,8 +559,8 @@ def main() -> None:
     sources = list(_iter_sources(in_path))
 
     print(
-        f"HIRE fs={hire.sample_rate_hz:g} tau={hire.tau_fast:g}/{hire.tau_slow:g}/{hire.tau_surprise:g} "
-        f"theta={hire.gate_theta:g} chunk={int(args.chunk_size)}"
+        f"HIRE v0.3 fs={hire.sample_rate_hz:g} theta_on/off={hire.theta_on:g}/{hire.theta_off:g} "
+        f"confirm={hire.confirm_bins} cooldown={hire.cooldown_bins} chunk={int(args.chunk_size)}"
     )
 
     for video_idx, source in enumerate(tqdm(sources, desc=f"hire vis [{sample_name}]")):

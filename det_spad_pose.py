@@ -346,7 +346,11 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
                 "tau_fast": _tau_or_none(float(getattr(args, "hire_tau_fast", 0.0))),
                 "tau_slow": _tau_or_none(float(getattr(args, "hire_tau_slow", 0.0))),
                 "tau_surprise": _tau_or_none(float(getattr(args, "hire_tau_surprise", 0.0))),
-                "gate_theta": float(getattr(args, "hire_gate_theta", 0.05)),
+                "gate_theta": float(getattr(args, "hire_gate_theta", 0.2)),
+                "theta_on": float(getattr(args, "hire_theta_on", 0.15)),
+                "theta_off": float(getattr(args, "hire_theta_off", 0.06)),
+                "confirm_bins": int(getattr(args, "hire_confirm_bins", 5)),
+                "cooldown_bins": int(getattr(args, "hire_cooldown_bins", 8)),
                 "spatial_kernel": int(getattr(args, "hire_spatial_kernel", 3)),
             }
         )
@@ -514,7 +518,7 @@ def main():
     ap.add_argument("--hire-tau-fast", type=float, default=0.0)
     ap.add_argument("--hire-tau-slow", type=float, default=0.0)
     ap.add_argument("--hire-tau-surprise", type=float, default=0.0)
-    ap.add_argument("--hire-gate-theta", type=float, default=0.05)
+    ap.add_argument("--hire-gate-theta", type=float, default=0.2)
     ap.add_argument("--hire-spatial-kernel", type=int, default=3)
     ap.add_argument(
         "--hyb-motion-sharpness",
