@@ -338,12 +338,13 @@ class HIRE(nn.Module):
         return p * torch.log(p / q) + (1.0 - p) * torch.log((1.0 - p) / (1.0 - q))
 
     def _spatial_mean(self, surprise_hw: Tensor) -> Tensor:
+        """Local max-pool so sparse motion peaks dilate and connect."""
         k = self.spatial_kernel
         if k == 1:
             return surprise_hw
         pad = k // 2
         x = surprise_hw.unsqueeze(0).unsqueeze(0)
-        return F.avg_pool2d(x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
+        return F.max_pool2d(x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
 
     def _step(
         self,
