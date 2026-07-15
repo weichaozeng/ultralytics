@@ -63,25 +63,25 @@ def taus_from_presets(
 
 
 class HIRE(nn.Module):
-    """I^f / I^s rate estimator with age-based output mix and hard I^s reset.
+    """I^f / I^s rate estimator with hold+exp output mix and hard I^s reset.
 
     Roles (per bin)::
 
         I^f  — fast probe (always EMA)
-        I^s  — slow bank: normal EMA; hard ``I^s←I^f`` when spatially-avg S exceeds θ_on
-        I_out — mix by slow age ``n_s`` (surprise S does **not** soft-mix)
+        I^s  — slow bank: normal EMA; hard ``I^s←I^f`` when max-pooled S exceeds θ_on
+        I_out — hold full I^f for H bins after reset, then exp-decay toward I^s
 
     Formulas::
 
         β_f = max(1/n_f, 1-α_f),   I^f ← (1-β_f) I^f + β_f x
         β_s = max(1/n_s, 1-α_s),   I^s ← (1-β_s) I^s + β_s x
         S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
-        λ   = n_s / (n_s + κ);  I_out = λ I^s + (1-λ) I^f
         S̄  = max_pool_k(S);  enter if S̄>θ_on; leave if S̄<θ_off
-        at c==C_min: I^s←I^f, n_s←W_f (match fast age), S←0 (+ short cooldown)
+        at c==C_min: I^s←I^f, n_s←W_f, S←0, t_mix←0 (+ short cooldown)
+        t_mix ← t_mix+1 (else);  g=1 if t_mix<H else exp(-(t_mix-H)/τ)
+        I_out = (1-g) I^s + g I^f
 
-    with ``α_* = exp(-1/W_*)`` from ``*_bins`` (unless ``tau_*>0`` ZOH override).
-    ``κ = mix_kappa`` (config ``hire_mix_kappa``).
+    ``H = mix_hold_bins`` (≤0 → ``subsampling`` / chunk_size), ``τ = mix_bins``.
     """
 
     def __init__(
@@ -96,8 +96,10 @@ class HIRE(nn.Module):
         tau_fast: float | None = None,
         tau_slow: float | None = None,
         tau_surprise: float | None = None,
-        mix_kappa: float = 16.0,
-        gate_theta: float | None = None,  # legacy alias → mix_kappa
+        mix_hold_bins: int = 0,
+        mix_bins: float = 16.0,
+        mix_kappa: float | None = None,  # legacy → mix_bins
+        gate_theta: float | None = None,  # legacy → mix_bins
         theta_on: float = 0.15,
         theta_off: float = 0.06,
         confirm_bins: int = 1,
@@ -120,10 +122,17 @@ class HIRE(nn.Module):
         self.fast_bins = max(int(fast_bins), 1)
         self.slow_bins = max(int(slow_bins), 1)
         self.surprise_bins = max(int(surprise_bins), 1)
-        kappa = float(mix_kappa if gate_theta is None else gate_theta)
-        if kappa <= 0.0:
-            raise ValueError(f"mix_kappa must be > 0, got {kappa}")
-        self.mix_kappa = kappa
+        self.mix_hold_bins = int(mix_hold_bins)
+        tau_mix = mix_bins
+        if mix_kappa is not None:
+            tau_mix = mix_kappa
+        if gate_theta is not None:
+            tau_mix = gate_theta
+        self.mix_bins = float(tau_mix)
+        if self.mix_bins <= 0.0:
+            raise ValueError(f"mix_bins must be > 0, got {self.mix_bins}")
+        # Back-compat attribute used by older logs/vis.
+        self.mix_kappa = self.mix_bins
         self.theta_on = float(theta_on)
         self.theta_off = float(theta_off)
         if not (self.theta_on > self.theta_off > 0.0):
@@ -156,14 +165,21 @@ class HIRE(nn.Module):
         self.in_change: Tensor | None = None
         self.confirm_count: Tensor | None = None
         self.cooldown: Tensor | None = None
+        self.t_mix: Tensor | None = None
         self.w_slow: Tensor | None = None
+
+    def effective_mix_hold_bins(self) -> int:
+        """Hold length H; ``mix_hold_bins<=0`` means use ``subsampling`` (chunk_size)."""
+        h = int(self.mix_hold_bins)
+        return int(self.subsampling) if h <= 0 else h
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(fs={self.sample_rate_hz:g}, "
             f"W_f/s/S={self.fast_bins}/{self.slow_bins}/{self.surprise_bins}, "
             f"α_f/s/S={self.alpha_fast:.4f}/{self.alpha_slow:.4f}/{self.alpha_surprise:.4f}, "
-            f"mix_kappa={self.mix_kappa:g}, theta_on/off={self.theta_on:g}/{self.theta_off:g}, "
+            f"mix_hold={self.effective_mix_hold_bins()} mix_τ={self.mix_bins:g}, "
+            f"theta_on/off={self.theta_on:g}/{self.theta_off:g}, "
             f"confirm={self.confirm_bins}, cooldown={self.cooldown_bins}, "
             f"subsampling={self.subsampling})"
         )
@@ -212,6 +228,7 @@ class HIRE(nn.Module):
         self.in_change = None
         self.confirm_count = None
         self.cooldown = None
+        self.t_mix = None
         self.w_slow = None
 
     def reset(self) -> None:
@@ -240,9 +257,12 @@ class HIRE(nn.Module):
             "hire_fast_bins": "fast_bins",
             "hire_slow_bins": "slow_bins",
             "hire_surprise_bins": "surprise_bins",
-            "hire_mix_kappa": "mix_kappa",
-            "hire_gate_theta": "mix_kappa",  # legacy
-            "gate_theta": "mix_kappa",  # legacy
+            "hire_mix_hold_bins": "mix_hold_bins",
+            "hire_mix_bins": "mix_bins",
+            "hire_mix_kappa": "mix_bins",  # legacy → τ
+            "hire_gate_theta": "mix_bins",  # legacy
+            "mix_kappa": "mix_bins",  # legacy
+            "gate_theta": "mix_bins",  # legacy
             "hire_theta_on": "theta_on",
             "hire_theta_off": "theta_off",
             "hire_confirm_bins": "confirm_bins",
@@ -282,11 +302,14 @@ class HIRE(nn.Module):
                 setattr(self, bins_key, max(int(normalized[bins_key]), 1))
                 preset_changed = True
 
-        if "mix_kappa" in normalized:
-            kappa = float(normalized["mix_kappa"])
-            if kappa <= 0.0:
-                raise ValueError(f"mix_kappa must be > 0, got {kappa}")
-            self.mix_kappa = kappa
+        if "mix_hold_bins" in normalized:
+            self.mix_hold_bins = int(normalized["mix_hold_bins"])
+        if "mix_bins" in normalized:
+            tau = float(normalized["mix_bins"])
+            if tau <= 0.0:
+                raise ValueError(f"mix_bins must be > 0, got {tau}")
+            self.mix_bins = tau
+            self.mix_kappa = tau
 
         if "theta_on" in normalized:
             self.theta_on = float(normalized["theta_on"])
@@ -362,44 +385,45 @@ class HIRE(nn.Module):
         in_change: Tensor,
         confirm_count: Tensor,
         cooldown: Tensor,
+        t_mix: Tensor,
     ) -> tuple[Tensor, ...]:
         """One-bin HIRE update.
 
         Returns
         ``(i_fast, i_slow, n_fast, n_slow, s_tilde, in_change, confirm_count,
-          cooldown, i_out, w_slow, s_raw, s_spat, did_reset)``.
+          cooldown, t_mix, i_out, w_slow, g_fast, s_raw, s_spat, did_reset)``.
         """
         eps = self.eps
-        kappa = self.mix_kappa
         c_min = self.confirm_bins
         t_cd = float(self.cooldown_bins)
         n_f_max = float(self.fast_bins)
         n_s_max = float(self.slow_bins)
+        hold_h = float(self.effective_mix_hold_bins())
+        tau_mix = float(self.mix_bins)
 
         # --- fast always updates ---
         beta_f = torch.maximum(1.0 / n_fast, xt.new_tensor(self.beta_fast_floor))
         i_fast = (1.0 - beta_f) * i_fast + beta_f * xt
         n_fast = torch.minimum(n_fast + 1.0, xt.new_tensor(n_f_max))
 
-        # --- slow bank: normal EMA only (no soft mix with I^f) ---
+        # --- slow bank: normal EMA only ---
         beta_s = torch.maximum(1.0 / n_slow, xt.new_tensor(self.beta_slow_floor))
         i_slow = (1.0 - beta_s) * i_slow + beta_s * xt
         n_slow = torch.minimum(n_slow + 1.0, xt.new_tensor(n_s_max))
 
-        # --- evidence (S only for hard reset; no soft mix) ---
+        # --- evidence (S only for hard reset) ---
         s_raw = self._bernoulli_kl(i_fast, i_slow, eps)
-        s_spat = s_raw  # debug alias; spatial avg is reserved for change gating
+        s_spat = s_raw
         a_s = self.alpha_surprise
         s_tilde = a_s * s_tilde + (1.0 - a_s) * s_spat
 
-        # --- hysteresis on spatially max-pooled S: dilate peaks, connect motion blobs ---
+        # --- hysteresis on max-pooled S ---
         s_chg = self._spatial_mean(s_tilde)
         enter = s_chg > self.theta_on
         leave = s_chg < self.theta_off
         in_change = torch.where(enter, xt.new_ones(xt.shape), in_change)
         in_change = torch.where(leave, xt.new_zeros(xt.shape), in_change)
 
-        # confirm_bins=1 => reset on the first bin that enters change (fast path).
         confirm_count = torch.where(in_change > 0.5, confirm_count + 1.0, xt.new_zeros(xt.shape))
         can_reset = (
             (in_change > 0.5)
@@ -407,11 +431,8 @@ class HIRE(nn.Module):
             & (confirm_count >= float(c_min) - 1e-6)
             & (confirm_count < float(c_min) + 1.0 - 1e-6)
         )
-        # Inherit platform + match mature fast age so next-step β_s≈β_f (avoid
-        # cold-start 1/n_s=1 while n_f≈W_f ⇒ spurious KL / re-reset loop).
         i_slow = torch.where(can_reset, i_fast, i_slow)
         n_slow = torch.where(can_reset, xt.new_full(xt.shape, n_f_max), n_slow)
-        # Drop surprise / change latch so residual S cannot immediately re-enter.
         s_tilde = torch.where(can_reset, xt.new_zeros(xt.shape), s_tilde)
         in_change = torch.where(can_reset, xt.new_zeros(xt.shape), in_change)
         confirm_count = torch.where(can_reset, xt.new_zeros(xt.shape), confirm_count)
@@ -419,9 +440,17 @@ class HIRE(nn.Module):
             cooldown = torch.where(can_reset, xt.new_full(xt.shape, t_cd), cooldown)
         cooldown = torch.clamp(cooldown - 1.0, min=0.0)
 
-        # --- age mix after possible reset: λ=n_s/(n_s+κ); large n_s → I_out→I^s ---
-        w_slow = n_slow / (n_slow + kappa)
-        i_out = w_slow * i_slow + (1.0 - w_slow) * i_fast
+        # --- hold+exp mix age (independent of n_s) ---
+        t_mix = torch.where(can_reset, xt.new_zeros(xt.shape), t_mix + 1.0)
+        # g=1 for t<H (full I^f); then exp(-(t-H)/τ) toward I^s
+        over = torch.clamp(t_mix - hold_h, min=0.0)
+        g_fast = torch.where(
+            t_mix < hold_h,
+            xt.new_ones(xt.shape),
+            torch.exp(-over / tau_mix),
+        )
+        w_slow = 1.0 - g_fast
+        i_out = w_slow * i_slow + g_fast * i_fast
 
         did_reset = can_reset.to(dtype=xt.dtype)
         return (
@@ -433,8 +462,10 @@ class HIRE(nn.Module):
             in_change,
             confirm_count,
             cooldown,
+            t_mix,
             i_out,
             w_slow,
+            g_fast,
             s_raw,
             s_spat,
             did_reset,
@@ -471,6 +502,7 @@ class HIRE(nn.Module):
         in_change = self.in_change
         confirm_count = self.confirm_count
         cooldown = self.cooldown
+        t_mix = self.t_mix
         w_slow = self.w_slow
         frames: list[Tensor] = []
 
@@ -482,6 +514,8 @@ class HIRE(nn.Module):
             "s_spat",
             "s_tilde",
             "w_slow",
+            "g_fast",
+            "t_mix",
             "n_slow",
             "n_fast",
             "in_change",
@@ -490,6 +524,9 @@ class HIRE(nn.Module):
             "did_reset",
         )
         dbg_lists: dict[str, list[Tensor]] = {k: [] for k in dbg_keys} if record_debug else {}
+
+        # Large age ⇒ g≈0 (full slow) until the first hard reset.
+        t_mix_init = float(max(self.effective_mix_hold_bins(), 1) + 10.0 * self.mix_bins)
 
         for t0 in range(0, t_raw, self.subsampling):
             t1 = min(t_raw, t0 + self.subsampling)
@@ -504,7 +541,9 @@ class HIRE(nn.Module):
                     in_change = xt.new_zeros(xt.shape)
                     confirm_count = xt.new_zeros(xt.shape)
                     cooldown = xt.new_zeros(xt.shape)
-                    w_slow = n_slow / (n_slow + self.mix_kappa)
+                    t_mix = xt.new_full(xt.shape, t_mix_init)
+                    g_fast = xt.new_zeros(xt.shape)
+                    w_slow = xt.new_ones(xt.shape)
                     s_raw = xt.new_zeros(xt.shape)
                     s_spat = xt.new_zeros(xt.shape)
                     i_out = i_slow
@@ -519,8 +558,10 @@ class HIRE(nn.Module):
                         in_change,
                         confirm_count,
                         cooldown,
+                        t_mix,
                         i_out,
                         w_slow,
+                        g_fast,
                         s_raw,
                         s_spat,
                         did_reset,
@@ -534,6 +575,7 @@ class HIRE(nn.Module):
                         in_change,
                         confirm_count,
                         cooldown,
+                        t_mix,
                     )
                 if record_debug:
                     dbg_lists["i_fast"].append(i_fast)
@@ -543,6 +585,8 @@ class HIRE(nn.Module):
                     dbg_lists["s_spat"].append(s_spat)
                     dbg_lists["s_tilde"].append(s_tilde)
                     dbg_lists["w_slow"].append(w_slow)
+                    dbg_lists["g_fast"].append(g_fast)
+                    dbg_lists["t_mix"].append(t_mix)
                     dbg_lists["n_slow"].append(n_slow)
                     dbg_lists["n_fast"].append(n_fast)
                     dbg_lists["in_change"].append(in_change)
@@ -559,6 +603,7 @@ class HIRE(nn.Module):
         self.in_change = None if in_change is None else in_change.detach()
         self.confirm_count = None if confirm_count is None else confirm_count.detach()
         self.cooldown = None if cooldown is None else cooldown.detach()
+        self.t_mix = None if t_mix is None else t_mix.detach()
         self.w_slow = None if w_slow is None else w_slow.detach()
 
         recons_prenorm = torch.cat(frames, dim=-1)
@@ -574,7 +619,7 @@ class HIRE(nn.Module):
             debug[f"{key}_last"] = vol[..., -1]
             debug[f"{key}_peak"] = vol.amax(dim=-1)
             debug[f"{key}_mean"] = vol.mean(dim=-1)
-        debug["w_fast_last"] = (1.0 - debug["w_slow_last"]).clamp(0.0, 1.0)
+        debug["w_fast_last"] = debug["g_fast_last"]
         # Chunk summaries: any hard reset / min age over the processed volume.
         debug["reset_any"] = debug["did_reset_peak"]
         debug["n_slow_min"] = debug["n_slow_hwt"].amin(dim=-1)
@@ -662,7 +707,7 @@ class HIREFrame(HIRE):
         if self.w_slow is None:
             conf_hw = photon_cube.new_ones(photon_cube.shape[0], photon_cube.shape[1], dtype=torch.float32)
         else:
-            # High when slow bank is young (post-reset / cold-start).
+            # High when recently reset (prefer I^f).
             conf_hw = (1.0 - self.w_slow.float()).clamp(0.0, 1.0)
         confidence = self._confidence_to_frame_space(conf_hw).to(device=frame.device, dtype=frame.dtype)
         return frame, confidence

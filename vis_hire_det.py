@@ -318,11 +318,13 @@ def _save_visuals(
         "n_slow": n_last,
         "n_slow_min": n_min,
         "w_slow": _np(debug["w_slow_last"]),
-        "w_fast": _np(debug["w_fast_last"]),
+        "g_fast": _np(debug["g_fast_last"]),
+        "t_mix": _np(debug["t_mix_last"]),
         # reset footprint over this chunk (not last-bin latch)
         "reset_any": reset_any,
         "cooldown": _np(debug["cooldown_last"]),
         "young": (n_last <= w_f + 0.5).astype(np.float32),
+        "holding": (_np(debug["t_mix_last"]) < float(hire.effective_mix_hold_bins())).astype(np.float32),
     }
 
     s_vmax = _resolve_vmax(s_tilde_hwt, fixed_vmax=score_vmax, percentile=score_percentile)
@@ -336,9 +338,10 @@ def _save_visuals(
             panel = _panel_from_map(
                 score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=s_vmax
             )
-        elif label in {"n_slow", "n_slow_min"}:
+        elif label in {"n_slow", "n_slow_min", "t_mix"}:
+            vmax = n_vmax if label.startswith("n_") else max(float(hire.effective_mix_hold_bins()) + 3.0 * float(hire.mix_bins), float(np.percentile(score_map, 99.5)), 1.0)
             panel = _panel_from_map(
-                score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=n_vmax
+                score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=vmax
             )
         elif label == "cooldown":
             panel = _panel_from_map(
@@ -396,6 +399,24 @@ def _save_visuals(
             label_prefix="w_slow",
             mode="gray",
             vmax=1.0,
+            max_slices=temporal_slices,
+        ),
+        _temporal_strip(
+            _np(debug["g_fast_hwt"]),
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="g_fast",
+            mode="gray",
+            vmax=1.0,
+            max_slices=temporal_slices,
+        ),
+        _temporal_strip(
+            _np(debug["t_mix_hwt"]),
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="t_mix",
+            mode="heatmap",
+            vmax=max(float(hire.effective_mix_hold_bins()) + 3.0 * float(hire.mix_bins), 1.0),
             max_slices=temporal_slices,
         ),
         _temporal_strip(
@@ -459,19 +480,23 @@ def _save_visuals(
                 _panel_from_map(maps["i_fast"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
                 _panel_from_map(maps["i_slow"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
                 _panel_from_map(maps["n_slow"], display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=n_vmax),
-                _panel_from_map(maps["w_slow"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
+                _panel_from_map(maps["g_fast"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
+                _panel_from_map(maps["holding"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
                 _panel_from_map(maps["reset_any"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
                 _panel_from_map(maps["young"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
             ],
-            ["sum", "hire", "i_fast", "i_slow", "n_slow", "w_slow", "reset_any", "young"],
+            ["sum", "hire", "i_fast", "i_slow", "n_slow", "g_fast", "holding", "reset_any", "young"],
         ),
     )
 
     if not write_stats:
         return
 
-    w_from_n = maps["n_slow"] / (maps["n_slow"] + float(hire.mix_kappa))
-    w_err = np.abs(w_from_n - maps["w_slow"])
+    hold_h = float(hire.effective_mix_hold_bins())
+    tau_m = float(hire.mix_bins)
+    t_m = maps["t_mix"]
+    g_from_t = np.where(t_m < hold_h, 1.0, np.exp(-np.maximum(t_m - hold_h, 0.0) / tau_m))
+    g_err = np.abs(g_from_t.astype(np.float64) - maps["g_fast"].astype(np.float64))
 
     stats_lines = [
         f"stem={stem}",
@@ -479,7 +504,8 @@ def _save_visuals(
             f"fs={hire.sample_rate_hz:g} ref={hire.ref_rate_hz:g} "
             f"bins={hire.fast_bins}/{hire.slow_bins}/{hire.surprise_bins} "
             f"tau={hire.tau_fast:g}/{hire.tau_slow:g}/{hire.tau_surprise:g} "
-            f"mix_kappa={hire.mix_kappa:g} theta_on/off={hire.theta_on:g}/{hire.theta_off:g} "
+            f"mix_hold={hire.effective_mix_hold_bins()} mix_τ={hire.mix_bins:g} "
+            f"theta_on/off={hire.theta_on:g}/{hire.theta_off:g} "
             f"confirm={hire.confirm_bins} cooldown={hire.cooldown_bins} "
             f"spatial_kernel={hire.spatial_kernel} normalize={hire.normalize} quantile={hire.quantile:g}"
         ),
@@ -488,11 +514,11 @@ def _save_visuals(
             f"alpha_surprise={hire.alpha_surprise:.6f}"
         ),
         f"s_tilde_vmax={s_vmax:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
-        "Pipeline: I^f/I^s → BernKL → S EMA → max-pool gate → hard I^s←I^f (n_s←W_f,S←0) → I_out=λ(n_s)",
-        f"w_slow_from_n_abs_err_max={float(w_err.max()):.8f} mean={float(w_err.mean()):.8f}",
+        "Pipeline: I^f/I^s → BernKL → S EMA → max-pool gate → hard reset → I_out hold+exp(g)",
+        f"g_fast_from_t_abs_err_max={float(g_err.max()):.8f} mean={float(g_err.mean()):.8f}",
         (
-            f"reset_any_frac={float(reset_any.mean()):.6f} "
-            f"n_slow_mean={float(n_last.mean()):.3f} n_slow_min_mean={float(n_min.mean()):.3f}"
+            f"reset_any_frac={float(reset_any.mean()):.6f} holding_frac={float(maps['holding'].mean()):.6f} "
+            f"n_slow_mean={float(n_last.mean()):.3f} g_fast_mean={float(maps['g_fast'].mean()):.4f}"
         ),
         "",
     ]
@@ -532,7 +558,18 @@ def main() -> None:
     ap.add_argument("--hire_tau_fast", type=float, default=0.0)
     ap.add_argument("--hire_tau_slow", type=float, default=0.0)
     ap.add_argument("--hire_tau_surprise", type=float, default=0.0)
-    ap.add_argument("--hire_mix_kappa", type=float, default=16.0, help="κ in λ=n_s/(n_s+κ) for I_out")
+    ap.add_argument(
+        "--hire_mix_hold_bins",
+        type=int,
+        default=0,
+        help="Hold full I^f for H bins after reset; <=0 => chunk_size",
+    )
+    ap.add_argument(
+        "--hire_mix_bins",
+        type=float,
+        default=16.0,
+        help="τ after hold: g=exp(-(t-H)/τ) toward I^s",
+    )
     ap.add_argument("--hire_theta_on", type=float, default=0.15)
     ap.add_argument("--hire_theta_off", type=float, default=0.06)
     ap.add_argument("--hire_confirm_bins", type=int, default=1)
@@ -579,7 +616,8 @@ def main() -> None:
         tau_fast=_tau_or_none(args.hire_tau_fast),
         tau_slow=_tau_or_none(args.hire_tau_slow),
         tau_surprise=_tau_or_none(args.hire_tau_surprise),
-        mix_kappa=float(args.hire_mix_kappa),
+        mix_hold_bins=int(args.hire_mix_hold_bins),
+        mix_bins=float(args.hire_mix_bins),
         theta_on=float(args.hire_theta_on),
         theta_off=float(args.hire_theta_off),
         confirm_bins=int(args.hire_confirm_bins),

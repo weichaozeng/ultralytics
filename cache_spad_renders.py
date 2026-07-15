@@ -93,7 +93,8 @@ def parse_args():
     ap.add_argument("--hire-tau-fast", type=float, default=0.0)
     ap.add_argument("--hire-tau-slow", type=float, default=0.0)
     ap.add_argument("--hire-tau-surprise", type=float, default=0.0)
-    ap.add_argument("--hire-mix-kappa", type=float, default=16.0)
+    ap.add_argument("--hire-mix-hold-bins", type=int, default=0)
+    ap.add_argument("--hire-mix-bins", type=float, default=16.0)
     ap.add_argument("--hire-theta-on", type=float, default=0.15)
     ap.add_argument("--hire-theta-off", type=float, default=0.06)
     ap.add_argument("--hire-confirm-bins", type=int, default=1)
@@ -179,7 +180,8 @@ def _build_preprocessor_kwargs(args) -> dict[str, Any]:
             "tau_fast": _tau_or_none(args.hire_tau_fast),
             "tau_slow": _tau_or_none(args.hire_tau_slow),
             "tau_surprise": _tau_or_none(args.hire_tau_surprise),
-            "mix_kappa": float(args.hire_mix_kappa),
+            "mix_hold_bins": int(args.hire_mix_hold_bins),
+            "mix_bins": float(args.hire_mix_bins),
             "theta_on": float(args.hire_theta_on),
             "theta_off": float(args.hire_theta_off),
             "confirm_bins": int(args.hire_confirm_bins),

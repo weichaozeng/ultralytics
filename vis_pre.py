@@ -140,7 +140,18 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--hire_tau_fast", type=float, default=0.0)
     ap.add_argument("--hire_tau_slow", type=float, default=0.0)
     ap.add_argument("--hire_tau_surprise", type=float, default=0.0)
-    ap.add_argument("--hire_mix_kappa", type=float, default=16.0, help="κ in λ=n_s/(n_s+κ) for I_out")
+    ap.add_argument(
+        "--hire_mix_hold_bins",
+        type=int,
+        default=0,
+        help="Hold full I^f for H bins after reset; <=0 => chunk_size",
+    )
+    ap.add_argument(
+        "--hire_mix_bins",
+        type=float,
+        default=16.0,
+        help="τ after hold: g=exp(-(t-H)/τ) toward I^s",
+    )
     ap.add_argument("--hire_theta_on", type=float, default=0.15)
     ap.add_argument("--hire_theta_off", type=float, default=0.06)
     ap.add_argument("--hire_confirm_bins", type=int, default=1)
@@ -396,7 +407,8 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             tau_fast=_tau_or_none(args.hire_tau_fast),
             tau_slow=_tau_or_none(args.hire_tau_slow),
             tau_surprise=_tau_or_none(args.hire_tau_surprise),
-            mix_kappa=float(args.hire_mix_kappa),
+            mix_hold_bins=int(args.hire_mix_hold_bins),
+            mix_bins=float(args.hire_mix_bins),
             theta_on=float(args.hire_theta_on),
             theta_off=float(args.hire_theta_off),
             confirm_bins=int(args.hire_confirm_bins),
@@ -804,7 +816,7 @@ def main() -> None:
             f"hire: bin_rate_hz={float(args.bin_rate_hz):g} "
             f"ref_rate_hz={float(args.hire_ref_rate_hz):g} "
             f"bins={int(args.hire_fast_bins)}/{int(args.hire_slow_bins)}/{int(args.hire_surprise_bins)} "
-            f"mix_kappa={float(args.hire_mix_kappa):g} "
+            f"mix_hold={int(args.hire_mix_hold_bins)}(0=chunk) mix_τ={float(args.hire_mix_bins):g} "
             f"theta_on/off={float(args.hire_theta_on):g}/{float(args.hire_theta_off):g} "
             f"confirm={int(args.hire_confirm_bins)} cooldown={int(args.hire_cooldown_bins)}"
         )
