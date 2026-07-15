@@ -97,7 +97,7 @@ def parse_args():
     ap.add_argument("--hire-theta-on", type=float, default=0.15)
     ap.add_argument("--hire-theta-off", type=float, default=0.06)
     ap.add_argument("--hire-confirm-bins", type=int, default=1)
-    ap.add_argument("--hire-cooldown-bins", type=int, default=8)
+    ap.add_argument("--hire-cooldown-bins", type=int, default=3)
     ap.add_argument("--hire-spatial-kernel", type=int, default=3)
     ap.add_argument("--sum-normalize", type=str, default="true")
     ap.add_argument("--sum-quantile", type=float, default=1.0)

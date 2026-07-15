@@ -265,7 +265,7 @@ class SpadPoseSequenceTrainer(PoseTrainer):
                 "theta_on": float(getattr(self.args, "hire_theta_on", 0.15)),
                 "theta_off": float(getattr(self.args, "hire_theta_off", 0.06)),
                 "confirm_bins": int(getattr(self.args, "hire_confirm_bins", 1)),
-                "cooldown_bins": int(getattr(self.args, "hire_cooldown_bins", 8)),
+                "cooldown_bins": int(getattr(self.args, "hire_cooldown_bins", 3)),
                 "spatial_kernel": int(getattr(self.args, "hire_spatial_kernel", 3)),
                 "normalize": bool(getattr(self.args, "hire_normalize", True)),
                 "quantile": float(getattr(self.args, "hire_quantile", 1.0)),

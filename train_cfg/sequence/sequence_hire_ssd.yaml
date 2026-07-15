@@ -34,7 +34,7 @@ hire_mix_kappa: 16.0
 hire_theta_on: 0.15
 hire_theta_off: 0.06
 hire_confirm_bins: 1
-hire_cooldown_bins: 8
+hire_cooldown_bins: 3
 hire_spatial_kernel: 3
 
 # backbone SSD plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.

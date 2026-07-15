@@ -78,7 +78,7 @@ class HIRE(nn.Module):
         S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
         λ   = n_s / (n_s + κ);  I_out = λ I^s + (1-λ) I^f
         S̄  = avg_pool_k(S);  enter if S̄>θ_on; leave if S̄<θ_off
-        at c==C_min: I^s←I^f, n_s←1 (+ cooldown)
+        at c==C_min: I^s←I^f, n_s←1, S←0 (+ short cooldown)
 
     with ``α_* = exp(-1/W_*)`` from ``*_bins`` (unless ``tau_*>0`` ZOH override).
     ``κ = mix_kappa`` (config ``hire_mix_kappa``).
@@ -101,7 +101,7 @@ class HIRE(nn.Module):
         theta_on: float = 0.15,
         theta_off: float = 0.06,
         confirm_bins: int = 1,
-        cooldown_bins: int = 8,
+        cooldown_bins: int = 3,
         spatial_kernel: int = 3,
         eps: float = 1e-5,
         normalize: bool = False,
@@ -409,6 +409,10 @@ class HIRE(nn.Module):
         )
         i_slow = torch.where(can_reset, i_fast, i_slow)
         n_slow = torch.where(can_reset, xt.new_ones(xt.shape), n_slow)
+        # Drop surprise / change latch so residual S cannot immediately re-enter.
+        s_tilde = torch.where(can_reset, xt.new_zeros(xt.shape), s_tilde)
+        in_change = torch.where(can_reset, xt.new_zeros(xt.shape), in_change)
+        confirm_count = torch.where(can_reset, xt.new_zeros(xt.shape), confirm_count)
         if t_cd > 0.0:
             cooldown = torch.where(can_reset, xt.new_full(xt.shape, t_cd), cooldown)
         cooldown = torch.clamp(cooldown - 1.0, min=0.0)
