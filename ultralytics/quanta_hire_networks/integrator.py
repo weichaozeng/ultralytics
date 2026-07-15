@@ -75,10 +75,10 @@ class HIRE(nn.Module):
 
         β_f = max(1/n_f, 1-α_f),   I^f ← (1-β_f) I^f + β_f x
         β_s = max(1/n_s, 1-α_s),   I^s ← (1-β_s) I^s + β_s x     # always
-        S   ← α_S S + (1-α_S) spat(BernKL(I^f || I^s))
-        w   = max(S/(S+θ), spat/(spat+θ))
-        I_out = (1-w) I^s + w I^f
-        enter if S>θ_on; leave if S<θ_off; at c==C_min: I^s←I^f, n_s←1 (+ cooldown)
+        S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
+        w   = max(S/(S+θ), raw/(raw+θ));  I_out = (1-w) I^s + w I^f
+        S̄  = avg_pool_k(S);  enter if S̄>θ_on; leave if S̄<θ_off
+        at c==C_min: I^s←I^f, n_s←1 (+ cooldown)
 
     with ``α_* = exp(-1/W_*)`` from ``*_bins`` (unless ``tau_*>0`` ZOH override).
     """
@@ -338,13 +338,13 @@ class HIRE(nn.Module):
         return p * torch.log(p / q) + (1.0 - p) * torch.log((1.0 - p) / (1.0 - q))
 
     def _spatial_mean(self, surprise_hw: Tensor) -> Tensor:
-        """Local max-pool so sparse motion peaks dilate and connect."""
+        """Local average pool (used on S before in_change thresholds)."""
         k = self.spatial_kernel
         if k == 1:
             return surprise_hw
         pad = k // 2
         x = surprise_hw.unsqueeze(0).unsqueeze(0)
-        return F.max_pool2d(x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
+        return F.avg_pool2d(x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
 
     def _step(
         self,
@@ -381,9 +381,9 @@ class HIRE(nn.Module):
         i_slow = (1.0 - beta_s) * i_slow + beta_s * xt
         n_slow = torch.minimum(n_slow + 1.0, xt.new_tensor(n_s_max))
 
-        # --- evidence ---
+        # --- evidence (no spatial pool here; soft mix stays pixel-local) ---
         s_raw = self._bernoulli_kl(i_fast, i_slow, eps)
-        s_spat = self._spatial_mean(s_raw)
+        s_spat = s_raw  # debug alias; spatial avg is reserved for change gating
         a_s = self.alpha_surprise
         s_tilde = a_s * s_tilde + (1.0 - a_s) * s_spat
 
@@ -393,13 +393,14 @@ class HIRE(nn.Module):
         w = torch.maximum(w_s, w_spat)
         i_out = (1.0 - w) * i_slow + w * i_fast
 
-        # --- hysteresis: hard I^s←I^f once S stays above θ_on for confirm_bins ---
-        # confirm_bins=1 => reset on the first bin that enters change (fast path).
-        enter = s_tilde > self.theta_on
-        leave = s_tilde < self.theta_off
+        # --- hysteresis on spatially averaged S: kill shot-noise resets, keep blobs ---
+        s_chg = self._spatial_mean(s_tilde)
+        enter = s_chg > self.theta_on
+        leave = s_chg < self.theta_off
         in_change = torch.where(enter, xt.new_ones(xt.shape), in_change)
         in_change = torch.where(leave, xt.new_zeros(xt.shape), in_change)
 
+        # confirm_bins=1 => reset on the first bin that enters change (fast path).
         confirm_count = torch.where(in_change > 0.5, confirm_count + 1.0, xt.new_zeros(xt.shape))
         can_reset = (
             (in_change > 0.5)

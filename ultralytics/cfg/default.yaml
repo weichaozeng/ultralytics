@@ -203,7 +203,7 @@ hire_theta_on: 0.15 # (float) enter change if S>θ_on → hard I^s←I^f after c
 hire_theta_off: 0.06 # (float) leave change if S<θ_off
 hire_confirm_bins: 1 # (int) bins in-change before hard I^s reset (1 = immediate)
 hire_cooldown_bins: 8 # (int) bins after reset that block another hard inheritance
-hire_spatial_kernel: 3 # (int) odd spatial max-pool on KL (dilate/connect motion)
+hire_spatial_kernel: 3 # (int) odd avg-pool on S before in_change / hard-reset thresholds
 hire_normalize: True
 hire_quantile: 1.0
 ssd_state_dim: 20 # (int) latent state dimension for SSD temporal blocks
