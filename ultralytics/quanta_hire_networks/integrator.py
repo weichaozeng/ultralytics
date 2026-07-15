@@ -77,7 +77,7 @@ class HIRE(nn.Module):
         β_s = max(1/n_s, 1-α_s),   I^s ← (1-β_s) I^s + β_s x
         S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
         λ   = n_s / (n_s + κ);  I_out = λ I^s + (1-λ) I^f
-        S̄  = avg_pool_k(S);  enter if S̄>θ_on; leave if S̄<θ_off
+        S̄  = max_pool_k(S);  enter if S̄>θ_on; leave if S̄<θ_off
         at c==C_min: I^s←I^f, n_s←W_f (match fast age), S←0 (+ short cooldown)
 
     with ``α_* = exp(-1/W_*)`` from ``*_bins`` (unless ``tau_*>0`` ZOH override).
@@ -343,13 +343,13 @@ class HIRE(nn.Module):
         return p * torch.log(p / q) + (1.0 - p) * torch.log((1.0 - p) / (1.0 - q))
 
     def _spatial_mean(self, surprise_hw: Tensor) -> Tensor:
-        """Local average pool (used on S before in_change thresholds)."""
+        """Local max-pool on S before in_change thresholds (connect motion blobs)."""
         k = self.spatial_kernel
         if k == 1:
             return surprise_hw
         pad = k // 2
         x = surprise_hw.unsqueeze(0).unsqueeze(0)
-        return F.avg_pool2d(x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
+        return F.max_pool2d(x, kernel_size=k, stride=1, padding=pad).squeeze(0).squeeze(0)
 
     def _step(
         self,
@@ -367,7 +367,7 @@ class HIRE(nn.Module):
 
         Returns
         ``(i_fast, i_slow, n_fast, n_slow, s_tilde, in_change, confirm_count,
-          cooldown, i_out, w_slow, s_raw, s_spat)``.
+          cooldown, i_out, w_slow, s_raw, s_spat, did_reset)``.
         """
         eps = self.eps
         kappa = self.mix_kappa
@@ -392,7 +392,7 @@ class HIRE(nn.Module):
         a_s = self.alpha_surprise
         s_tilde = a_s * s_tilde + (1.0 - a_s) * s_spat
 
-        # --- hysteresis on spatially averaged S: kill shot-noise resets, keep blobs ---
+        # --- hysteresis on spatially max-pooled S: dilate peaks, connect motion blobs ---
         s_chg = self._spatial_mean(s_tilde)
         enter = s_chg > self.theta_on
         leave = s_chg < self.theta_off
@@ -423,6 +423,7 @@ class HIRE(nn.Module):
         w_slow = n_slow / (n_slow + kappa)
         i_out = w_slow * i_slow + (1.0 - w_slow) * i_fast
 
+        did_reset = can_reset.to(dtype=xt.dtype)
         return (
             i_fast,
             i_slow,
@@ -436,6 +437,7 @@ class HIRE(nn.Module):
             w_slow,
             s_raw,
             s_spat,
+            did_reset,
         )
 
     def _update_causal(self, photon_cube: Tensor, *, clear_states: bool) -> Tensor:
@@ -485,6 +487,7 @@ class HIRE(nn.Module):
             "in_change",
             "confirm",
             "cooldown",
+            "did_reset",
         )
         dbg_lists: dict[str, list[Tensor]] = {k: [] for k in dbg_keys} if record_debug else {}
 
@@ -505,6 +508,7 @@ class HIRE(nn.Module):
                     s_raw = xt.new_zeros(xt.shape)
                     s_spat = xt.new_zeros(xt.shape)
                     i_out = i_slow
+                    did_reset = xt.new_zeros(xt.shape)
                 else:
                     (
                         i_fast,
@@ -519,6 +523,7 @@ class HIRE(nn.Module):
                         w_slow,
                         s_raw,
                         s_spat,
+                        did_reset,
                     ) = self._step(
                         xt,
                         i_fast,
@@ -543,6 +548,7 @@ class HIRE(nn.Module):
                     dbg_lists["in_change"].append(in_change)
                     dbg_lists["confirm"].append(confirm_count)
                     dbg_lists["cooldown"].append(cooldown)
+                    dbg_lists["did_reset"].append(did_reset)
             frames.append(i_out.unsqueeze(-1))
 
         self.i_fast = None if i_fast is None else i_fast.detach()
@@ -569,6 +575,9 @@ class HIRE(nn.Module):
             debug[f"{key}_peak"] = vol.amax(dim=-1)
             debug[f"{key}_mean"] = vol.mean(dim=-1)
         debug["w_fast_last"] = (1.0 - debug["w_slow_last"]).clamp(0.0, 1.0)
+        # Chunk summaries: any hard reset / min age over the processed volume.
+        debug["reset_any"] = debug["did_reset_peak"]
+        debug["n_slow_min"] = debug["n_slow_hwt"].amin(dim=-1)
         # Back-compat aliases for older vis scripts.
         debug["gate_last"] = debug["w_slow_last"]
         debug["gate_hwt"] = debug["w_slow_hwt"]

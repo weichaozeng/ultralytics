@@ -1,12 +1,12 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Visualize HIRE v0.3 (I^f / I^s + hysteresis change-point) intermediates.
+"""Visualize HIRE (I^f / I^s + hard reset) intermediates.
 
 Writes per-chunk outputs under ``{save_dir}/{sample}/videoXXXXX/``:
 
-- ``{stem}_hire_stats.txt`` — percentile summary (only with ``--write_stats``; slow)
-- ``{stem}_hire_compare.png`` — sum / hire / i_fast / i_slow / in_change
-- ``{stem}_hire_scores.png`` — last-frame maps
-- ``{stem}_hire_temporal.png`` — evenly spaced time slices of key volumes
+- ``{stem}_hire_compare.png`` — sum / hire / ages / reset footprint
+- ``{stem}_hire_scores.png`` — last-bin maps (n_slow, w_slow, S, …)
+- ``{stem}_hire_temporal.png`` — time slices of key volumes
+- ``{stem}_hire_stats.txt`` — optional percentile summary (``--write_stats``)
 
 Example
 -------
@@ -297,26 +297,37 @@ def _save_visuals(
     i_fast_hwt = _np(debug["i_fast_hwt"])
     i_slow_hwt = _np(debug["i_slow_hwt"])
     i_out_hwt = _np(debug["i_out_hwt"])
-    in_change_hwt = _np(debug["in_change_hwt"])
     n_slow_hwt = _np(debug["n_slow_hwt"])
+    cooldown_hwt = _np(debug["cooldown_hwt"])
+    did_reset_hwt = _np(debug["did_reset_hwt"])
+
+    n_last = _np(debug["n_slow_last"])
+    n_min = _np(debug["n_slow_min"])
+    reset_any = _np(debug["reset_any"])
+    w_f = float(hire.fast_bins)
 
     maps: dict[str, np.ndarray] = {
+        # reconstructions
+        "i_out": _np(debug["i_out_last"]),
         "i_fast": _np(debug["i_fast_last"]),
         "i_slow": _np(debug["i_slow_last"]),
-        "i_out": _np(debug["i_out_last"]),
-        "s_raw": _np(debug["s_raw_last"]),
-        "s_spat": _np(debug["s_spat_last"]),
+        # evidence (absolute scale shared)
         "s_tilde": _np(debug["s_tilde_last"]),
+        "s_raw": _np(debug["s_raw_last"]),
+        # age / mix (most informative post-reset signals)
+        "n_slow": n_last,
+        "n_slow_min": n_min,
         "w_slow": _np(debug["w_slow_last"]),
         "w_fast": _np(debug["w_fast_last"]),
-        "n_slow": _np(debug["n_slow_last"]),
-        "in_change": _np(debug["in_change_last"]),
-        "confirm": _np(debug["confirm_last"]),
+        # reset footprint over this chunk (not last-bin latch)
+        "reset_any": reset_any,
         "cooldown": _np(debug["cooldown_last"]),
+        "young": (n_last <= w_f + 0.5).astype(np.float32),
     }
 
     s_vmax = _resolve_vmax(s_tilde_hwt, fixed_vmax=score_vmax, percentile=score_percentile)
     n_vmax = max(float(hire.slow_bins), float(np.percentile(n_slow_hwt, 99.5)), 1.0)
+    cd_vmax = max(float(hire.cooldown_bins), float(np.max(maps["cooldown"])), 1.0)
 
     score_panels = []
     score_labels = []
@@ -325,14 +336,13 @@ def _save_visuals(
             panel = _panel_from_map(
                 score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=s_vmax
             )
-        elif label == "n_slow":
+        elif label in {"n_slow", "n_slow_min"}:
             panel = _panel_from_map(
                 score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=n_vmax
             )
-        elif label in {"confirm", "cooldown"}:
-            vmax = max(float(np.max(score_map)), 1.0)
+        elif label == "cooldown":
             panel = _panel_from_map(
-                score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=vmax
+                score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=cd_vmax
             )
         else:
             panel = _panel_from_map(
@@ -353,12 +363,30 @@ def _save_visuals(
             max_slices=temporal_slices,
         ),
         _temporal_strip(
-            in_change_hwt,
+            n_slow_hwt,
             display_hw=display_hw,
             cmap_id=cmap_id,
-            label_prefix="in_change",
+            label_prefix="n_slow",
+            mode="heatmap",
+            vmax=n_vmax,
+            max_slices=temporal_slices,
+        ),
+        _temporal_strip(
+            did_reset_hwt,
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="did_reset",
             mode="gray",
             vmax=1.0,
+            max_slices=temporal_slices,
+        ),
+        _temporal_strip(
+            cooldown_hwt,
+            display_hw=display_hw,
+            cmap_id=cmap_id,
+            label_prefix="cooldown",
+            mode="heatmap",
+            vmax=max(float(hire.cooldown_bins), 1.0),
             max_slices=temporal_slices,
         ),
         _temporal_strip(
@@ -371,19 +399,19 @@ def _save_visuals(
             max_slices=temporal_slices,
         ),
         _temporal_strip(
-            i_slow_hwt,
+            i_out_hwt,
             display_hw=display_hw,
             cmap_id=cmap_id,
-            label_prefix="i_slow",
+            label_prefix="i_out",
             mode="gray",
             vmax=1.0,
             max_slices=temporal_slices,
         ),
         _temporal_strip(
-            i_out_hwt,
+            i_slow_hwt,
             display_hw=display_hw,
             cmap_id=cmap_id,
-            label_prefix="i_out",
+            label_prefix="i_slow",
             mode="gray",
             vmax=1.0,
             max_slices=temporal_slices,
@@ -430,9 +458,12 @@ def _save_visuals(
                 recon_bgr,
                 _panel_from_map(maps["i_fast"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
                 _panel_from_map(maps["i_slow"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
-                _panel_from_map(maps["in_change"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
+                _panel_from_map(maps["n_slow"], display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=n_vmax),
+                _panel_from_map(maps["w_slow"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
+                _panel_from_map(maps["reset_any"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
+                _panel_from_map(maps["young"], display_hw=display_hw, cmap_id=cmap_id, mode="gray", vmax=1.0),
             ],
-            ["sum", "hire", "i_fast", "i_slow", "in_change"],
+            ["sum", "hire", "i_fast", "i_slow", "n_slow", "w_slow", "reset_any", "young"],
         ),
     )
 
@@ -457,9 +488,12 @@ def _save_visuals(
             f"alpha_surprise={hire.alpha_surprise:.6f}"
         ),
         f"s_tilde_vmax={s_vmax:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
-        "Pipeline: I^f/I^s → BernKL → S EMA → avg-pool in_change → hard I^s←I^f → I_out=λ(n_s) mix",
+        "Pipeline: I^f/I^s → BernKL → S EMA → max-pool gate → hard I^s←I^f (n_s←W_f,S←0) → I_out=λ(n_s)",
         f"w_slow_from_n_abs_err_max={float(w_err.max()):.8f} mean={float(w_err.mean()):.8f}",
-        f"in_change_mean={float(maps['in_change'].mean()):.6f} n_slow_mean={float(maps['n_slow'].mean()):.3f}",
+        (
+            f"reset_any_frac={float(reset_any.mean()):.6f} "
+            f"n_slow_mean={float(n_last.mean()):.3f} n_slow_min_mean={float(n_min.mean()):.3f}"
+        ),
         "",
     ]
     for label, values in maps.items():
@@ -469,11 +503,12 @@ def _save_visuals(
         "s_raw_hwt": s_raw_hwt,
         "s_tilde_hwt": s_tilde_hwt,
         "w_slow_hwt": w_slow_hwt,
+        "n_slow_hwt": n_slow_hwt,
+        "did_reset_hwt": did_reset_hwt,
+        "cooldown_hwt": cooldown_hwt,
         "i_fast_hwt": i_fast_hwt,
         "i_slow_hwt": i_slow_hwt,
         "i_out_hwt": i_out_hwt,
-        "in_change_hwt": in_change_hwt,
-        "n_slow_hwt": n_slow_hwt,
     }.items():
         stats_lines.extend(_percentile_summary(values, name=label, percentiles=percentiles))
         stats_lines.append("")
