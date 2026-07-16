@@ -505,11 +505,12 @@ def _save_visuals(
             f"fs={hire.sample_rate_hz:g} ref={hire.ref_rate_hz:g} "
             f"bins={hire.fast_bins}/{hire.slow_bins}/{hire.surprise_bins} "
             f"tau={hire.tau_fast:g}/{hire.tau_slow:g}/{hire.tau_surprise:g} "
-            f"mix_hold={hire.effective_mix_hold_bins()} mix_τ={hire.mix_bins:g} mix_θ={hire.mix_theta:g} "
-            f"theta_on/off={hire.theta_on:g}/{hire.theta_off:g} "
+            f"mix_hold={hire.effective_mix_hold_bins()} mix_τ={hire.mix_bins:g} "
+            f"mix_θ/floor={hire.mix_theta:g}/{hire.effective_mix_floor():g} "
+            f"theta_on/off/grow={hire.theta_on:g}/{hire.theta_off:g}/{hire.effective_theta_grow():g} "
             f"confirm={hire.confirm_bins} cooldown={hire.cooldown_bins} "
             f"spatial_kernel={hire.spatial_kernel} gate_pool={hire.gate_pool} "
-            f"reset_open/dilate={hire.reset_open}/{hire.reset_dilate} "
+            f"reset_open/grow={hire.reset_open}/{hire.reset_grow} "
             f"normalize={hire.normalize} quantile={hire.quantile:g}"
         ),
         (
@@ -517,7 +518,7 @@ def _save_visuals(
             f"alpha_surprise={hire.alpha_surprise:.6f}"
         ),
         f"s_tilde_vmax={s_vmax:.6f} (fixed={score_vmax:g}, percentile={score_percentile:g})",
-        "Pipeline: I^f/I^s → BernKL → S EMA → pool → hard reset + morph expand → g=max(hold+exp, soft) → I_out",
+        "Pipeline: I^f/I^s → BernKL → S EMA → pool → geodesic reset → g=max(hold+exp, deadzone-soft) → I_out",
         f"g_soft_lift_over_reset_max={float(g_soft_lift.max()):.6f} mean={float(g_soft_lift.mean()):.6f}",
         (
             f"reset_any_frac={float(reset_any.mean()):.6f} holding_frac={float(maps['holding'].mean()):.6f} "
@@ -555,9 +556,9 @@ def main() -> None:
     # HIRE (2 kHz / chunk=80; α=exp(-1/W) from *_bins)
     ap.add_argument("--bin_rate_hz", type=float, default=2000.0, help="SPAD bin rate f_s (logging / tau override)")
     ap.add_argument("--hire_ref_rate_hz", type=float, default=2000.0)
-    ap.add_argument("--hire_fast_bins", type=int, default=16, help="W_f: α_f=exp(-1/W_f)")
+    ap.add_argument("--hire_fast_bins", type=int, default=12, help="W_f: α_f=exp(-1/W_f)")
     ap.add_argument("--hire_slow_bins", type=int, default=160, help="W_s: α_s=exp(-1/W_s), n_s cap")
-    ap.add_argument("--hire_surprise_bins", type=int, default=8, help="W_S: α_S=exp(-1/W_S)")
+    ap.add_argument("--hire_surprise_bins", type=int, default=4, help="W_S: α_S=exp(-1/W_S)")
     ap.add_argument("--hire_tau_fast", type=float, default=0.0)
     ap.add_argument("--hire_tau_slow", type=float, default=0.0)
     ap.add_argument("--hire_tau_surprise", type=float, default=0.0)
@@ -565,43 +566,61 @@ def main() -> None:
         "--hire_mix_hold_bins",
         type=int,
         default=0,
-        help="Hold full I^f for H bins after reset; <=0 => chunk_size",
+        help="Hold full I^f for H bins after reset; <0 => chunk_size (legacy); 0 => no hold",
     )
     ap.add_argument(
         "--hire_mix_bins",
         type=float,
-        default=16.0,
+        default=12.0,
         help="τ after hold: g=exp(-(t-H)/τ) toward I^s",
     )
     ap.add_argument(
         "--hire_mix_theta",
         type=float,
-        default=0.1,
-        help="Soft output gate: g_soft=S̄/(S̄+θ); leans I^f on live surprise (<=0 disables)",
+        default=0.06,
+        help="Soft gate on relu(S̄-θ_floor); <=0 disables",
     )
-    ap.add_argument("--hire_theta_on", type=float, default=0.15)
-    ap.add_argument("--hire_theta_off", type=float, default=0.06)
+    ap.add_argument(
+        "--hire_mix_floor",
+        type=float,
+        default=-1.0,
+        help="Soft deadzone; <0 => use theta_off (suppress background I^f bleed)",
+    )
+    ap.add_argument("--hire_theta_on", type=float, default=0.08)
+    ap.add_argument("--hire_theta_off", type=float, default=0.04)
+    ap.add_argument(
+        "--hire_theta_grow",
+        type=float,
+        default=-1.0,
+        help="Geodesic support S̄>θ_grow; <0 => use theta_off",
+    )
     ap.add_argument("--hire_confirm_bins", type=int, default=1)
-    ap.add_argument("--hire_cooldown_bins", type=int, default=3)
-    ap.add_argument("--hire_spatial_kernel", type=int, default=3)
+    ap.add_argument("--hire_cooldown_bins", type=int, default=2)
+    ap.add_argument("--hire_spatial_kernel", type=int, default=5)
     ap.add_argument(
         "--hire_gate_pool",
         type=str,
-        default="max",
+        default="avg",
         choices=["max", "avg"],
-        help="Spatial pool on S for gate/reset: max=connect blobs, avg=denoise isolated spikes",
+        help="Spatial pool on S: avg=denoise spikes, max=connect blobs",
     )
     ap.add_argument(
         "--hire_reset_open",
         type=int,
         default=1,
-        help="Odd morph open on can_reset (1=off). >1 kills thin edge seeds — prefer avg gate",
+        help="Odd morph open on seeds (1=off). >1 kills thin edge seeds",
+    )
+    ap.add_argument(
+        "--hire_reset_grow",
+        type=int,
+        default=6,
+        help="Geodesic dilate steps of confirmed seeds inside {S̄>θ_grow}",
     )
     ap.add_argument(
         "--hire_reset_dilate",
         type=int,
-        default=5,
-        help="Odd morph dilate after open: expand sparse confirmed resets into continuous bands",
+        default=-1,
+        help="Legacy: odd blind-dilate kernel; >0 maps to reset_grow≈k//2",
     )
     ap.add_argument("--hire_eps", type=float, default=1e-5)
     ap.add_argument("--hire_normalize", action=argparse.BooleanOptionalAction, default=True)
@@ -647,14 +666,17 @@ def main() -> None:
         mix_hold_bins=int(args.hire_mix_hold_bins),
         mix_bins=float(args.hire_mix_bins),
         mix_theta=float(args.hire_mix_theta),
+        mix_floor=float(args.hire_mix_floor),
         theta_on=float(args.hire_theta_on),
         theta_off=float(args.hire_theta_off),
+        theta_grow=float(args.hire_theta_grow),
         confirm_bins=int(args.hire_confirm_bins),
         cooldown_bins=int(args.hire_cooldown_bins),
         spatial_kernel=int(args.hire_spatial_kernel),
         gate_pool=str(args.hire_gate_pool),
         reset_open=int(args.hire_reset_open),
-        reset_dilate=int(args.hire_reset_dilate),
+        reset_grow=int(args.hire_reset_grow),
+        reset_dilate=None if int(args.hire_reset_dilate) < 0 else int(args.hire_reset_dilate),
         eps=float(args.hire_eps),
         normalize=bool(args.hire_normalize),
         quantile=float(args.hire_quantile),

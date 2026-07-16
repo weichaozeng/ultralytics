@@ -1,11 +1,9 @@
 spad_train_mode: sequence
 model: /home/zvc/Project/SPADHand/ultralytics/weights/detector.pt
 
-# data
 spad_train_json: /home/zvc/Data/visionsim/outputs/train.json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test.json
 
-# run
 project: Runs/spad_pose
 name: sequence_hire
 device: "0"
@@ -15,32 +13,36 @@ batch: 2
 workers: 0
 imgsz: 512
 
-# sequence windowing @ 2 kHz / 25 FPS emit => 80 bins/frame
+# sequence windowing @ 2 kHz / emit 80
 spad_output_frames: 20
+spad_chunk_size: 80
 spad_subsampling: 80
 spad_bins_per_gt: 80
 spad_stride_frames: 5
 spad_image_size: 512
 spad_packed_ch_order: RGB
+spad_cache_mode: auto
 
-# HIRE v0.3 @ 2 kHz / chunk=80; α=exp(-1/W) from *_bins
+# HIRE offline cache @ 2 kHz; α=exp(-1/W) from *_bins
 spad_preprocessor: hire
 spad_bin_rate_hz: 2000.0
 hire_ref_rate_hz: 2000.0
-hire_fast_bins: 16
+hire_fast_bins: 12
 hire_slow_bins: 160
-hire_surprise_bins: 8
+hire_surprise_bins: 4
 hire_mix_hold_bins: 0
-hire_mix_bins: 16.0
-hire_mix_theta: 0.1
-hire_theta_on: 0.15
-hire_theta_off: 0.06
+hire_mix_bins: 12.0
+hire_mix_theta: 0.06
+hire_mix_floor: -1.0
+hire_theta_on: 0.08
+hire_theta_off: 0.04
+hire_theta_grow: -1.0
 hire_confirm_bins: 1
-hire_cooldown_bins: 3
-hire_spatial_kernel: 3
-hire_gate_pool: max
+hire_cooldown_bins: 2
+hire_spatial_kernel: 5
+hire_gate_pool: avg
 hire_reset_open: 1
-hire_reset_dilate: 5
+hire_reset_grow: 6
 
 # detector-side sequence plugin
 spad_plugin: temporal_ssd
@@ -50,6 +52,5 @@ spad_spatial_reduce_ratio: 2
 spad_spatial_kernel_size: 3
 spad_plugin_alpha_init: 0.0
 
-# misc
 spad_input_gamma: 2.2
 spad_freeze_detector: true

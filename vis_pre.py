@@ -144,28 +144,30 @@ def _parse_args() -> argparse.Namespace:
         "--hire_mix_hold_bins",
         type=int,
         default=0,
-        help="Hold full I^f for H bins after reset; <=0 => chunk_size",
+        help="Hold full I^f for H bins after reset; <0 => chunk_size; 0 => no hold",
     )
     ap.add_argument(
         "--hire_mix_bins",
         type=float,
-        default=16.0,
+        default=12.0,
         help="τ after hold: g=exp(-(t-H)/τ) toward I^s",
     )
     ap.add_argument(
         "--hire_mix_theta",
         type=float,
-        default=0.1,
-        help="Soft output gate g_soft=S̄/(S̄+θ); leans I^f on live surprise (<=0 disables)",
+        default=0.06,
+        help="Soft gate on relu(S̄-θ_floor); <=0 disables",
     )
-    ap.add_argument("--hire_theta_on", type=float, default=0.15)
-    ap.add_argument("--hire_theta_off", type=float, default=0.06)
+    ap.add_argument("--hire_mix_floor", type=float, default=-1.0, help="<0 => theta_off")
+    ap.add_argument("--hire_theta_on", type=float, default=0.08)
+    ap.add_argument("--hire_theta_off", type=float, default=0.04)
+    ap.add_argument("--hire_theta_grow", type=float, default=-1.0, help="<0 => theta_off")
     ap.add_argument("--hire_confirm_bins", type=int, default=1)
-    ap.add_argument("--hire_cooldown_bins", type=int, default=3)
-    ap.add_argument("--hire_spatial_kernel", type=int, default=3)
-    ap.add_argument("--hire_gate_pool", type=str, default="max", choices=["max", "avg"])
+    ap.add_argument("--hire_cooldown_bins", type=int, default=2)
+    ap.add_argument("--hire_spatial_kernel", type=int, default=5)
+    ap.add_argument("--hire_gate_pool", type=str, default="avg", choices=["max", "avg"])
     ap.add_argument("--hire_reset_open", type=int, default=1)
-    ap.add_argument("--hire_reset_dilate", type=int, default=5)
+    ap.add_argument("--hire_reset_grow", type=int, default=6)
     ap.add_argument("--hire_eps", type=float, default=1e-5)
     return ap.parse_args()
 
@@ -419,14 +421,16 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             mix_hold_bins=int(args.hire_mix_hold_bins),
             mix_bins=float(args.hire_mix_bins),
             mix_theta=float(args.hire_mix_theta),
+            mix_floor=float(args.hire_mix_floor),
             theta_on=float(args.hire_theta_on),
             theta_off=float(args.hire_theta_off),
+            theta_grow=float(args.hire_theta_grow),
             confirm_bins=int(args.hire_confirm_bins),
             cooldown_bins=int(args.hire_cooldown_bins),
             spatial_kernel=int(args.hire_spatial_kernel),
             gate_pool=str(args.hire_gate_pool),
             reset_open=int(args.hire_reset_open),
-            reset_dilate=int(args.hire_reset_dilate),
+            reset_grow=int(args.hire_reset_grow),
             eps=float(args.hire_eps),
             normalize=bool(args.hire_normalize),
             quantile=float(args.hire_quantile),
@@ -829,12 +833,12 @@ def main() -> None:
             f"hire: bin_rate_hz={float(args.bin_rate_hz):g} "
             f"ref_rate_hz={float(args.hire_ref_rate_hz):g} "
             f"bins={int(args.hire_fast_bins)}/{int(args.hire_slow_bins)}/{int(args.hire_surprise_bins)} "
-            f"mix_hold={int(args.hire_mix_hold_bins)}(0=chunk) mix_τ={float(args.hire_mix_bins):g} "
-            f"mix_θ={float(args.hire_mix_theta):g} "
-            f"theta_on/off={float(args.hire_theta_on):g}/{float(args.hire_theta_off):g} "
+            f"mix_hold={int(args.hire_mix_hold_bins)}(<0=chunk,0=none) mix_τ={float(args.hire_mix_bins):g} "
+            f"mix_θ/floor={float(args.hire_mix_theta):g}/{float(args.hire_mix_floor):g} "
+            f"theta_on/off/grow={float(args.hire_theta_on):g}/{float(args.hire_theta_off):g}/{float(args.hire_theta_grow):g} "
             f"confirm={int(args.hire_confirm_bins)} cooldown={int(args.hire_cooldown_bins)} "
             f"gate_pool={str(args.hire_gate_pool)} "
-            f"reset_open/dilate={int(args.hire_reset_open)}/{int(args.hire_reset_dilate)}"
+            f"reset_open/grow={int(args.hire_reset_open)}/{int(args.hire_reset_grow)}"
         )
     if "ppb" in preprocessors:
         print(

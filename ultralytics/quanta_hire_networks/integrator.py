@@ -68,8 +68,8 @@ class HIRE(nn.Module):
     Roles (per bin)::
 
         I^f  — fast probe (always EMA)
-        I^s  — slow bank: normal EMA; hard ``I^s←I^f`` when max-pooled S exceeds θ_on
-        I_out — hold full I^f for H bins after reset, then exp-decay toward I^s
+        I^s  — slow bank: normal EMA; hard ``I^s←I^f`` on geodesic change regions
+        I_out — short hold of I^f after reset, then exp-decay toward I^s; plus deadzoned soft gate
 
     Formulas::
 
@@ -77,19 +77,22 @@ class HIRE(nn.Module):
         β_s = max(1/n_s, 1-α_s),   I^s ← (1-β_s) I^s + β_s x
         S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
         S̄  = pool_k(S)   (``gate_pool`` = max | avg);  enter if S̄>θ_on; leave if S̄<θ_off
-        at c==C_min: seed hard-reset mask → open (kill speckles) → dilate (thicken lines)
-                     then I^s←I^f, n_s←W_f, S←0, t_mix←0 on expanded mask (+ cooldown)
+        at c==C_min: seed = confirmed enter; optionally open; then geodesic-dilate seed
+                     inside support {S̄>θ_grow}; reset I^s←I^f on that region
         t_mix ← t_mix+1 (else);  g_reset = 1 if t_mix<H else exp(-(t-H)/τ)
-        g_soft = S̄/(S̄+θ_mix)   (θ_mix = ``mix_theta`` > 0, else 0 → disabled)
+        S₊ = relu(S̄ - θ_floor);  g_soft = S₊/(S₊+θ_mix)   (θ_mix<=0 disables)
         g = max(g_reset, g_soft);   I_out = (1-g) I^s + g I^f
 
-    ``H = mix_hold_bins`` (≤0 → ``subsampling`` / chunk_size), ``τ = mix_bins``.
+    Hold ``H = mix_hold_bins``: ``H<0`` → chunk/subsampling (legacy); ``H>=0`` → that many
+    bins (default 0 = no hold). Soft floor defaults to ``θ_off``; grow threshold to ``θ_off``.
 
-    ``g_soft`` is a safety-net for output only (does **not** age/reset I^s). Thin motion
-    edges often light ``g_soft`` while hysteresis barely seeds hard resets — hence
-    ``n_slow`` stays old on most of the silhouette. Morphological ``reset_open`` then
-    ``reset_dilate`` expand confirmed seeds into continuous lines without promoting
-    isolated background speckles (killed by open + avg gate_pool).
+    Design notes (using KL well)::
+
+    - KL / S is typically a **thin edge map**. Blind dilate into background creates false
+      resets; soft ``S/(S+θ)`` without a floor mixes background noise into I_out.
+    - **Geodesic grow** expands confirmed high-S seeds only through moderate-S support —
+      fills motion bands without painting quiet background.
+    - Soft gate uses the **same deadzone** so low-S salt does not pull I^f into I_out.
     """
 
     def __init__(
@@ -98,25 +101,28 @@ class HIRE(nn.Module):
         sample_rate_hz: float = 2000.0,
         bin_rate_hz: float | None = None,
         ref_rate_hz: float = 2000.0,
-        fast_bins: int = 16,
+        fast_bins: int = 12,
         slow_bins: int = 160,
-        surprise_bins: int = 8,
+        surprise_bins: int = 4,
         tau_fast: float | None = None,
         tau_slow: float | None = None,
         tau_surprise: float | None = None,
         mix_hold_bins: int = 0,
-        mix_bins: float = 16.0,
-        mix_theta: float = 0.1,
+        mix_bins: float = 12.0,
+        mix_theta: float = 0.06,
+        mix_floor: float | None = None,
         mix_kappa: float | None = None,  # legacy → mix_bins
         gate_theta: float | None = None,  # legacy → mix_bins
-        theta_on: float = 0.15,
-        theta_off: float = 0.06,
+        theta_on: float = 0.08,
+        theta_off: float = 0.04,
+        theta_grow: float | None = None,
         confirm_bins: int = 1,
-        cooldown_bins: int = 3,
-        spatial_kernel: int = 3,
-        gate_pool: str = "max",
+        cooldown_bins: int = 2,
+        spatial_kernel: int = 5,
+        gate_pool: str = "avg",
         reset_open: int = 1,
-        reset_dilate: int = 5,
+        reset_grow: int = 6,
+        reset_dilate: int | None = None,  # legacy → reset_grow steps
         eps: float = 1e-5,
         normalize: bool = False,
         quantile: float = 1.0,
@@ -147,12 +153,14 @@ class HIRE(nn.Module):
         self.mix_kappa = self.mix_bins
         # Soft output gate threshold (<=0 disables the safety-net gate).
         self.mix_theta = float(mix_theta)
+        self.mix_floor = self._optional_threshold(mix_floor)
         self.theta_on = float(theta_on)
         self.theta_off = float(theta_off)
         if not (self.theta_on > self.theta_off > 0.0):
             raise ValueError(
                 f"require theta_on > theta_off > 0, got on={theta_on}, off={theta_off}"
             )
+        self.theta_grow = self._optional_threshold(theta_grow)
         self.confirm_bins = max(int(confirm_bins), 1)
         self.cooldown_bins = max(int(cooldown_bins), 0)
         k = int(spatial_kernel)
@@ -164,7 +172,14 @@ class HIRE(nn.Module):
             raise ValueError(f"gate_pool must be 'max' or 'avg', got {gate_pool}")
         self.gate_pool = gp
         self.reset_open = self._validate_odd_kernel(reset_open, "reset_open")
-        self.reset_dilate = self._validate_odd_kernel(reset_dilate, "reset_dilate")
+        # Geodesic grow steps; legacy reset_dilate (odd kernel) ≈ half-width in steps.
+        if reset_dilate is not None:
+            rd = int(reset_dilate)
+            grow = max(rd // 2, 0) if rd > 1 else max(int(reset_grow), 0)
+        else:
+            grow = max(int(reset_grow), 0)
+        self.reset_grow = grow
+        self.reset_dilate = max(2 * grow + 1, 1)  # back-compat attr for logs/vis
         self.eps = float(eps)
         self.normalize = bool(normalize)
         self.quantile = float(quantile)
@@ -189,19 +204,32 @@ class HIRE(nn.Module):
         self.w_slow: Tensor | None = None
 
     def effective_mix_hold_bins(self) -> int:
-        """Hold length H; ``mix_hold_bins<=0`` means use ``subsampling`` (chunk_size)."""
+        """Hold length H. ``H<0`` → chunk/subsampling (legacy); ``H>=0`` → that many bins."""
         h = int(self.mix_hold_bins)
-        return int(self.subsampling) if h <= 0 else h
+        return int(self.subsampling) if h < 0 else max(h, 0)
+
+    def effective_mix_floor(self) -> float:
+        """Soft-gate deadzone; default ``theta_off`` so background S does not mix I^f."""
+        if self.mix_floor is None:
+            return float(self.theta_off)
+        return float(self.mix_floor)
+
+    def effective_theta_grow(self) -> float:
+        """Geodesic support threshold; default ``theta_off`` (moderate evidence corridor)."""
+        if self.theta_grow is None:
+            return float(self.theta_off)
+        return float(self.theta_grow)
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(fs={self.sample_rate_hz:g}, "
             f"W_f/s/S={self.fast_bins}/{self.slow_bins}/{self.surprise_bins}, "
             f"α_f/s/S={self.alpha_fast:.4f}/{self.alpha_slow:.4f}/{self.alpha_surprise:.4f}, "
-            f"mix_hold={self.effective_mix_hold_bins()} mix_τ={self.mix_bins:g} mix_θ={self.mix_theta:g}, "
-            f"theta_on/off={self.theta_on:g}/{self.theta_off:g}, "
+            f"mix_hold={self.effective_mix_hold_bins()} mix_τ={self.mix_bins:g} "
+            f"mix_θ/floor={self.mix_theta:g}/{self.effective_mix_floor():g}, "
+            f"theta_on/off/grow={self.theta_on:g}/{self.theta_off:g}/{self.effective_theta_grow():g}, "
             f"confirm={self.confirm_bins}, cooldown={self.cooldown_bins}, "
-            f"gate_pool={self.gate_pool}, reset_open/dilate={self.reset_open}/{self.reset_dilate}, "
+            f"gate_pool={self.gate_pool}, reset_open/grow={self.reset_open}/{self.reset_grow}, "
             f"subsampling={self.subsampling})"
         )
 
@@ -211,6 +239,14 @@ class HIRE(nn.Module):
         if k < 1 or k % 2 == 0:
             raise ValueError(f"{name} must be odd and >= 1, got {value}")
         return k
+
+    @staticmethod
+    def _optional_threshold(value: float | None) -> float | None:
+        """``None`` or ``<0`` means follow the linked default (θ_off)."""
+        if value is None:
+            return None
+        v = float(value)
+        return None if v < 0.0 else v
 
     def _sync_tau_display(self) -> None:
         """Wall-clock τ for logging: override or W/f_s."""
@@ -291,15 +327,18 @@ class HIRE(nn.Module):
             "hire_gate_theta": "mix_bins",  # legacy
             "mix_kappa": "mix_bins",  # legacy
             "gate_theta": "mix_bins",  # legacy
+            "hire_mix_theta": "mix_theta",
+            "hire_mix_floor": "mix_floor",
             "hire_theta_on": "theta_on",
             "hire_theta_off": "theta_off",
+            "hire_theta_grow": "theta_grow",
             "hire_confirm_bins": "confirm_bins",
             "hire_cooldown_bins": "cooldown_bins",
             "hire_spatial_kernel": "spatial_kernel",
-            "hire_mix_theta": "mix_theta",
             "hire_gate_pool": "gate_pool",
             "hire_reset_open": "reset_open",
-            "hire_reset_dilate": "reset_dilate",
+            "hire_reset_grow": "reset_grow",
+            "hire_reset_dilate": "reset_dilate",  # legacy → grow steps
             "hire_tau_fast": "tau_fast",
             "hire_tau_slow": "tau_slow",
             "hire_tau_surprise": "tau_surprise",
@@ -344,11 +383,15 @@ class HIRE(nn.Module):
             self.mix_kappa = tau
         if "mix_theta" in normalized:
             self.mix_theta = float(normalized["mix_theta"])
+        if "mix_floor" in normalized:
+            self.mix_floor = self._optional_threshold(normalized["mix_floor"])
 
         if "theta_on" in normalized:
             self.theta_on = float(normalized["theta_on"])
         if "theta_off" in normalized:
             self.theta_off = float(normalized["theta_off"])
+        if "theta_grow" in normalized:
+            self.theta_grow = self._optional_threshold(normalized["theta_grow"])
         if "theta_on" in normalized or "theta_off" in normalized:
             if not (self.theta_on > self.theta_off > 0.0):
                 raise ValueError(
@@ -374,8 +417,15 @@ class HIRE(nn.Module):
 
         if "reset_open" in normalized:
             self.reset_open = self._validate_odd_kernel(normalized["reset_open"], "reset_open")
+        if "reset_grow" in normalized:
+            self.reset_grow = max(int(normalized["reset_grow"]), 0)
+            self.reset_dilate = max(2 * self.reset_grow + 1, 1)
         if "reset_dilate" in normalized:
-            self.reset_dilate = self._validate_odd_kernel(normalized["reset_dilate"], "reset_dilate")
+            # Legacy odd kernel → approximate geodesic step count.
+            rd = int(normalized["reset_dilate"])
+            if rd > 1:
+                self.reset_grow = max(rd // 2, 0)
+            self.reset_dilate = max(2 * self.reset_grow + 1, 1)
 
         if "eps" in normalized:
             eps = float(normalized["eps"])
@@ -428,27 +478,37 @@ class HIRE(nn.Module):
             pooled = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
         return pooled.squeeze(0).squeeze(0)
 
-    def _expand_reset_mask(self, seed: Tensor) -> Tensor:
-        """Kill isolated reset speckles (open), then thicken line-like seeds (dilate).
-
-        Opening = erode ∘ dilate via min/max pools. Dilate alone would also grow noise
-        seeds; open first so only spatially-coexisting seeds survive to expand.
-        Kernels of 1 leave the mask unchanged.
-        """
-        if self.reset_open <= 1 and self.reset_dilate <= 1:
+    def _open_mask(self, seed: Tensor) -> Tensor:
+        """Morphological opening (optional); kills isolated 1-px seeds when kernel > 1."""
+        if self.reset_open <= 1:
             return seed
+        k = self.reset_open
+        pad = k // 2
         x = seed.to(dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        if self.reset_open > 1:
-            k = self.reset_open
-            pad = k // 2
-            # erode = min-pool = -max_pool(-x)
-            x = -F.max_pool2d(-x, kernel_size=k, stride=1, padding=pad)
-            x = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
-        if self.reset_dilate > 1:
-            k = self.reset_dilate
-            pad = k // 2
-            x = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
+        x = -F.max_pool2d(-x, kernel_size=k, stride=1, padding=pad)
+        x = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
         return x.squeeze(0).squeeze(0) > 0.5
+
+    def _geodesic_grow(self, seed: Tensor, support: Tensor) -> Tensor:
+        """Grow confirmed seeds only through moderate-evidence support (geodesic dilate).
+
+        Unlike blind dilate, pixels without KL support never join the reset region —
+        so motion edge bands fill while quiet background stays untouched.
+        """
+        region = seed & support
+        steps = int(self.reset_grow)
+        if steps <= 0:
+            return region
+        for _ in range(steps):
+            dil = F.max_pool2d(region.float().unsqueeze(0).unsqueeze(0), 3, 1, 1).squeeze(0).squeeze(0) > 0.5
+            region = dil & support
+        return region
+
+    def _expand_reset_mask(self, seed: Tensor, s_chg: Tensor) -> Tensor:
+        """Open (optional) then geodesic-grow confirmed reset seeds inside {S̄>θ_grow}."""
+        seed = self._open_mask(seed)
+        support = s_chg > self.effective_theta_grow()
+        return self._geodesic_grow(seed, support)
 
     def _step(
         self,
@@ -507,8 +567,8 @@ class HIRE(nn.Module):
             & (confirm_count >= float(c_min) - 1e-6)
             & (confirm_count < float(c_min) + 1.0 - 1e-6)
         )
-        # Expand sparse confirmed seeds into continuous edge bands; open kills speckles.
-        can_reset = self._expand_reset_mask(can_reset)
+        # Expand seeds through moderate-S support (geodesic); not blind dilate.
+        can_reset = self._expand_reset_mask(can_reset, s_chg)
         i_slow = torch.where(can_reset, i_fast, i_slow)
         n_slow = torch.where(can_reset, xt.new_full(xt.shape, n_f_max), n_slow)
         s_tilde = torch.where(can_reset, xt.new_zeros(xt.shape), s_tilde)
@@ -522,15 +582,18 @@ class HIRE(nn.Module):
         t_mix = torch.where(can_reset, xt.new_zeros(xt.shape), t_mix + 1.0)
         # g_reset=1 for t<H (full I^f); then exp(-(t-H)/τ) toward I^s
         over = torch.clamp(t_mix - hold_h, min=0.0)
-        g_reset = torch.where(
-            t_mix < hold_h,
-            xt.new_ones(xt.shape),
-            torch.exp(-over / tau_mix),
-        )
-        # Soft safety-net: lean I^f wherever current pooled surprise is high, even
-        # without a confirmed reset (rescues brief/fast motion from fragmentation).
+        if hold_h > 0.0:
+            g_reset = torch.where(
+                t_mix < hold_h,
+                xt.new_ones(xt.shape),
+                torch.exp(-over / tau_mix),
+            )
+        else:
+            g_reset = torch.exp(-t_mix / tau_mix)
+        # Deadzoned soft gate: background below θ_floor contributes 0 (no I^f bleed).
         if self.mix_theta > 0.0:
-            g_soft = s_chg / (s_chg + self.mix_theta)
+            s_eff = torch.clamp(s_chg - self.effective_mix_floor(), min=0.0)
+            g_soft = s_eff / (s_eff + self.mix_theta)
             g_fast = torch.maximum(g_reset, g_soft)
         else:
             g_fast = g_reset
