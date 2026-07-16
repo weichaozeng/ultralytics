@@ -11,11 +11,11 @@ Writes per-chunk outputs under ``{save_dir}/{sample}/videoXXXXX/``:
 Example
 -------
 python ultralytics/vis_hire_det.py \\
-  --in_path /path/to/sample \\
+  --in_path /path/to/frames.npy \\
   --save_dir /tmp/hire_vis \\
-  --chunk_size 80 \\
-  --bin_rate_hz 2000 \\
-  --hire_theta_on 0.15 --hire_theta_off 0.06
+  --chunk_size 80 --bin_rate_hz 2000
+  # defaults: W_f/s/S=24/160/4, hold=80, θ_on/off=0.08/0.02,
+  # confirm=4, gate_pool=max, reset_open/grow=15/6, vis_mode=gamma
 """
 
 from __future__ import annotations
@@ -558,7 +558,7 @@ def main() -> None:
     # HIRE (2 kHz / chunk=80; α=exp(-1/W) from *_bins)
     ap.add_argument("--bin_rate_hz", type=float, default=2000.0, help="SPAD bin rate f_s (logging / tau override)")
     ap.add_argument("--hire_ref_rate_hz", type=float, default=2000.0)
-    ap.add_argument("--hire_fast_bins", type=int, default=12, help="W_f: α_f=exp(-1/W_f)")
+    ap.add_argument("--hire_fast_bins", type=int, default=24, help="W_f: α_f=exp(-1/W_f)")
     ap.add_argument("--hire_slow_bins", type=int, default=160, help="W_s: α_s=exp(-1/W_s), n_s cap")
     ap.add_argument("--hire_surprise_bins", type=int, default=4, help="W_S: α_S=exp(-1/W_S)")
     ap.add_argument("--hire_tau_fast", type=float, default=0.0)
@@ -567,7 +567,7 @@ def main() -> None:
     ap.add_argument(
         "--hire_mix_hold_bins",
         type=int,
-        default=0,
+        default=80,
         help="Hold full I^f for H bins after reset; <0 => chunk_size (legacy); 0 => no hold",
     )
     ap.add_argument(
@@ -589,14 +589,14 @@ def main() -> None:
         help="Soft deadzone; <0 => use theta_off (suppress background I^f bleed)",
     )
     ap.add_argument("--hire_theta_on", type=float, default=0.08)
-    ap.add_argument("--hire_theta_off", type=float, default=0.04)
+    ap.add_argument("--hire_theta_off", type=float, default=0.02)
     ap.add_argument(
         "--hire_theta_grow",
         type=float,
         default=-1.0,
         help="Geodesic support S̄>θ_grow; <0 => use theta_off",
     )
-    ap.add_argument("--hire_confirm_bins", type=int, default=1)
+    ap.add_argument("--hire_confirm_bins", type=int, default=4)
     ap.add_argument(
         "--hire_cooldown_bins",
         type=int,
@@ -607,14 +607,14 @@ def main() -> None:
     ap.add_argument(
         "--hire_gate_pool",
         type=str,
-        default="avg",
+        default="max",
         choices=["max", "avg"],
         help="Spatial pool on S: avg=denoise spikes, max=connect blobs",
     )
     ap.add_argument(
         "--hire_reset_open",
         type=int,
-        default=1,
+        default=15,
         help="Odd morph open on seeds (1=off). >1 kills thin edge seeds",
     )
     ap.add_argument(
@@ -633,7 +633,7 @@ def main() -> None:
     ap.add_argument("--hire_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--hire_quantile", type=float, default=1.0)
     # Vis
-    ap.add_argument("--vis_mode", type=str, default="linear", choices=["linear", "gamma", "percentile", "percentile_gamma"])
+    ap.add_argument("--vis_mode", type=str, default="gamma", choices=["linear", "gamma", "percentile", "percentile_gamma"])
     ap.add_argument("--vis_percentile", type=float, default=99.5)
     ap.add_argument("--vis_gamma", type=float, default=2.2)
     ap.add_argument("--colormap", type=str, default="turbo", choices=sorted(COLORMAPS))

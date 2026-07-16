@@ -134,16 +134,16 @@ def _parse_args() -> argparse.Namespace:
         help="SPAD bin rate f_s (logging / optional tau_* ZOH override).",
     )
     ap.add_argument("--hire_ref_rate_hz", type=float, default=2000.0)
-    ap.add_argument("--hire_fast_bins", type=int, default=16, help="W_f: α_f=exp(-1/W_f)")
+    ap.add_argument("--hire_fast_bins", type=int, default=24, help="W_f: α_f=exp(-1/W_f)")
     ap.add_argument("--hire_slow_bins", type=int, default=160, help="W_s: α_s=exp(-1/W_s), n_s cap")
-    ap.add_argument("--hire_surprise_bins", type=int, default=8, help="W_S: α_S=exp(-1/W_S)")
+    ap.add_argument("--hire_surprise_bins", type=int, default=4, help="W_S: α_S=exp(-1/W_S)")
     ap.add_argument("--hire_tau_fast", type=float, default=0.0)
     ap.add_argument("--hire_tau_slow", type=float, default=0.0)
     ap.add_argument("--hire_tau_surprise", type=float, default=0.0)
     ap.add_argument(
         "--hire_mix_hold_bins",
         type=int,
-        default=0,
+        default=80,
         help="Hold full I^f for H bins after reset; <0 => chunk_size; 0 => no hold",
     )
     ap.add_argument(
@@ -160,9 +160,9 @@ def _parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--hire_mix_floor", type=float, default=-1.0, help="<0 => theta_off")
     ap.add_argument("--hire_theta_on", type=float, default=0.08)
-    ap.add_argument("--hire_theta_off", type=float, default=0.04)
+    ap.add_argument("--hire_theta_off", type=float, default=0.02)
     ap.add_argument("--hire_theta_grow", type=float, default=-1.0, help="<0 => theta_off")
-    ap.add_argument("--hire_confirm_bins", type=int, default=1)
+    ap.add_argument("--hire_confirm_bins", type=int, default=4)
     ap.add_argument(
         "--hire_cooldown_bins",
         type=int,
@@ -170,8 +170,8 @@ def _parse_args() -> argparse.Namespace:
         help="Unused (kept for CLI compat); n_f/n_s←W_f after reset replaces cooldown",
     )
     ap.add_argument("--hire_spatial_kernel", type=int, default=5)
-    ap.add_argument("--hire_gate_pool", type=str, default="avg", choices=["max", "avg"])
-    ap.add_argument("--hire_reset_open", type=int, default=1)
+    ap.add_argument("--hire_gate_pool", type=str, default="max", choices=["max", "avg"])
+    ap.add_argument("--hire_reset_open", type=int, default=15)
     ap.add_argument("--hire_reset_grow", type=int, default=6)
     ap.add_argument("--hire_eps", type=float, default=1e-5)
     return ap.parse_args()

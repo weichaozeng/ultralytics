@@ -27,21 +27,21 @@ spad_cache_mode: auto
 spad_preprocessor: hire
 spad_bin_rate_hz: 2000.0
 hire_ref_rate_hz: 2000.0
-hire_fast_bins: 12
+hire_fast_bins: 24
 hire_slow_bins: 160
 hire_surprise_bins: 4
-hire_mix_hold_bins: 0
+hire_mix_hold_bins: 80
 hire_mix_bins: 12.0
 hire_mix_theta: 0.06
 hire_mix_floor: -1.0
 hire_theta_on: 0.08
-hire_theta_off: 0.04
+hire_theta_off: 0.02
 hire_theta_grow: -1.0
-hire_confirm_bins: 1
+hire_confirm_bins: 4
 hire_cooldown_bins: 0
 hire_spatial_kernel: 5
-hire_gate_pool: avg
-hire_reset_open: 1
+hire_gate_pool: max
+hire_reset_open: 15
 hire_reset_grow: 6
 
 # detector-side sequence plugin
