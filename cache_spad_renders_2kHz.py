@@ -2,7 +2,7 @@
 
 Pipeline
 --------
-1. Build split JSON with spad under ``renders-2kHz``::
+1. Build split JSON with spad under ``renders-spc2kHz``::
 
      python DataProcess/traindata/build_visionsim_split_2kHz.py \\
        --reuse-split-from /home/zvc/Data/visionsim/outputs/train.json \\
@@ -18,7 +18,7 @@ Pipeline
        --update-json \\
        --preprocessors sum ema ppb hire
 
-Reads packed SPAD from sibling ``renders-2kHz``, writes ``frames.npy`` + ``meta.json``
+Reads packed SPAD from sibling ``renders-spc2kHz``, writes ``frames.npy`` + ``meta.json``
 under ``renders-{method}-2kHz``.
 """
 
@@ -68,7 +68,7 @@ def parse_args():
         "--output-root",
         type=str,
         default="",
-        help="Optional explicit cache root. Default: sibling renders-{prep}-2kHz beside renders-2kHz.",
+        help="Optional explicit cache root. Default: sibling renders-{prep}-2kHz beside renders-spc2kHz.",
     )
     ap.add_argument(
         "--preprocessors",
@@ -78,9 +78,14 @@ def parse_args():
         choices=list(_PREPROCESSORS),
         help="Preprocessors to cache (default: sum ema ppb hire).",
     )
-    ap.add_argument("--chunk-size", type=int, default=80)
+    ap.add_argument("--chunk-size", type=int, default=80, help="Bins per cached frame (=5 GT @ 125 Hz).")
     ap.add_argument("--stride-bins", type=int, default=80)
-    ap.add_argument("--spad-bins-per-gt", type=int, default=80, help="2 kHz @ 25 FPS => 80 bins/GT.")
+    ap.add_argument(
+        "--spad-bins-per-gt",
+        type=int,
+        default=16,
+        help="Raw bins per GT frame: 2000 Hz / 125 Hz GT = 16 (same GT rate as 8 kHz@64).",
+    )
     ap.add_argument("--packed-ch-order", type=str, default="RGB")
     ap.add_argument("--input-gamma", type=float, default=2.2)
     ap.add_argument("--device", type=str, default="cuda:0")
@@ -101,8 +106,8 @@ def parse_args():
     ap.add_argument(
         "--source-render-dirname",
         type=str,
-        default="renders-2kHz",
-        help="Source packed-SPAD directory name (default: renders-2kHz).",
+        default="renders-spc2kHz",
+        help="Source packed-SPAD directory name (default: renders-spc2kHz).",
     )
     ap.add_argument(
         "--render-tag",

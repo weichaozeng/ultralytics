@@ -13,16 +13,16 @@ batch: 2
 workers: 0
 imgsz: 512
 
-# sequence windowing @ 2 kHz / emit 80
+# sequence windowing @ 2 kHz / GT 125 Hz (bins_per_gt=16); chunk=80 = 5 GT
 spad_output_frames: 20
 spad_chunk_size: 80
 spad_subsampling: 80
-spad_bins_per_gt: 80
+spad_bins_per_gt: 16
 spad_stride_frames: 5
 spad_image_size: 512
 spad_packed_ch_order: RGB
 spad_cache_mode: auto
-spad_source_render_dirname: renders-2kHz
+spad_source_render_dirname: renders-spc2kHz
 spad_render_contains_confidence: false
 
 # HIRE offline cache @ 2 kHz; α=exp(-1/W) from *_bins
