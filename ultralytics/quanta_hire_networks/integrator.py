@@ -78,9 +78,10 @@ class HIRE(nn.Module):
         if not in_change:  β_s = max(1/n_s, 1-α_s), I^s ← (1-β_s) I^s + β_s x   # freeze I^s during change
         S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
         S̄  = pool_k(S)   (``gate_pool`` = max | avg);  enter if S̄>θ_on; leave if S̄<θ_off
-        at c==C_min: seed → geodesic inside {S̄>θ_grow}; reset I^s←I^f, n_s←n_f←W_f
-                     (no cooldown: ages start at mature fast window so I^f≈I^s without dark rim)
+        at c>=C_min: seed → geodesic inside {S̄>θ_grow}; each bin while armed:
+                     I^s←I^f, n_s←n_f←W_f  (level trigger; fills motion over time)
         leave & ¬reset: keep I^s (frozen value); next bin resumes EMA
+                     (leave via S̄<θ_off clears in_change / confirm)
         t_mix ← t_mix+1 (else);  g_reset = 1 if t_mix<H else exp(-(t-H)/τ)
         S₊ = relu(S̄ - θ_floor);  g_soft = S₊/(S₊+θ_mix)   (θ_mix<=0 disables)
         g = max(g_reset, g_soft);   I_out = (1-g) I^s + g I^f
@@ -96,7 +97,9 @@ class HIRE(nn.Module):
     - Updates resume when ``in_change`` clears: leave keeps frozen I^s then EMA;
       hard reset does ``I^s←I^f`` and sets both ages to ``W_f`` (avoids n←1 dark rims).
     - **Geodesic grow** expands confirmed high-S seeds only through moderate-S support.
-    - Ages at ``W_f`` keep β≈1/W_f so I^f≈I^s briefly after reset — replaces cooldown.
+    - Hard reset is **level-triggered** (``confirm≥C`` every bin while in_change), not
+      a one-shot edge — geodesic can fill motion bands across successive bins.
+    - Ages at ``W_f`` keep β≈1/W_f so I^f≈I^s after each refresh — replaces cooldown.
     - Soft gate uses the **same deadzone** so low-S salt does not pull I^f into I_out.
     """
 
@@ -569,12 +572,9 @@ class HIRE(nn.Module):
         in_change = torch.where(leave, xt.new_zeros(xt.shape), in_change)
 
         confirm_count = torch.where(in_change > 0.5, confirm_count + 1.0, xt.new_zeros(xt.shape))
-        # Edge trigger at confirm==C; no cooldown (n←W_f keeps β moderate, KL stays low).
-        can_reset = (
-            (in_change > 0.5)
-            & (confirm_count >= float(c_min) - 1e-6)
-            & (confirm_count < float(c_min) + 1.0 - 1e-6)
-        )
+        # Level trigger: once confirmed, keep resetting every bin while still in_change
+        # (fills motion bands over time; edge-only left thin ridges).
+        can_reset = (in_change > 0.5) & (confirm_count >= float(c_min) - 1e-6)
         # Expand seeds through moderate-S support (geodesic); not blind dilate.
         can_reset = self._expand_reset_mask(can_reset, s_chg)
         i_slow = torch.where(can_reset, i_fast, i_slow)
@@ -582,10 +582,8 @@ class HIRE(nn.Module):
         n_age = xt.new_full(xt.shape, n_f_max)
         n_slow = torch.where(can_reset, n_age, n_slow)
         n_fast = torch.where(can_reset, n_age, n_fast)
-        s_tilde = torch.where(can_reset, xt.new_zeros(xt.shape), s_tilde)
-        in_change = torch.where(can_reset, xt.new_zeros(xt.shape), in_change)
-        confirm_count = torch.where(can_reset, xt.new_zeros(xt.shape), confirm_count)
-        # Leave without reset: keep frozen I^s as-is; next bin resumes EMA (static=True).
+        # Do not clear S / in_change here: zeroing S would trip leave and disarm the level latch.
+        # Leave (S̄<θ_off) alone ends the sustained-reset episode.
         cooldown = xt.new_zeros(xt.shape)  # kept for debug/vis; anti-chatter unused
 
         # --- hold+exp mix age (independent of n_s) ---
