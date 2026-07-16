@@ -38,7 +38,7 @@ hire_theta_on: 0.08
 hire_theta_off: 0.04
 hire_theta_grow: -1.0
 hire_confirm_bins: 1
-hire_cooldown_bins: 2
+hire_cooldown_bins: 0
 hire_spatial_kernel: 5
 hire_gate_pool: avg
 hire_reset_open: 1

@@ -101,7 +101,7 @@ def parse_args():
     ap.add_argument("--hire-theta-off", type=float, default=0.04)
     ap.add_argument("--hire-theta-grow", type=float, default=-1.0)
     ap.add_argument("--hire-confirm-bins", type=int, default=1)
-    ap.add_argument("--hire-cooldown-bins", type=int, default=2)
+    ap.add_argument("--hire-cooldown-bins", type=int, default=0)
     ap.add_argument("--hire-spatial-kernel", type=int, default=5)
     ap.add_argument("--hire-gate-pool", type=str, default="avg", choices=["max", "avg"])
     ap.add_argument("--hire-reset-open", type=int, default=1)

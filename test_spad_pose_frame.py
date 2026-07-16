@@ -194,7 +194,7 @@ def _build_frame_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsa
             "theta_off": float(getattr(args, "hire_theta_off", 0.04)),
             "theta_grow": float(getattr(args, "hire_theta_grow", -1.0)),
             "confirm_bins": int(getattr(args, "hire_confirm_bins", 1)),
-            "cooldown_bins": int(getattr(args, "hire_cooldown_bins", 2)),
+            "cooldown_bins": int(getattr(args, "hire_cooldown_bins", 0)),
             "spatial_kernel": int(getattr(args, "hire_spatial_kernel", 5)),
             "gate_pool": str(getattr(args, "hire_gate_pool", "avg")),
             "reset_open": int(getattr(args, "hire_reset_open", 1)),

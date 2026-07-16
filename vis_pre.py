@@ -163,7 +163,12 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--hire_theta_off", type=float, default=0.04)
     ap.add_argument("--hire_theta_grow", type=float, default=-1.0, help="<0 => theta_off")
     ap.add_argument("--hire_confirm_bins", type=int, default=1)
-    ap.add_argument("--hire_cooldown_bins", type=int, default=2)
+    ap.add_argument(
+        "--hire_cooldown_bins",
+        type=int,
+        default=0,
+        help="Unused (kept for CLI compat); dual n_f/n_s←1 cold-start replaces cooldown",
+    )
     ap.add_argument("--hire_spatial_kernel", type=int, default=5)
     ap.add_argument("--hire_gate_pool", type=str, default="avg", choices=["max", "avg"])
     ap.add_argument("--hire_reset_open", type=int, default=1)
