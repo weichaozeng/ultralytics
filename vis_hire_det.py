@@ -599,7 +599,7 @@ def main() -> None:
         "--hire_cooldown_bins",
         type=int,
         default=0,
-        help="Unused (kept for CLI compat); dual n_f/n_s←1 cold-start replaces cooldown",
+        help="Unused (kept for CLI compat); n_f/n_s←W_f after reset replaces cooldown",
     )
     ap.add_argument("--hire_spatial_kernel", type=int, default=5)
     ap.add_argument(

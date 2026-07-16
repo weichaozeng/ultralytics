@@ -67,8 +67,9 @@ class HIRE(nn.Module):
 
     Roles (per bin)::
 
-        I^f  — fast probe (always EMA); age restarts with I^s on hard reset
-        I^s  — slow bank: EMA when idle, frozen while in_change; hard ``I^s←I^f`` + dual n←1
+        I^f  — fast probe (always EMA); age set to W_f with I^s on hard reset
+        I^s  — slow bank: EMA when idle, frozen while in_change; hard ``I^s←I^f`` + n_s←n_f←W_f;
+               leave-without-reset keeps frozen I^s and resumes EMA next bin
         I_out — short hold of I^f after reset, then exp-decay toward I^s; plus deadzoned soft gate
 
     Formulas::
@@ -77,8 +78,9 @@ class HIRE(nn.Module):
         if not in_change:  β_s = max(1/n_s, 1-α_s), I^s ← (1-β_s) I^s + β_s x   # freeze I^s during change
         S   ← α_S S + (1-α_S) BernKL(I^f || I^s)
         S̄  = pool_k(S)   (``gate_pool`` = max | avg);  enter if S̄>θ_on; leave if S̄<θ_off
-        at c==C_min: seed → geodesic inside {S̄>θ_grow}; reset I^s←I^f, n_s←1, n_f←1
-                     (no cooldown: after dual cold-start I^f≈I^s for ~W_f bins so KL stays low)
+        at c==C_min: seed → geodesic inside {S̄>θ_grow}; reset I^s←I^f, n_s←n_f←W_f
+                     (no cooldown: ages start at mature fast window so I^f≈I^s without dark rim)
+        leave & ¬reset: keep I^s (frozen value); next bin resumes EMA
         t_mix ← t_mix+1 (else);  g_reset = 1 if t_mix<H else exp(-(t-H)/τ)
         S₊ = relu(S̄ - θ_floor);  g_soft = S₊/(S₊+θ_mix)   (θ_mix<=0 disables)
         g = max(g_reset, g_soft);   I_out = (1-g) I^s + g I^f
@@ -91,8 +93,10 @@ class HIRE(nn.Module):
     - KL / S is typically a **thin edge map**. Blind dilate into background creates false
       resets; soft ``S/(S+θ)`` without a floor mixes background noise into I_out.
     - **Freeze I^s while in_change** so KL is vs pre-change bank (seeds stay sharp).
+    - Updates resume when ``in_change`` clears: leave keeps frozen I^s then EMA;
+      hard reset does ``I^s←I^f`` and sets both ages to ``W_f`` (avoids n←1 dark rims).
     - **Geodesic grow** expands confirmed high-S seeds only through moderate-S support.
-    - Reset restarts both ages at 1 so I^f and I^s track together briefly — replaces cooldown.
+    - Ages at ``W_f`` keep β≈1/W_f so I^f≈I^s briefly after reset — replaces cooldown.
     - Soft gate uses the **same deadzone** so low-S salt does not pull I^f into I_out.
     """
 
@@ -118,7 +122,7 @@ class HIRE(nn.Module):
         theta_off: float = 0.04,
         theta_grow: float | None = None,
         confirm_bins: int = 1,
-        cooldown_bins: int = 0,  # unused (dual n←1 cold-start replaces anti-chatter)
+        cooldown_bins: int = 0,  # unused (n←W_f after reset replaces anti-chatter)
         spatial_kernel: int = 5,
         gate_pool: str = "avg",
         reset_open: int = 1,
@@ -565,7 +569,7 @@ class HIRE(nn.Module):
         in_change = torch.where(leave, xt.new_zeros(xt.shape), in_change)
 
         confirm_count = torch.where(in_change > 0.5, confirm_count + 1.0, xt.new_zeros(xt.shape))
-        # Edge trigger at confirm==C; no cooldown (dual n←1 keeps I^f≈I^s briefly).
+        # Edge trigger at confirm==C; no cooldown (n←W_f keeps β moderate, KL stays low).
         can_reset = (
             (in_change > 0.5)
             & (confirm_count >= float(c_min) - 1e-6)
@@ -574,12 +578,14 @@ class HIRE(nn.Module):
         # Expand seeds through moderate-S support (geodesic); not blind dilate.
         can_reset = self._expand_reset_mask(can_reset, s_chg)
         i_slow = torch.where(can_reset, i_fast, i_slow)
-        # Dual cold-start: both ages restart so branches track together for ~W_f bins.
-        n_slow = torch.where(can_reset, xt.new_ones(xt.shape), n_slow)
-        n_fast = torch.where(can_reset, xt.new_ones(xt.shape), n_fast)
+        # Both ages → W_f: I^s matches I^f content without n←1 under-integration dark rims.
+        n_age = xt.new_full(xt.shape, n_f_max)
+        n_slow = torch.where(can_reset, n_age, n_slow)
+        n_fast = torch.where(can_reset, n_age, n_fast)
         s_tilde = torch.where(can_reset, xt.new_zeros(xt.shape), s_tilde)
         in_change = torch.where(can_reset, xt.new_zeros(xt.shape), in_change)
         confirm_count = torch.where(can_reset, xt.new_zeros(xt.shape), confirm_count)
+        # Leave without reset: keep frozen I^s as-is; next bin resumes EMA (static=True).
         cooldown = xt.new_zeros(xt.shape)  # kept for debug/vis; anti-chatter unused
 
         # --- hold+exp mix age (independent of n_s) ---

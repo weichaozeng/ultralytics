@@ -206,7 +206,7 @@ hire_theta_on: 0.08 # (float) enter / confirm seed if S̄>θ_on → hard I^s←I
 hire_theta_off: 0.04 # (float) leave change if S̄<θ_off; also default soft floor / grow support
 hire_theta_grow: -1.0 # (float) geodesic support S̄>θ_grow; <0 => use hire_theta_off
 hire_confirm_bins: 1 # (int) bins in-change before hard I^s reset (1 = immediate)
-hire_cooldown_bins: 0 # (int) unused; dual n_f/n_s←1 cold-start replaces anti-chatter
+hire_cooldown_bins: 0 # (int) unused; n_f/n_s←W_f after reset replaces anti-chatter
 hire_spatial_kernel: 5 # (int) odd pool on S before in_change / hard-reset / soft-gate thresholds
 hire_gate_pool: avg # (str) spatial pool on S: avg=denoise spikes | max=connect blobs
 hire_reset_open: 1 # (int) odd morph open on seeds (1=off; >1 kills thin edge seeds)
