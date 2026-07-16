@@ -200,7 +200,12 @@ def parse_args():
     ap.add_argument("--cache_mode", type=str, default="auto", choices=["auto", "raw", "rendered"])
     ap.add_argument("--render_root", type=str, default=None, help="Optional explicit root for cached rendered frames")
     ap.add_argument("--source_render_dirname", type=str, default="renders-spc8kHz")
-    ap.add_argument("--render_contains_confidence", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument(
+        "--render_contains_confidence",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If set, require confidence.npy in rendered cache (2 kHz caches are frames+meta only).",
+    )
     ap.add_argument(
         "--input_gamma",
         type=float,
