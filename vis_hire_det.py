@@ -740,6 +740,10 @@ def main() -> None:
                 temporal_slices=int(args.temporal_slices),
                 write_stats=bool(args.write_stats),
             )
+            # Drop large debug volumes between cubes (esp. T=320 @ 8 kHz).
+            del debug, recons, raw, raw_chunk, recon_rgb, sum_rgb
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             frame_idx += 1
 
         if frame_idx == 0:

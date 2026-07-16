@@ -681,6 +681,10 @@ class HIRE(nn.Module):
         )
         dbg_lists: dict[str, list[Tensor]] = {k: [] for k in dbg_keys} if record_debug else {}
 
+        def _dbg_cpu(x: Tensor) -> Tensor:
+            """Debug H×W frames on CPU — keeps algorithm tensors on the compute device."""
+            return x.detach().to(device="cpu", dtype=torch.float32)
+
         # Large age ⇒ g≈0 (full slow) until the first hard reset.
         t_mix_init = float(max(self.effective_mix_hold_bins(), 1) + 10.0 * self.mix_bins)
 
@@ -734,21 +738,21 @@ class HIRE(nn.Module):
                         t_mix,
                     )
                 if record_debug:
-                    dbg_lists["i_fast"].append(i_fast)
-                    dbg_lists["i_slow"].append(i_slow)
-                    dbg_lists["i_out"].append(i_out)
-                    dbg_lists["s_raw"].append(s_raw)
-                    dbg_lists["s_spat"].append(s_spat)
-                    dbg_lists["s_tilde"].append(s_tilde)
-                    dbg_lists["w_slow"].append(w_slow)
-                    dbg_lists["g_fast"].append(g_fast)
-                    dbg_lists["t_mix"].append(t_mix)
-                    dbg_lists["n_slow"].append(n_slow)
-                    dbg_lists["n_fast"].append(n_fast)
-                    dbg_lists["in_change"].append(in_change)
-                    dbg_lists["confirm"].append(confirm_count)
-                    dbg_lists["cooldown"].append(cooldown)
-                    dbg_lists["did_reset"].append(did_reset)
+                    dbg_lists["i_fast"].append(_dbg_cpu(i_fast))
+                    dbg_lists["i_slow"].append(_dbg_cpu(i_slow))
+                    dbg_lists["i_out"].append(_dbg_cpu(i_out))
+                    dbg_lists["s_raw"].append(_dbg_cpu(s_raw))
+                    dbg_lists["s_spat"].append(_dbg_cpu(s_spat))
+                    dbg_lists["s_tilde"].append(_dbg_cpu(s_tilde))
+                    dbg_lists["w_slow"].append(_dbg_cpu(w_slow))
+                    dbg_lists["g_fast"].append(_dbg_cpu(g_fast))
+                    dbg_lists["t_mix"].append(_dbg_cpu(t_mix))
+                    dbg_lists["n_slow"].append(_dbg_cpu(n_slow))
+                    dbg_lists["n_fast"].append(_dbg_cpu(n_fast))
+                    dbg_lists["in_change"].append(_dbg_cpu(in_change))
+                    dbg_lists["confirm"].append(_dbg_cpu(confirm_count))
+                    dbg_lists["cooldown"].append(_dbg_cpu(cooldown))
+                    dbg_lists["did_reset"].append(_dbg_cpu(did_reset))
             frames.append(i_out.unsqueeze(-1))
 
         self.i_fast = None if i_fast is None else i_fast.detach()
@@ -768,9 +772,12 @@ class HIRE(nn.Module):
         if not record_debug:
             return recons, empty_debug
 
-        debug: dict[str, Tensor] = {"recons_prenorm": recons_prenorm, "recons": recons}
+        debug: dict[str, Tensor] = {
+            "recons_prenorm": recons_prenorm.detach().cpu(),
+            "recons": recons.detach().cpu(),
+        }
         for key, parts in dbg_lists.items():
-            vol = torch.stack(parts, dim=-1)
+            vol = torch.stack(parts, dim=-1)  # already on CPU
             debug[f"{key}_hwt"] = vol
             debug[f"{key}_last"] = vol[..., -1]
             debug[f"{key}_peak"] = vol.amax(dim=-1)
