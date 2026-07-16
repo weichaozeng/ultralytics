@@ -6,7 +6,7 @@ spad_test_json: /home/zvc/Data/visionsim/outputs/test_2kHz.json
 
 project: Runs/spad_pose
 name: sequence_ppb_ssd_2kHz
-device: "1"
+device: "2"
 epochs: 60
 spad_viz_period: 10
 batch: 2
