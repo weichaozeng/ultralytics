@@ -328,8 +328,10 @@ def _save_visuals(
     }
 
     s_vmax = _resolve_vmax(s_tilde_hwt, fixed_vmax=score_vmax, percentile=score_percentile)
-    n_vmax = max(float(hire.slow_bins), float(np.percentile(n_slow_hwt, 99.5)), 1.0)
-    cd_vmax = max(float(hire.cooldown_bins), float(np.max(maps["cooldown"])), 1.0)
+    # Fixed counter scales: n saturates at W_s, t_mix at hold H (values above clip hot).
+    n_vmax = max(float(hire.slow_bins), 1.0)
+    t_mix_vmax = max(float(hire.effective_mix_hold_bins()), 1.0)
+    cd_vmax = max(float(hire.cooldown_bins), 1.0)
 
     score_panels = []
     score_labels = []
@@ -339,7 +341,7 @@ def _save_visuals(
                 score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=s_vmax
             )
         elif label in {"n_slow", "n_slow_min", "t_mix"}:
-            vmax = n_vmax if label.startswith("n_") else max(float(hire.effective_mix_hold_bins()) + 3.0 * float(hire.mix_bins), float(np.percentile(score_map, 99.5)), 1.0)
+            vmax = n_vmax if label.startswith("n_") else t_mix_vmax
             panel = _panel_from_map(
                 score_map, display_hw=display_hw, cmap_id=cmap_id, mode="heatmap", vmax=vmax
             )
@@ -389,7 +391,7 @@ def _save_visuals(
             cmap_id=cmap_id,
             label_prefix="cooldown",
             mode="heatmap",
-            vmax=max(float(hire.cooldown_bins), 1.0),
+            vmax=cd_vmax,
             max_slices=temporal_slices,
         ),
         _temporal_strip(
@@ -416,7 +418,7 @@ def _save_visuals(
             cmap_id=cmap_id,
             label_prefix="t_mix",
             mode="heatmap",
-            vmax=max(float(hire.effective_mix_hold_bins()) + 3.0 * float(hire.mix_bins), 1.0),
+            vmax=t_mix_vmax,
             max_slices=temporal_slices,
         ),
         _temporal_strip(
