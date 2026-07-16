@@ -1,0 +1,49 @@
+spad_train_mode: sequence
+model: /home/zvc/Project/SPADHand/ultralytics/weights/detector.pt
+
+spad_train_json: /home/zvc/Data/visionsim/outputs/train_2kHz.json
+spad_test_json: /home/zvc/Data/visionsim/outputs/test_2kHz.json
+
+project: Runs/spad_pose
+name: sequence_ppb_attn_sr_2kHz
+device: "1"
+epochs: 60
+spad_viz_period: 10
+batch: 2
+workers: 0
+imgsz: 512
+
+# 2 kHz / GT 125 Hz: bins_per_gt=16; chunk=80 (=5 GT)
+spad_output_frames: 20
+spad_chunk_size: 80
+spad_subsampling: 80
+spad_bins_per_gt: 16
+spad_stride_frames: 5
+spad_image_size: 512
+spad_packed_ch_order: RGB
+spad_cache_mode: auto
+spad_source_render_dirname: renders-spc2kHz
+spad_render_contains_confidence: false
+
+# PPB offline cache @ 2 kHz
+spad_preprocessor: ppb
+ppb_bocpd_gamma: 0.002
+ppb_quantile: 1.0
+ppb_normalize: true
+ppb_min_filter_size: 5
+
+# backbone SR-attention
+spad_plugin: sr_attn
+spad_plugin_scales: backbone
+attn_state_dim: 8
+attn_head_divisor: 4
+attn_dropout: 0.0
+attn_sr_ratio: 2
+attn_window_size: [3, 7, 7]
+spad_spatial_reduce_ratio: 2
+spad_spatial_kernel_size: 3
+spad_plugin_alpha_init: 0.0
+
+spad_bin_rate_hz: 2000.0
+spad_input_gamma: 2.2
+spad_freeze_detector: true

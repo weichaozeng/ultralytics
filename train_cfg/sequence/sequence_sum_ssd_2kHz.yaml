@@ -5,15 +5,15 @@ spad_train_json: /home/zvc/Data/visionsim/outputs/train_2kHz.json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test_2kHz.json
 
 project: Runs/spad_pose
-name: sequence_hire_ssd_2kHz
-device: "0"
+name: sequence_sum_ssd_2kHz
+device: "2"
 epochs: 60
 spad_viz_period: 10
 batch: 2
 workers: 0
 imgsz: 512
 
-# sequence windowing @ 2 kHz / GT 125 Hz (bins_per_gt=16); chunk=80 = 5 GT
+# 2 kHz / GT 125 Hz: bins_per_gt=16; chunk=80 (=5 GT)
 spad_output_frames: 20
 spad_chunk_size: 80
 spad_subsampling: 80
@@ -25,28 +25,12 @@ spad_cache_mode: auto
 spad_source_render_dirname: renders-spc2kHz
 spad_render_contains_confidence: false
 
-# HIRE offline cache @ 2 kHz; α=exp(-1/W) from *_bins
-spad_preprocessor: hire
-spad_bin_rate_hz: 2000.0
-hire_ref_rate_hz: 2000.0
-hire_fast_bins: 24
-hire_slow_bins: 160
-hire_surprise_bins: 4
-hire_mix_hold_bins: 80
-hire_mix_bins: 12.0
-hire_mix_theta: 0.06
-hire_mix_floor: -1.0
-hire_theta_on: 0.08
-hire_theta_off: 0.02
-hire_theta_grow: -1.0
-hire_confirm_bins: 4
-hire_cooldown_bins: 0
-hire_spatial_kernel: 5
-hire_gate_pool: max
-hire_reset_open: 15
-hire_reset_grow: 6
+# sum offline cache @ 2 kHz (temporal mean over each 80-bin chunk)
+spad_preprocessor: sum
+sum_normalize: true
+sum_quantile: 1.0
 
-# backbone SSD plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.
+# backbone SSD plugins
 spad_plugin: temporal_ssd
 spad_plugin_scales: backbone
 ssd_state_dim: 20
@@ -55,5 +39,6 @@ spad_spatial_reduce_ratio: 2
 spad_spatial_kernel_size: 3
 spad_plugin_alpha_init: 0.0
 
+spad_bin_rate_hz: 2000.0
 spad_input_gamma: 2.2
 spad_freeze_detector: true
