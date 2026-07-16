@@ -42,9 +42,9 @@ def bin_retention(window_bins: int) -> float:
 
 def taus_from_presets(
     *,
-    fast_bins: int = 16,
+    fast_bins: int = 24,
     slow_bins: int = 160,
-    surprise_bins: int = 8,
+    surprise_bins: int = 4,
     sample_rate_hz: float = 2000.0,
     ref_rate_hz: float | None = None,
 ) -> tuple[float, float, float]:
@@ -87,7 +87,7 @@ class HIRE(nn.Module):
         g = max(g_reset, g_soft);   I_out = (1-g) I^s + g I^f
 
     Hold ``H = mix_hold_bins``: ``H<0`` → chunk/subsampling (legacy); ``H>=0`` → that many
-    bins (default 0 = no hold). Soft floor defaults to ``θ_off``; grow threshold to ``θ_off``.
+    bins (default 80 ≈ one 2 kHz chunk). Soft floor defaults to ``θ_off``; grow threshold to ``θ_off``.
 
     Design notes (using KL well)::
 
@@ -109,26 +109,26 @@ class HIRE(nn.Module):
         sample_rate_hz: float = 2000.0,
         bin_rate_hz: float | None = None,
         ref_rate_hz: float = 2000.0,
-        fast_bins: int = 12,
+        fast_bins: int = 24,
         slow_bins: int = 160,
         surprise_bins: int = 4,
         tau_fast: float | None = None,
         tau_slow: float | None = None,
         tau_surprise: float | None = None,
-        mix_hold_bins: int = 0,
+        mix_hold_bins: int = 80,
         mix_bins: float = 12.0,
         mix_theta: float = 0.06,
         mix_floor: float | None = None,
         mix_kappa: float | None = None,  # legacy → mix_bins
         gate_theta: float | None = None,  # legacy → mix_bins
         theta_on: float = 0.08,
-        theta_off: float = 0.04,
+        theta_off: float = 0.02,
         theta_grow: float | None = None,
-        confirm_bins: int = 1,
+        confirm_bins: int = 4,
         cooldown_bins: int = 0,  # unused (n←W_f after reset replaces anti-chatter)
         spatial_kernel: int = 5,
-        gate_pool: str = "avg",
-        reset_open: int = 1,
+        gate_pool: str = "max",
+        reset_open: int = 15,
         reset_grow: int = 6,
         reset_dilate: int | None = None,  # legacy → reset_grow steps
         eps: float = 1e-5,

@@ -192,24 +192,24 @@ stea_normalize: True # (bool) normalize STEA reconstructions
 stea_quantile: 1.0 # (float) normalization quantile for STEA
 # HIRE v0.3 @ 2 kHz / chunk=80: α=exp(-1/W) from *_bins (no 8 kHz ref fold)
 hire_ref_rate_hz: 2000.0 # (float) legacy/logging; alphas use bin windows unless tau_*>0
-hire_fast_bins: 12 # (int) W_f: α_f=exp(-1/W_f), n_f cap
+hire_fast_bins: 24 # (int) W_f: α_f=exp(-1/W_f), n_f cap
 hire_slow_bins: 160 # (int) W_s: α_s=exp(-1/W_s), n_s cap (~2×chunk)
 hire_surprise_bins: 4 # (int) W_S: α_S=exp(-1/W_S) for surprise EMA
 hire_tau_fast: 0.0 # (float) >0 => ZOH α=exp(-1/(f_s·τ)) override (rate experiments)
 hire_tau_slow: 0.0
 hire_tau_surprise: 0.0
-hire_mix_hold_bins: 0 # (int) hold full I^f after reset; <0 => chunk/subsampling (legacy); 0 => no hold
+hire_mix_hold_bins: 80 # (int) hold full I^f after reset; <0 => chunk/subsampling (legacy); 0 => no hold
 hire_mix_bins: 12.0 # (float) τ after hold: g=exp(-(t-H)/τ) toward I^s
 hire_mix_theta: 0.06 # (float) soft gate on relu(S̄-θ_floor); <=0 disables
 hire_mix_floor: -1.0 # (float) soft deadzone; <0 => use hire_theta_off (kills background I^f bleed)
 hire_theta_on: 0.08 # (float) enter / confirm seed if S̄>θ_on → hard I^s←I^f
-hire_theta_off: 0.04 # (float) leave change if S̄<θ_off; also default soft floor / grow support
+hire_theta_off: 0.02 # (float) leave change if S̄<θ_off; also default soft floor / grow support
 hire_theta_grow: -1.0 # (float) geodesic support S̄>θ_grow; <0 => use hire_theta_off
-hire_confirm_bins: 1 # (int) bins in-change before sustained hard reset (confirm≥C each bin)
+hire_confirm_bins: 4 # (int) bins in-change before sustained hard reset (confirm≥C each bin)
 hire_cooldown_bins: 0 # (int) unused; n_f/n_s←W_f after reset replaces anti-chatter
 hire_spatial_kernel: 5 # (int) odd pool on S before in_change / hard-reset / soft-gate thresholds
-hire_gate_pool: avg # (str) spatial pool on S: avg=denoise spikes | max=connect blobs
-hire_reset_open: 1 # (int) odd morph open on seeds (1=off; >1 kills thin edge seeds)
+hire_gate_pool: max # (str) spatial pool on S: avg=denoise spikes | max=connect blobs
+hire_reset_open: 15 # (int) odd morph open on seeds (1=off; >1 kills thin edge seeds)
 hire_reset_grow: 6 # (int) geodesic dilate steps of seed inside {S̄>θ_grow}
 hire_normalize: True
 hire_quantile: 1.0
