@@ -29,12 +29,20 @@ def infer_sibling_render_root(
     *,
     preprocessor: str,
     source_render_dirname: str = "renders-spc8kHz",
+    render_tag: str = "",
 ) -> Path:
-    """Infer the sibling render root beside a source packed-SPAD render tree."""
+    """Infer the sibling render root beside a source packed-SPAD render tree.
+
+    With ``render_tag`` (e.g. ``2kHz``) the dirname is ``renders-{prep}-{tag}``;
+    otherwise ``renders-{prep}`` (legacy).
+    """
     spad_path = Path(spad_path).resolve()
+    prep = str(preprocessor).strip().lower()
+    tag = str(render_tag).strip()
+    dirname = f"renders-{prep}-{tag}" if tag else f"renders-{prep}"
     for parent in (spad_path.parent, *spad_path.parents):
         if parent.name == source_render_dirname:
-            return parent.parent / f"renders-{str(preprocessor).strip().lower()}"
+            return parent.parent / dirname
     raise ValueError(
         f"Could not locate source render directory {source_render_dirname!r} in path {spad_path}. "
         "Pass an explicit render root instead."
@@ -47,12 +55,14 @@ def sibling_sample_render_dir(
     preprocessor: str,
     sample_name: str,
     source_render_dirname: str = "renders-spc8kHz",
+    render_tag: str = "",
 ) -> Path:
-    """Return the per-sample sibling render cache directory beside renders-spc8kHz."""
+    """Return the per-sample sibling render cache directory beside the source SPAD tree."""
     root = infer_sibling_render_root(
         spad_path,
         preprocessor=preprocessor,
         source_render_dirname=source_render_dirname,
+        render_tag=render_tag,
     )
     return sample_render_dir(root, sample_name)
 
