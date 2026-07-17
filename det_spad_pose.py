@@ -478,7 +478,7 @@ def _scale_pose_preds_to_native(
         scaled[:, 2].clamp_(0, native_w - 1)
         scaled[:, 3].clamp_(0, native_h - 1)
         if scaled.shape[1] > 6 and nk > 0 and nd >= 2:
-            kpts = scaled[:, 6:].view(-1, nk, nd)
+            kpts = scaled[:, 6:].reshape(-1, nk, nd).clone()
             kpts[..., 0] = (kpts[..., 0] - pad_x) / ratio
             kpts[..., 1] = (kpts[..., 1] - pad_y) / ratio
             kpts[..., 0].clamp_(0, native_w - 1)
