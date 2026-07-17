@@ -235,9 +235,10 @@ def parse_args():
         help="Preprocessor subsampling. Default uses spad_bins_per_gt (same as cache_spad_renders).",
     )
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
+    ap.add_argument("--ppb-memory-size", type=int, default=10)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument("--ppb-min-filter-size", type=int, default=5)
     ap.add_argument(
         "--ema-alpha",
         type=float,

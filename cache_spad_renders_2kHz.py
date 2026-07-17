@@ -121,6 +121,7 @@ def parse_args():
     ap.add_argument("--ema-quantile", type=float, default=1.0)
     # PPB
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
+    ap.add_argument("--ppb-memory-size", type=int, default=10)
     ap.add_argument("--ppb-min-filter-size", type=int, default=5)
     ap.add_argument("--ppb-normalize", type=str, default="true")
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
@@ -194,6 +195,7 @@ def _build_preprocessor_kwargs(args, preprocessor: str) -> dict[str, Any]:
         return {
             "subsampling": subsampling,
             "bocpd_gamma": float(args.ppb_bocpd_gamma),
+            "memory_size": int(args.ppb_memory_size),
             "normalize": _as_bool(args.ppb_normalize),
             "quantile": float(args.ppb_quantile),
             "min_filter_size": int(args.ppb_min_filter_size),
@@ -447,7 +449,8 @@ def main():
         f"stride={args.stride_bins} bins_per_gt={args.spad_bins_per_gt} "
         f"source={args.source_render_dirname} tag={args.render_tag!r} "
         f"ema_alpha={args.ema_alpha} ppb_gamma={args.ppb_bocpd_gamma} "
-        f"ppb_min_filter={args.ppb_min_filter_size} (frames+meta only, no confidence)"
+        f"ppb_memory={args.ppb_memory_size} ppb_min_filter={args.ppb_min_filter_size} "
+        f"(frames+meta only, no confidence)"
     )
 
     for split_idx, split_path in enumerate(split_paths):

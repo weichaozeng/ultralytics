@@ -30,6 +30,7 @@ spad_preprocessor: ppb
 ppb_bocpd_gamma: 0.001
 ppb_quantile: 1.0
 ppb_normalize: true
+ppb_memory_size: 10
 ppb_min_filter_size: 5
 
 # backbone windowed spatio-temporal attention

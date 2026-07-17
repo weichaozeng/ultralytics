@@ -530,9 +530,10 @@ def main():
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     # PerPixelBayesian preprocessor
     ap.add_argument("--ppb_gamma", type=float, default=1e-3)
+    ap.add_argument("--ppb_memory_size", type=int, default=10)
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--ppb_min_filter_size", type=int, default=7)
+    ap.add_argument("--ppb_min_filter_size", type=int, default=5)
     # STEA preprocessor
     ap.add_argument("--stea_fast_window", type=int, default=16, help="Fast Gamma temporal basis length for STEA")
     ap.add_argument("--stea_slow_window", type=int, default=128, help="Slow boxcar temporal basis length for STEA")
@@ -635,6 +636,7 @@ def main():
         PerPixelBayesian(
             subsampling=int(args.chunk_size),
             bocpd_gamma=float(args.ppb_gamma),
+            memory_size=int(args.ppb_memory_size),
             normalize=bool(args.ppb_normalize),
             quantile=float(args.ppb_quantile),
             min_filter_size=int(args.ppb_min_filter_size),

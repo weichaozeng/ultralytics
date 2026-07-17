@@ -97,9 +97,10 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--font_scale", type=float, default=0.7)
     # PerPixelBayesian
     ap.add_argument("--ppb_gamma", type=float, default=1e-3)
+    ap.add_argument("--ppb_memory_size", type=int, default=10)
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--ppb_min_filter_size", type=int, default=7)
+    ap.add_argument("--ppb_min_filter_size", type=int, default=5)
     # Shared dynamic-range stretch (align brightness across methods)
     ap.add_argument("--sum_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--sum_quantile", type=float, default=1.0)
@@ -390,6 +391,7 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
         out["ppb"] = PerPixelBayesian(
             subsampling=emit,
             bocpd_gamma=float(args.ppb_gamma),
+            memory_size=int(args.ppb_memory_size),
             normalize=bool(args.ppb_normalize),
             quantile=float(args.ppb_quantile),
             min_filter_size=int(args.ppb_min_filter_size),
@@ -848,6 +850,7 @@ def main() -> None:
     if "ppb" in preprocessors:
         print(
             f"ppb: gamma={float(args.ppb_gamma):g} "
+            f"memory_size={int(args.ppb_memory_size)} "
             f"min_filter_size={int(args.ppb_min_filter_size)} "
             f"normalize={bool(args.ppb_normalize)}"
         )

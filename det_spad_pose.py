@@ -300,6 +300,7 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
         kwargs.update(
             {
                 "bocpd_gamma": float(args.ppb_bocpd_gamma),
+                "memory_size": int(args.ppb_memory_size),
                 "normalize": bool(args.ppb_normalize),
                 "quantile": float(args.ppb_quantile),
                 "min_filter_size": int(args.ppb_min_filter_size),
@@ -600,9 +601,10 @@ def main():
     )
     ap.add_argument("--spad-subsampling", type=int, default=320, help="Temporal subsampling used by override preprocessors.")
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
+    ap.add_argument("--ppb-memory-size", type=int, default=10)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument("--ppb-min-filter-size", type=int, default=5)
     ap.add_argument(
         "--ema-alpha",
         type=float,

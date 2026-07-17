@@ -62,9 +62,10 @@ def parse_args():
         help="Name of the source packed-SPAD render directory used to infer sibling render roots.",
     )
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
+    ap.add_argument("--ppb-memory-size", type=int, default=10)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", type=str, default="true")
-    ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument("--ppb-min-filter-size", type=int, default=5)
     ap.add_argument(
         "--ema-alpha",
         type=float,
@@ -155,6 +156,7 @@ def _build_preprocessor_kwargs(args) -> dict[str, Any]:
         return {
             "subsampling": subsampling,
             "bocpd_gamma": float(args.ppb_bocpd_gamma),
+            "memory_size": int(args.ppb_memory_size),
             "normalize": _as_bool(args.ppb_normalize),
             "quantile": float(args.ppb_quantile),
             "min_filter_size": int(args.ppb_min_filter_size),

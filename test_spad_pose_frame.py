@@ -149,6 +149,7 @@ def _build_frame_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsa
         return {
             "subsampling": spad_subsampling,
             "bocpd_gamma": float(args.ppb_bocpd_gamma),
+            "memory_size": int(args.ppb_memory_size),
             "normalize": bool(args.ppb_normalize),
             "quantile": float(args.ppb_quantile),
             "min_filter_size": int(args.ppb_min_filter_size),
@@ -572,9 +573,10 @@ def parse_args():
     ap.add_argument("--spad_subsampling", type=int, default=0)
     ap.add_argument("--input_gamma", type=float, default=0.0, help="Used for rendered-cache fingerprinting and override preprocessors")
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
+    ap.add_argument("--ppb-memory-size", type=int, default=10)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument("--ppb-min-filter-size", type=int, default=5)
     ap.add_argument(
         "--ema-alpha",
         type=float,

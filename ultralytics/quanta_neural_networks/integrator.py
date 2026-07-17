@@ -18,12 +18,12 @@ class PerPixelBayesian(nn.Module):
     def __init__(
         self,
         bocpd_gamma: float = 1e-3,
-        memory_size: int = 8,
+        memory_size: int = 10,
         subsampling: int = 1,
         hot_pixel_mask: Bool[np.ndarray, "h w"] = None,
         normalize: bool = False,
         quantile: float = 1.0,
-        min_filter_size: int = 7,
+        min_filter_size: int = 5,
     ):
         """
         Initialize a PerPixelBayesian smoothing module.
