@@ -1,3 +1,34 @@
+"""Offline 8 kHz SPAD render cache: sum / ema / ppb / stea / hire.
+
+Pipeline
+--------
+1. Split JSON with spad under ``renders-spc8kHz`` (e.g. ``train_8kHz.json`` / ``test_8kHz.json``).
+
+2. Cache preprocessed frames (no confidence)::
+
+     python cache_spad_renders_8kHz.py \\
+       --split-json /home/zvc/Data/visionsim/outputs/train_8kHz.json \\
+                    /home/zvc/Data/visionsim/outputs/test_8kHz.json \\
+       --json-output /home/zvc/Data/visionsim/outputs/train_8kHz.json \\
+                     /home/zvc/Data/visionsim/outputs/test_8kHz.json \\
+       --update-json \\
+       --preprocessors hire
+
+   Or cache several methods at once::
+
+     python cache_spad_renders_8kHz.py \\
+       --split-json .../train_8kHz.json .../test_8kHz.json \\
+       --update-json \\
+       --preprocessors sum ema ppb hire
+
+Reads packed SPAD from sibling ``renders-spc8kHz``, writes ``frames.npy`` + ``meta.json``
+under ``renders-{method}-8kHz`` (override with ``--render-tag``).
+
+Defaults match sequence HIRE @ 8 kHz / GT 125 Hz:
+  chunk=320, stride=320, bins_per_gt=64, spad_subsampling=64, bin_rate=8000.
+  HIRE hyperparams are the same as 2 kHz (α=exp(-1/W) from *_bins).
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -25,53 +56,97 @@ from ultralytics.data.spad_render_cache import (
 )
 from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_frame_preprocessor
 
+_PREPROCESSORS = ("sum", "ema", "ppb", "stea", "hire")
+_DEFAULT_PREPROCESSORS = ("hire",)
+
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Offline cache for SPAD chunk renders.")
-    ap.add_argument("--split-json", type=str, required=True, help="Path to VisionSIM split JSON.")
+    ap = argparse.ArgumentParser(
+        description="8 kHz SPAD cache: frames.npy + meta.json under renders-{method}[ -tag]."
+    )
+    ap.add_argument(
+        "--split-json",
+        type=str,
+        nargs="+",
+        required=True,
+        help="VisionSIM split JSON path(s), e.g. train_8kHz.json test_8kHz.json",
+    )
     ap.add_argument(
         "--output-root",
         type=str,
         default="",
-        help="Optional explicit cache root. If omitted, writes beside each sample's renders-spc8kHz tree.",
+        help="Optional explicit cache root. Default: sibling renders-{prep}-8kHz beside renders-spc8kHz.",
     )
-    ap.add_argument("--preprocessor", type=str, choices=["sum", "ema", "ppb", "stea", "hire"], required=True)
-    ap.add_argument("--chunk-size", type=int, default=320, help="Raw-bin chunk size per rendered frame.")
-    ap.add_argument("--stride-bins", type=int, default=320, help="Stride in raw bins between cached chunks.")
-    ap.add_argument("--spad-bins-per-gt", type=int, default=64, help="Raw bins corresponding to one GT frame.")
-    ap.add_argument("--packed-ch-order", type=str, default="RGB", help="Packed SPAD channel order.")
-    ap.add_argument("--input-gamma", type=float, default=2.2, help="Gamma correction applied to cached RGB frames.")
-    ap.add_argument("--device", type=str, default="cuda:0", help="Torch device for preprocessing.")
-    ap.add_argument("--overwrite", action="store_true", help="Overwrite per-sample cache outputs if they exist.")
-    ap.add_argument("--limit-samples", type=int, default=0, help="Optional number of samples to process for smoke tests.")
+    ap.add_argument(
+        "--preprocessors",
+        type=str,
+        nargs="+",
+        default=list(_DEFAULT_PREPROCESSORS),
+        choices=list(_PREPROCESSORS),
+        help="Preprocessors to cache (default: hire).",
+    )
+    ap.add_argument("--chunk-size", type=int, default=320, help="Bins per cached frame (=5 GT @ 125 Hz).")
+    ap.add_argument("--stride-bins", type=int, default=320)
+    ap.add_argument(
+        "--spad-bins-per-gt",
+        type=int,
+        default=64,
+        help="Raw bins per GT frame: 8000 Hz / 125 Hz GT = 64.",
+    )
+    ap.add_argument(
+        "--spad-subsampling",
+        type=int,
+        default=64,
+        help="Preprocessor recon step (must match train spad_subsampling; default 64 @ 8 kHz).",
+    )
+    ap.add_argument("--packed-ch-order", type=str, default="RGB")
+    ap.add_argument("--input-gamma", type=float, default=2.2)
+    ap.add_argument("--device", type=str, default="cuda:0")
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--limit-samples", type=int, default=0)
     ap.add_argument(
         "--update-json",
         action="store_true",
-        help="Write explicit render cache paths back into the split JSON after caching.",
+        help="Write frames/meta paths into output split JSON(s).",
     )
     ap.add_argument(
         "--json-output",
         type=str,
-        default="",
-        help="Optional output path for the updated split JSON. Defaults to in-place update when --update-json is set.",
+        nargs="*",
+        default=[],
+        help="Output JSON path(s) parallel to --split-json.",
     )
     ap.add_argument(
         "--source-render-dirname",
         type=str,
         default="renders-spc8kHz",
-        help="Name of the source packed-SPAD render directory used to infer sibling render roots.",
+        help="Source packed-SPAD directory name (default: renders-spc8kHz).",
     )
-    ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
-    ap.add_argument("--ppb-memory-size", type=int, default=10)
-    ap.add_argument("--ppb-quantile", type=float, default=1.0)
-    ap.add_argument("--ppb-normalize", type=str, default="true")
-    ap.add_argument("--ppb-min-filter-size", type=int, default=5)
+    ap.add_argument(
+        "--render-tag",
+        type=str,
+        default="8kHz",
+        help="Cache dir suffix: renders-{preprocessor}-{tag} (default: 8kHz).",
+    )
+    # EMA
     ap.add_argument(
         "--ema-alpha",
         type=float,
         default=0.0,
         help="EMA new-sample weight. <=0 uses 2/(subsampling+1) SMA-equivalent default.",
     )
+    ap.add_argument("--ema-normalize", type=str, default="true")
+    ap.add_argument("--ema-quantile", type=float, default=1.0)
+    # PPB
+    ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
+    ap.add_argument("--ppb-memory-size", type=int, default=10)
+    ap.add_argument("--ppb-min-filter-size", type=int, default=5)
+    ap.add_argument("--ppb-normalize", type=str, default="true")
+    ap.add_argument("--ppb-quantile", type=float, default=1.0)
+    # sum
+    ap.add_argument("--sum-normalize", type=str, default="true")
+    ap.add_argument("--sum-quantile", type=float, default=1.0)
+    # STEA
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
     ap.add_argument("--stea-temporal-window", type=int, default=5)
@@ -81,12 +156,8 @@ def parse_args():
     ap.add_argument("--stea-stable-prior", type=float, default=16.0)
     ap.add_argument("--stea-normalize", type=str, default="true")
     ap.add_argument("--stea-quantile", type=float, default=1.0)
-    ap.add_argument(
-        "--spad-bin-rate-hz",
-        type=float,
-        default=2000.0,
-        help="SPAD bin rate f_s (logging; HIRE alphas use α=exp(-1/W) from *_bins).",
-    )
+    # HIRE (same hyperparams as 2 kHz; only data-side rate/chunk differ)
+    ap.add_argument("--spad-bin-rate-hz", type=float, default=8000.0)
     ap.add_argument("--hire-fast-bins", type=int, default=24)
     ap.add_argument("--hire-slow-bins", type=int, default=160)
     ap.add_argument("--hire-surprise-bins", type=int, default=4)
@@ -103,10 +174,6 @@ def parse_args():
     ap.add_argument("--hire-gate-pool", type=str, default="max", choices=["max", "avg"])
     ap.add_argument("--hire-reset-open", type=int, default=15)
     ap.add_argument("--hire-reset-grow", type=int, default=6)
-    ap.add_argument("--sum-normalize", type=str, default="true")
-    ap.add_argument("--sum-quantile", type=float, default=1.0)
-    ap.add_argument("--ema-normalize", type=str, default="true")
-    ap.add_argument("--ema-quantile", type=float, default=1.0)
     ap.add_argument("--hire-normalize", type=str, default="true")
     ap.add_argument("--hire-quantile", type=float, default=1.0)
     return ap.parse_args()
@@ -132,21 +199,21 @@ def _apply_input_gamma(frame_tchw: torch.Tensor, gamma: float) -> torch.Tensor:
     return torch.pow(torch.clamp(frame_tchw, 0.0, 1.0), 1.0 / gamma)
 
 
-def _build_preprocessor_kwargs(args) -> dict[str, Any]:
-    name = str(args.preprocessor).strip().lower()
-    subsampling = int(args.spad_bins_per_gt)
+def _build_preprocessor_kwargs(args, preprocessor: str) -> dict[str, Any]:
+    name = str(preprocessor).strip().lower()
+    subsampling = int(args.spad_subsampling)
     if name == "sum":
         return {
             "subsampling": subsampling,
-            "normalize": _as_bool(getattr(args, "sum_normalize", True)),
-            "quantile": float(getattr(args, "sum_quantile", 1.0)),
+            "normalize": _as_bool(args.sum_normalize),
+            "quantile": float(args.sum_quantile),
         }
     if name == "ema":
         return {
             "subsampling": subsampling,
             "ema_alpha": float(args.ema_alpha),
-            "normalize": _as_bool(getattr(args, "ema_normalize", True)),
-            "quantile": float(getattr(args, "ema_quantile", 1.0)),
+            "normalize": _as_bool(args.ema_normalize),
+            "quantile": float(args.ema_quantile),
         }
     if name == "ppb":
         return {
@@ -190,30 +257,29 @@ def _build_preprocessor_kwargs(args) -> dict[str, Any]:
             "gate_pool": str(args.hire_gate_pool),
             "reset_open": int(args.hire_reset_open),
             "reset_grow": int(args.hire_reset_grow),
-            "normalize": _as_bool(getattr(args, "hire_normalize", True)),
-            "quantile": float(getattr(args, "hire_quantile", 1.0)),
+            "normalize": _as_bool(args.hire_normalize),
+            "quantile": float(args.hire_quantile),
         }
-    raise ValueError(f"Unsupported preprocessor: {name!r}")
+    raise ValueError(f"Unsupported preprocessor for 8 kHz cache: {name!r}")
 
 
 def _load_annotation_len(gt_path: str | Path) -> int:
     with Path(gt_path).open("r", encoding="utf-8") as f:
-        ann = json.load(f)
-    return len(ann)
+        return len(json.load(f))
 
 
-def _build_chunk_records(*, total_raw_bins: int, n_gt: int, chunk_size: int, stride_bins: int, spad_bins_per_gt: int) -> list[dict[str, Any]]:
+def _build_chunk_records(
+    *, total_raw_bins: int, n_gt: int, chunk_size: int, stride_bins: int, spad_bins_per_gt: int
+) -> list[dict[str, Any]]:
     if chunk_size <= 0 or stride_bins <= 0 or spad_bins_per_gt <= 0:
         raise ValueError("chunk_size, stride_bins and spad_bins_per_gt must be positive.")
     if chunk_size % spad_bins_per_gt != 0:
         raise ValueError(
-            f"chunk_size={chunk_size} must be divisible by spad_bins_per_gt={spad_bins_per_gt} "
-            "to preserve integer GT frame alignment."
+            f"chunk_size={chunk_size} must be divisible by spad_bins_per_gt={spad_bins_per_gt}."
         )
     if stride_bins % spad_bins_per_gt != 0:
         raise ValueError(
-            f"stride_bins={stride_bins} must be divisible by spad_bins_per_gt={spad_bins_per_gt} "
-            "to preserve integer GT frame alignment."
+            f"stride_bins={stride_bins} must be divisible by spad_bins_per_gt={spad_bins_per_gt}."
         )
     gt_chunk = chunk_size / spad_bins_per_gt
     records = []
@@ -236,16 +302,24 @@ def _build_chunk_records(*, total_raw_bins: int, n_gt: int, chunk_size: int, str
     return records
 
 
-def _render_chunk(*, preprocessor, packed_chunk: np.ndarray, packed_nch: int, packed_ch_order: str, input_gamma: float, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+def _render_frame(
+    *,
+    preprocessor,
+    packed_chunk: np.ndarray,
+    packed_nch: int,
+    packed_ch_order: str,
+    input_gamma: float,
+    device: torch.device,
+) -> np.ndarray:
+    """Return one CHW float32 RGB frame (no confidence)."""
     raw_chunk = packed_frames_to_raw_video(packed_chunk, ch_order=packed_ch_order)
     cube = raw_plane_to_photon_cube(raw_chunk_plane(raw_chunk, packed_nch=packed_nch), device=device, as_bool=True)
-    recons, confidence = preprocessor.process_photon_cube_to_frame(cube, clear_states=True)
+    recons, _confidence = preprocessor.process_photon_cube_to_frame(cube, clear_states=True)
     rgb = raw_hwt_to_rgb_float(recons.float(), packed_nch=packed_nch)
     if int(rgb.shape[0]) <= 0:
         raise ValueError("Frame preprocessor emitted zero frames for one chunk.")
     rgb = _apply_input_gamma(rgb[-1:].contiguous(), input_gamma).squeeze(0)
-    conf = confidence.float()
-    return rgb.detach().cpu().numpy().astype(np.float32, copy=False), conf.detach().cpu().numpy().astype(np.float32, copy=False)
+    return rgb.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
 def _load_split_payload(path: str | Path) -> dict[str, Any]:
@@ -256,38 +330,51 @@ def _load_split_payload(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-def _update_payload_entry(payload: dict[str, Any], sample: dict[str, str], *, preprocessor: str, render_dir: Path) -> None:
+def _update_payload_entry(
+    payload: dict[str, Any], sample: dict[str, str], *, preprocessor: str, render_dir: Path
+) -> None:
+    """Write frames + meta paths only (no confidence keys)."""
     samples = payload["samples"]
     sample_entry = samples.get(str(sample["id"]))
     if not isinstance(sample_entry, dict):
         raise KeyError(f"Missing sample entry for id={sample['id']!r} while updating JSON.")
     prefix = str(preprocessor).strip().lower()
     sample_entry[prefix] = str(render_dir / "frames.npy")
-    sample_entry[f"{prefix}_confidence"] = str(render_dir / "confidence.npy")
     sample_entry[f"{prefix}_meta"] = str(render_dir / "meta.json")
-    # Backward-compatible explicit directory key for older cache consumers.
     sample_entry[f"render_{prefix}"] = str(render_dir)
     sample_entry[f"render_{prefix}_frames"] = str(render_dir / "frames.npy")
-    sample_entry[f"render_{prefix}_confidence"] = str(render_dir / "confidence.npy")
     sample_entry[f"render_{prefix}_meta"] = str(render_dir / "meta.json")
+    for key in (f"{prefix}_confidence", f"render_{prefix}_confidence"):
+        sample_entry.pop(key, None)
 
 
-def _write_sample_cache(*, sample: dict[str, str], args, preprocessor, render_config: dict[str, Any], device: torch.device) -> dict[str, Any] | None:
+def _write_sample_cache(
+    *,
+    sample: dict[str, str],
+    args,
+    preprocessor_name: str,
+    preprocessor,
+    render_config: dict[str, Any],
+    device: torch.device,
+) -> dict[str, Any] | None:
     sample_name = str(sample["name"])
+    tag = str(args.render_tag).strip()
     if str(args.output_root).strip():
-        render_dir = sample_render_dir(args.output_root, sample_name)
+        leaf = f"renders-{preprocessor_name}-{tag}" if tag else f"renders-{preprocessor_name}"
+        render_dir = sample_render_dir(Path(args.output_root) / leaf, sample_name)
     else:
         render_dir = sibling_sample_render_dir(
             sample["spad"],
-            preprocessor=args.preprocessor,
+            preprocessor=preprocessor_name,
             sample_name=sample_name,
             source_render_dirname=args.source_render_dirname,
+            render_tag=tag,
         )
+
     frames_path = render_dir / "frames.npy"
-    confidence_path = render_dir / "confidence.npy"
     meta_path = render_dir / "meta.json"
-    if not args.overwrite and frames_path.exists() and confidence_path.exists() and meta_path.exists():
-        print(f"[skip] {sample_name}: cache already exists")
+    if not args.overwrite and frames_path.exists() and meta_path.exists():
+        print(f"[skip] {preprocessor_name} {sample_name}: cache already exists")
         return {"render_dir": render_dir}
 
     packed = np.load(sample["spad"], mmap_mode="r")
@@ -300,13 +387,13 @@ def _write_sample_cache(*, sample: dict[str, str], args, preprocessor, render_co
         spad_bins_per_gt=int(args.spad_bins_per_gt),
     )
     if not chunk_records:
-        print(f"[skip] {sample_name}: no valid chunks")
+        print(f"[skip] {preprocessor_name} {sample_name}: no valid chunks")
         return None
 
     packed_nch = infer_packed_nch(packed)
     first = chunk_records[0]
     first_chunk = np.asarray(packed[first["spad_start_bin"] : first["spad_end_bin"]])
-    first_frame, first_conf = _render_chunk(
+    first_frame = _render_frame(
         preprocessor=preprocessor,
         packed_chunk=first_chunk,
         packed_nch=packed_nch,
@@ -322,18 +409,11 @@ def _write_sample_cache(*, sample: dict[str, str], args, preprocessor, render_co
         dtype=np.float32,
         shape=(len(chunk_records),) + tuple(first_frame.shape),
     )
-    confidence_mm = np.lib.format.open_memmap(
-        confidence_path,
-        mode="w+",
-        dtype=np.float32,
-        shape=(len(chunk_records),) + tuple(first_conf.shape),
-    )
     frames_mm[0] = first_frame
-    confidence_mm[0] = first_conf
 
     for chunk in chunk_records[1:]:
         packed_chunk = np.asarray(packed[chunk["spad_start_bin"] : chunk["spad_end_bin"]])
-        frame, conf = _render_chunk(
+        frame = _render_frame(
             preprocessor=preprocessor,
             packed_chunk=packed_chunk,
             packed_nch=packed_nch,
@@ -342,10 +422,8 @@ def _write_sample_cache(*, sample: dict[str, str], args, preprocessor, render_co
             device=device,
         )
         frames_mm[chunk["chunk_index"]] = frame
-        confidence_mm[chunk["chunk_index"]] = conf
 
     del frames_mm
-    del confidence_mm
 
     for chunk in chunk_records:
         chunk["packed_nch"] = int(packed_nch)
@@ -357,12 +435,13 @@ def _write_sample_cache(*, sample: dict[str, str], args, preprocessor, render_co
         "render_dir": str(render_dir),
         "source_spad": str(sample["spad"]),
         "source_gt": str(sample["gt"]),
-        "preprocessor": str(args.preprocessor).strip().lower(),
+        "preprocessor": str(preprocessor_name).strip().lower(),
+        "render_tag": tag,
+        "source_render_dirname": str(args.source_render_dirname),
         "num_frames": len(chunk_records),
         "frame_shape": list(first_frame.shape),
-        "confidence_shape": list(first_conf.shape),
         "frame_dtype": "float32",
-        "confidence_dtype": "float32",
+        "has_confidence": False,
         "packed_nch": int(packed_nch),
         "config": render_config,
         "config_fingerprint": render_config_fingerprint(render_config),
@@ -372,67 +451,91 @@ def _write_sample_cache(*, sample: dict[str, str], args, preprocessor, render_co
         json.dump(meta, f, indent=2)
 
     print(
-        f"[ok] {sample_name}: {len(chunk_records)} chunks -> {render_dir} "
-        f"shape={tuple(first_frame.shape)} conf={tuple(first_conf.shape)}"
+        f"[ok] {preprocessor_name} {sample_name}: {len(chunk_records)} chunks -> {render_dir} "
+        f"shape={tuple(first_frame.shape)}"
     )
-    meta["render_dir"] = str(render_dir)
-    return meta
+    return {"render_dir": str(render_dir)}
 
 
 def main():
     args = parse_args()
-    payload = _load_split_payload(args.split_json) if args.update_json else None
-    samples = load_visionsim_split_json(args.split_json)
-    if int(args.limit_samples) > 0:
-        samples = samples[: int(args.limit_samples)]
+    preprocessors = [str(x).strip().lower() for x in args.preprocessors]
+    split_paths = [Path(p) for p in args.split_json]
+    json_outputs = [Path(p) for p in args.json_output] if args.json_output else []
+    if json_outputs and len(json_outputs) != len(split_paths):
+        raise ValueError(
+            f"--json-output length ({len(json_outputs)}) must match --split-json ({len(split_paths)})."
+        )
 
     device = torch.device(args.device)
-    preprocessor_kwargs = _build_preprocessor_kwargs(args)
-    preprocessor = build_spad_frame_preprocessor(args.preprocessor, kwargs=preprocessor_kwargs).to(device)
-    render_config = build_render_config(
-        preprocessor=args.preprocessor,
-        chunk_size=int(args.chunk_size),
-        stride_bins=int(args.stride_bins),
-        spad_bins_per_gt=int(args.spad_bins_per_gt),
-        packed_ch_order=args.packed_ch_order,
-        input_gamma=float(args.input_gamma),
-        extra_kwargs=preprocessor_kwargs,
-    )
     output_root = Path(args.output_root) if str(args.output_root).strip() else None
     if output_root is not None:
         output_root.mkdir(parents=True, exist_ok=True)
 
-    written = 0
-    for sample in samples:
-        meta = _write_sample_cache(
-            sample=sample,
-            args=args,
-            preprocessor=preprocessor,
-            render_config=render_config,
-            device=device,
-        )
-        if meta is not None:
-            written += 1
-            if payload is not None:
-                _update_payload_entry(
-                    payload,
-                    sample,
-                    preprocessor=args.preprocessor,
-                    render_dir=Path(meta["render_dir"]),
-                )
-
-    if payload is not None:
-        json_output = Path(args.json_output) if str(args.json_output).strip() else Path(args.split_json)
-        json_output.parent.mkdir(parents=True, exist_ok=True)
-        with json_output.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        print(f"Updated split JSON: {json_output}")
-
+    tag = str(args.render_tag).strip()
+    dir_pattern = f"renders-{{method}}-{tag}" if tag else "renders-{method}"
     print(
-        f"Done. processed_samples={len(samples)} newly_written={written} "
-        f"fingerprint={render_config_fingerprint(render_config)} "
-        f"output_root={output_root if output_root is not None else '<sibling-to-renders-spc8kHz>'}"
+        f"8kHz cache: preprocessors={preprocessors} chunk={args.chunk_size} "
+        f"stride={args.stride_bins} bins_per_gt={args.spad_bins_per_gt} "
+        f"subsampling={args.spad_subsampling} bin_rate={args.spad_bin_rate_hz:g} "
+        f"source={args.source_render_dirname} tag={tag!r} "
+        f"hire W_f/s/S={args.hire_fast_bins}/{args.hire_slow_bins}/{args.hire_surprise_bins} "
+        f"(frames+meta only, no confidence)"
     )
+
+    for split_idx, split_path in enumerate(split_paths):
+        payload = _load_split_payload(split_path) if args.update_json else None
+        samples = load_visionsim_split_json(split_path)
+        if int(args.limit_samples) > 0:
+            samples = samples[: int(args.limit_samples)]
+
+        written = 0
+        for prep_name in preprocessors:
+            kwargs = _build_preprocessor_kwargs(args, prep_name)
+            preprocessor = build_spad_frame_preprocessor(prep_name, kwargs=kwargs).to(device)
+            render_config = build_render_config(
+                preprocessor=prep_name,
+                chunk_size=int(args.chunk_size),
+                stride_bins=int(args.stride_bins),
+                spad_bins_per_gt=int(args.spad_bins_per_gt),
+                packed_ch_order=args.packed_ch_order,
+                input_gamma=float(args.input_gamma),
+                extra_kwargs=kwargs,
+            )
+            print(
+                f"=== {split_path.name} / {prep_name} "
+                f"fingerprint={render_config_fingerprint(render_config)} ==="
+            )
+            for sample in samples:
+                meta = _write_sample_cache(
+                    sample=sample,
+                    args=args,
+                    preprocessor_name=prep_name,
+                    preprocessor=preprocessor,
+                    render_config=render_config,
+                    device=device,
+                )
+                if meta is not None:
+                    written += 1
+                    if payload is not None:
+                        _update_payload_entry(
+                            payload,
+                            sample,
+                            preprocessor=prep_name,
+                            render_dir=Path(meta["render_dir"]),
+                        )
+
+        if payload is not None:
+            out_path = json_outputs[split_idx] if json_outputs else split_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            print(f"Updated split JSON: {out_path}")
+
+        print(
+            f"Done split={split_path} samples={len(samples)} write_ops={written} "
+            f"dirs={dir_pattern} from {args.source_render_dirname}"
+        )
 
 
 if __name__ == "__main__":

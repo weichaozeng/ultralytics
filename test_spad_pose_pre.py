@@ -116,7 +116,7 @@ def _render_raw_chunk_to_bgr(
     input_gamma: float,
     device: torch.device,
 ) -> np.ndarray:
-    """One raw SPAD chunk -> one detector BGR frame (same path as cache_spad_renders)."""
+    """One raw SPAD chunk -> one detector BGR frame (same path as cache_spad_renders_*)."""
     cube = raw_plane_to_photon_cube(raw_chunk_plane(raw_chunk, packed_nch=packed_nch), device=device, as_bool=True)
     recons, _confidence = preprocessor.process_photon_cube_to_frame(cube, clear_states=True)
     rgb = raw_hwt_to_rgb_float(recons.float(), packed_nch=int(packed_nch))
@@ -218,7 +218,7 @@ def parse_args():
         dest="cube_chunk_t",
         type=int,
         default=320,
-        help="Raw-bin chunk size per reconstructed frame (raw mode). Matches cache_spad_renders --chunk-size default.",
+        help="Raw-bin chunk size per reconstructed frame (raw mode). Matches cache_spad_renders_* --chunk-size default.",
     )
     ap.add_argument(
         "--cube_chunk_stride",
@@ -232,7 +232,7 @@ def parse_args():
         "--spad_subsampling",
         type=int,
         default=0,
-        help="Preprocessor subsampling. Default uses spad_bins_per_gt (same as cache_spad_renders).",
+        help="Preprocessor subsampling. Default uses spad_bins_per_gt (same as cache_spad_renders_*).",
     )
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
     ap.add_argument("--ppb-memory-size", type=int, default=10)
