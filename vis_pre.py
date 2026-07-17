@@ -433,6 +433,25 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
     return out
 
 
+def _reset_integrator_states(integrators: dict[str, object]) -> None:
+    """Clear causal state before the first chunk (idempotent on fresh builds)."""
+    for integrator in integrators.values():
+        clear = getattr(integrator, "clear_states", None)
+        if callable(clear):
+            clear()
+            continue
+        # PPB / STEA: mirror process_photon_cube(clear_states=True) entry.
+        if hasattr(integrator, "t_absolute"):
+            integrator.t_absolute = 0
+        clear_hist = getattr(integrator, "_clear_histories", None)
+        if callable(clear_hist):
+            clear_hist()
+        if hasattr(integrator, "_h"):
+            integrator._h = None
+            integrator._w = None
+            integrator._t = None
+
+
 def _preprocess_sum_gray(
     raw_chunk: np.ndarray,
     *,
