@@ -293,6 +293,8 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
         return None, None
 
     spad_subsampling = int(getattr(args, "spad_subsampling", 64))
+    if spad_subsampling <= 0:
+        spad_subsampling = 64
     kwargs: dict[str, Any] = {"subsampling": spad_subsampling}
     if name == "ppb":
         kwargs.update(

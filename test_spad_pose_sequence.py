@@ -774,17 +774,35 @@ def _run_sequence_chunk_forward(spad_model, seq_tensor: torch.Tensor, *, t_index
     return spad_model(seq_tensor)
 
 
-def _apply_sequence_preprocessor_override(spad_model, args, device, effective_preprocessor: str) -> None:
-    if effective_preprocessor == "model":
+def _apply_sequence_preprocessor_override(
+    spad_model, args, device, effective_preprocessor: str, *, spad_subsampling: int
+) -> None:
+    """Optionally replace the checkpoint preprocessor for raw-mode inference.
+
+    When ``--preprocessor model`` (default), keep the checkpoint module. Only rebuild
+    when the user explicitly requests another preprocessor name.
+    """
+    requested = str(getattr(args, "preprocessor", "model")).strip().lower()
+    legacy = str(getattr(args, "preprocessor_override", "none")).strip().lower()
+    explicit_override = requested not in {"", "model"} or legacy not in {"", "none"}
+    if not explicit_override:
         return
-    args.preprocessor_override = effective_preprocessor
-    override_name, override_preprocessor = _build_override_preprocessor(args)
+
+    override_name = requested if requested not in {"", "model"} else legacy
+    args.preprocessor_override = override_name
+    # CLI default spad_subsampling=0 means "from ckpt"; never pass 0 into a new module.
+    prev_sub = getattr(args, "spad_subsampling", 0)
+    args.spad_subsampling = max(int(spad_subsampling), 1)
+    try:
+        name, override_preprocessor = _build_override_preprocessor(args)
+    finally:
+        args.spad_subsampling = prev_sub
     if override_preprocessor is None:
         return
-    if override_name == "hyb" and args.tracker not in {"spad_tracker", "spad_posetrack"}:
+    if name == "hyb" and args.tracker not in {"spad_tracker", "spad_posetrack"}:
         raise ValueError("--preprocessor hyb requires --tracker spad_tracker or spad_posetrack")
     spad_model.preprocessor = override_preprocessor.to(device)
-    spad_model.preprocessor_name = override_name
+    spad_model.preprocessor_name = name
 
 
 def parse_args():
@@ -1006,7 +1024,13 @@ def main():
     )
 
     if resolved_cache_mode == "raw":
-        _apply_sequence_preprocessor_override(spad_model, args, device, effective_preprocessor)
+        _apply_sequence_preprocessor_override(
+            spad_model,
+            args,
+            device,
+            effective_preprocessor,
+            spad_subsampling=spad_subsampling,
+        )
         spad_model.spad_cache_mode = "raw"
     else:
         spad_model.spad_cache_mode = "rendered"

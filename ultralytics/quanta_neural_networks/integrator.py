@@ -41,7 +41,7 @@ class PerPixelBayesian(nn.Module):
 
         self.bocpd_gamma = bocpd_gamma
         self.memory_size = memory_size
-        self.subsampling = subsampling
+        self.subsampling = max(int(subsampling), 1)
         self.hot_pixel_mask = hot_pixel_mask
         self.normalize = normalize
         self.quantile = quantile
