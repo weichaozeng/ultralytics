@@ -8,23 +8,30 @@ import numpy as np
 import torch
 from torch import Tensor
 
+# Common VisionSIM packed widths (512→64, 1024→128). Detection no longer requires these.
 PACKED_WIDTHS = (64, 128)
+
+
+def infer_packed_expected_w(arr: np.ndarray) -> int:
+    """Infer unpacked RGB-plane width from packed ``(T,H,Wpacked,C)`` (``Wpacked * 8``)."""
+    if arr.ndim != 4 or arr.shape[-1] not in (3, 4):
+        raise ValueError(f"Expected packed (T,H,Wpacked,3|4), got shape={arr.shape}")
+    return int(arr.shape[2]) * 8
 
 
 def infer_packed_nch(arr: np.ndarray) -> int:
     """Infer packed channel semantics from a SPAD array layout."""
-    if arr.ndim == 4 and arr.shape[-1] in (3, 4) and arr.shape[2] in PACKED_WIDTHS:
+    if arr.ndim == 4 and arr.shape[-1] in (3, 4):
         return int(arr.shape[-1])
     return 4
 
 
 def is_packed_spad(arr: np.ndarray) -> bool:
-    """True for `(T, H, Wpacked, 3)` synthetic or `(T, H, Wpacked, 4)` real RGGB planes."""
-    return (
-        arr.ndim == 4
-        and arr.shape[-1] in (3, 4)
-        and arr.shape[2] in PACKED_WIDTHS
-    )
+    """True for ``(T, H, Wpacked, 3)`` synthetic or ``(T, H, Wpacked, 4)`` real RGGB planes.
+
+    ``Wpacked`` may be any positive width (VisionSIM uses 64/128; H2O 1280px → 160).
+    """
+    return arr.ndim == 4 and arr.shape[-1] in (3, 4) and int(arr.shape[2]) >= 1
 
 
 def is_synthetic_packed(packed_nch: int) -> bool:
@@ -32,16 +39,27 @@ def is_synthetic_packed(packed_nch: int) -> bool:
     return int(packed_nch) == 3
 
 
-def unpack_packed_frames(frames_packed: np.ndarray, *, expected_w: int = 512) -> np.ndarray:
-    """Unpack bit-packed width to boolean planes ``(T, H, W, C)`` with ``C`` in {3, 4}."""
+def unpack_packed_frames(frames_packed: np.ndarray, *, expected_w: int | None = None) -> np.ndarray:
+    """Unpack bit-packed width to boolean planes ``(T, H, W, C)`` with ``C`` in {3, 4}.
+
+    Args:
+        frames_packed: Packed uint8 array ``(T, H, Wpacked, C)``.
+        expected_w: Crop/pad target for the unpacked width. ``None`` or ``<=0`` keeps the
+            full unpacked width ``Wpacked * 8`` (needed for non-512 sources such as H2O).
+    """
     if frames_packed.ndim != 4 or frames_packed.shape[-1] not in (3, 4):
         raise ValueError(
             f"Expected packed frames (T,H,Wpacked,3|4), got shape={frames_packed.shape}"
         )
 
     unpacked = np.unpackbits(frames_packed, axis=2)
-    if unpacked.shape[2] > expected_w:
-        unpacked = unpacked[:, :, :expected_w, :]
+    full_w = int(unpacked.shape[2])
+    target_w = full_w if expected_w is None or int(expected_w) <= 0 else int(expected_w)
+    if unpacked.shape[2] > target_w:
+        unpacked = unpacked[:, :, :target_w, :]
+    elif unpacked.shape[2] < target_w:
+        pad = target_w - int(unpacked.shape[2])
+        unpacked = np.pad(unpacked, ((0, 0), (0, 0), (0, pad), (0, 0)), mode="constant")
     return unpacked.astype(bool, copy=False)
 
 
@@ -81,7 +99,7 @@ def _unpacked4_to_bayer(unpacked: np.ndarray, ch_order: str) -> np.ndarray:
 def packed_frames_to_raw_bayer(
     frames_packed: np.ndarray,
     *,
-    expected_w: int = 512,
+    expected_w: int | None = None,
     ch_order: str = "RGB",
 ) -> np.ndarray:
     """Expand packed frames to Bayer raw ``(T, 2H, 2W)`` uint8."""
@@ -95,10 +113,13 @@ def packed_frames_to_raw_bayer(
 def packed_frames_to_raw_video(
     frames_packed: np.ndarray,
     *,
-    expected_w: int = 512,
+    expected_w: int | None = None,
     ch_order: str = "RGB",
 ) -> np.ndarray:
-    """Convert packed frames to integrator-ready Bayer raw ``(T, 2H, 2W, 1)`` uint8."""
+    """Convert packed frames to integrator-ready Bayer raw ``(T, 2H, 2W, 1)`` uint8.
+
+    ``expected_w<=0`` / ``None`` keeps full ``Wpacked*8`` (no VisionSIM 512 crop).
+    """
     raw = packed_frames_to_raw_bayer(frames_packed, expected_w=expected_w, ch_order=ch_order)
     return raw[:, :, :, None]
 

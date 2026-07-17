@@ -54,7 +54,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--save_dir", type=Path, required=True, help="Output root")
     ap.add_argument("--pre", type=str, default="sum,ema,ppb,stea,hire", help="Comma-separated preprocessors")
     ap.add_argument("--bitdim", type=int, default=2, help="0-based axis to unpack with np.unpackbits")
-    ap.add_argument("--expected_w", type=int, default=512, help="Crop unpacked bit dimension to this width")
+    ap.add_argument("--expected_w", type=int, default=0, help="Crop unpacked bit dimension; 0=keep full Wpacked*8")
     ap.add_argument("--bitorder", type=str, default="big", choices=["big", "little"])
     ap.add_argument("--flip_x", action="store_true", help="Flip frames left-right before preprocessing")
     ap.add_argument("--flip_y", action="store_true", help="Flip frames top-bottom before preprocessing")

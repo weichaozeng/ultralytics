@@ -39,6 +39,7 @@ from tqdm import tqdm
 
 from ultralytics import YOLO
 from ultralytics.data.spad_packed import (
+    infer_packed_expected_w,
     infer_packed_nch,
     is_packed_spad,
     packed_frames_to_raw_video,
@@ -128,8 +129,10 @@ def draw_pose(img_bgr: np.ndarray, pose_kpts: np.ndarray, thresh: float = 0.5, k
     return img_bgr
 
 
-def _packed_frames_to_raw_video(frames_packed: np.ndarray, *, expected_w: int = 512, ch_order: str = "RGB") -> np.ndarray:
-    """Convert packed `(T,H,Wpacked,3|4)` to raw SPAD video."""
+def _packed_frames_to_raw_video(
+    frames_packed: np.ndarray, *, expected_w: int | None = None, ch_order: str = "RGB"
+) -> np.ndarray:
+    """Convert packed `(T,H,Wpacked,3|4)` to raw SPAD video (full width when expected_w<=0/None)."""
     return packed_frames_to_raw_video(frames_packed, expected_w=expected_w, ch_order=ch_order)
 
 
@@ -144,12 +147,14 @@ class RawVideoSource:
     array: np.ndarray
     layout: str
     packed_nch: int = 4
+    expected_w: int = 0  # 0 => full Wpacked*8 for packed layouts
 
 
-def _video_sources_from_array(arr: np.ndarray) -> list[RawVideoSource]:
+def _video_sources_from_array(arr: np.ndarray, *, expected_w: int = 0) -> list[RawVideoSource]:
     """Describe supported layouts without materializing the full raw video."""
     if is_packed_spad(arr):
-        return [RawVideoSource(arr, "packed", packed_nch=infer_packed_nch(arr))]
+        ew = int(expected_w) if int(expected_w) > 0 else infer_packed_expected_w(arr)
+        return [RawVideoSource(arr, "packed", packed_nch=infer_packed_nch(arr), expected_w=ew)]
     if arr.ndim == 4 and arr.shape[-1] == 1:
         return [RawVideoSource(arr, "thwc1", packed_nch=4)]
     if arr.ndim == 3:
@@ -159,16 +164,16 @@ def _video_sources_from_array(arr: np.ndarray) -> list[RawVideoSource]:
     raise ValueError(f"Unsupported input shape: {arr.shape}")
 
 
-def _iter_raw_video_sources_from_sample_path(in_path: Path):
+def _iter_raw_video_sources_from_sample_path(in_path: Path, *, expected_w: int = 0):
     """Yield lazy video sources from a sample path."""
     if in_path.is_dir():
         files = sorted([p for p in in_path.iterdir() if p.suffix.lower() == ".npy"])
         for p in files:
-            yield from _video_sources_from_array(_np_load(p))
+            yield from _video_sources_from_array(_np_load(p), expected_w=expected_w)
         return
 
     if in_path.suffix.lower() == ".npy":
-        yield from _video_sources_from_array(_np_load(in_path))
+        yield from _video_sources_from_array(_np_load(in_path), expected_w=expected_w)
         return
 
     raise ValueError(f"Unsupported input path: {in_path}")
@@ -186,7 +191,8 @@ def _slice_raw_chunk(source: RawVideoSource, t0: int, t1: int, *, packed_ch_orde
     """Load one raw `(T,H,W,1)` chunk from a lazy source."""
     if source.layout == "packed":
         packed = np.asarray(source.array[t0:t1])
-        return _packed_frames_to_raw_video(packed, ch_order=packed_ch_order)
+        ew = int(source.expected_w) if int(source.expected_w) > 0 else None
+        return _packed_frames_to_raw_video(packed, expected_w=ew, ch_order=packed_ch_order)
     if source.layout == "thwc1":
         return np.ascontiguousarray(source.array[t0:t1].astype(np.uint8, copy=False))
     if source.layout == "thw":
@@ -394,6 +400,92 @@ def _recon_frames_bgr(model, batch_index: int = 0) -> list[np.ndarray]:
         rgb = frames[:, batch_index].detach().float().cpu().permute(0, 2, 3, 1).numpy()
     bgr = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)[:, :, :, ::-1]
     return [np.ascontiguousarray(frame) for frame in bgr]
+
+
+def _letterbox_tbchw(
+    frames_t_b_c_h_w: torch.Tensor, imgsz: int
+) -> tuple[torch.Tensor, dict[str, float | int | tuple[int, int]]]:
+    """Letterbox ``T,B,3,H,W`` float frames to square ``imgsz`` (preserve aspect)."""
+    if frames_t_b_c_h_w.ndim != 5 or int(frames_t_b_c_h_w.shape[2]) != 3:
+        raise ValueError(f"Expected T,B,3,H,W frames, got shape={tuple(frames_t_b_c_h_w.shape)}")
+    imgsz = int(imgsz)
+    if imgsz <= 0:
+        raise ValueError(f"imgsz must be positive, got {imgsz}")
+
+    t, b, c, h, w = map(int, frames_t_b_c_h_w.shape)
+    if h == imgsz and w == imgsz:
+        meta = {
+            "ratio": 1.0,
+            "pad_x": 0.0,
+            "pad_y": 0.0,
+            "native_hw": (h, w),
+            "imgsz": imgsz,
+        }
+        return frames_t_b_c_h_w, meta
+
+    ratio = min(imgsz / float(h), imgsz / float(w))
+    new_h = max(int(round(h * ratio)), 1)
+    new_w = max(int(round(w * ratio)), 1)
+    flat = frames_t_b_c_h_w.reshape(t * b, c, h, w)
+    resized = torch.nn.functional.interpolate(flat, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    pad_h = imgsz - new_h
+    pad_w = imgsz - new_w
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    boxed = torch.nn.functional.pad(resized, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+    out = boxed.reshape(t, b, c, imgsz, imgsz)
+    meta = {
+        "ratio": float(ratio),
+        "pad_x": float(pad_left),
+        "pad_y": float(pad_top),
+        "native_hw": (h, w),
+        "imgsz": imgsz,
+    }
+    return out, meta
+
+
+def _scale_pose_preds_to_native(
+    preds: list[torch.Tensor],
+    *,
+    scale_meta: dict[str, float | int | tuple[int, int]] | None,
+    kpt_shape,
+) -> list[torch.Tensor]:
+    """Map detector-space pose preds (letterboxed imgsz) back to native recon coordinates."""
+    if not scale_meta:
+        return preds
+    ratio = float(scale_meta["ratio"])
+    pad_x = float(scale_meta["pad_x"])
+    pad_y = float(scale_meta["pad_y"])
+    native_h, native_w = map(int, scale_meta["native_hw"])
+    if ratio <= 0:
+        return preds
+
+    nk, nd = int(kpt_shape[0]), int(kpt_shape[1])
+    out = []
+    for pred in preds:
+        if pred is None or pred.numel() == 0:
+            out.append(pred)
+            continue
+        scaled = pred.clone()
+        scaled[:, 0] = (scaled[:, 0] - pad_x) / ratio
+        scaled[:, 1] = (scaled[:, 1] - pad_y) / ratio
+        scaled[:, 2] = (scaled[:, 2] - pad_x) / ratio
+        scaled[:, 3] = (scaled[:, 3] - pad_y) / ratio
+        scaled[:, 0].clamp_(0, native_w - 1)
+        scaled[:, 1].clamp_(0, native_h - 1)
+        scaled[:, 2].clamp_(0, native_w - 1)
+        scaled[:, 3].clamp_(0, native_h - 1)
+        if scaled.shape[1] > 6 and nk > 0 and nd >= 2:
+            kpts = scaled[:, 6:].view(-1, nk, nd)
+            kpts[..., 0] = (kpts[..., 0] - pad_x) / ratio
+            kpts[..., 1] = (kpts[..., 1] - pad_y) / ratio
+            kpts[..., 0].clamp_(0, native_w - 1)
+            kpts[..., 1].clamp_(0, native_h - 1)
+            scaled[:, 6:] = kpts.reshape(scaled.shape[0], -1)
+        out.append(scaled)
+    return out
 
 
 def _resize_to_shape_bgr(img_bgr: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:

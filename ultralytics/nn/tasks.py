@@ -674,6 +674,9 @@ class SpadPoseModel(PoseModel):
         self.spad_last_recon_frames = None
         self.spad_pending_t_index_ll = None
         self.spad_online_inference = False
+        # Detector letterbox size (0 = feed native recon resolution). Native frames kept in spad_last_recon_frames.
+        self.spad_detect_imgsz = 0
+        self.spad_scale_meta = None
 
         super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
 
@@ -964,7 +967,7 @@ class SpadPoseModel(PoseModel):
             )
         self.spad_t_index_ll = [int(v) for v in t_index_ll]
         self.spad_last_recon_frames = frames_t_b_c_h_w.detach()
-        return frames_t_b_c_h_w, self.spad_t_index_ll
+        return self._spad_maybe_letterbox_for_detector(frames_t_b_c_h_w)
 
     def _spad_begin_temporal_forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
         """Route raw SPAD or cached rendered clips into the shared temporal YOLO path."""
@@ -976,6 +979,53 @@ class SpadPoseModel(PoseModel):
         raise ValueError(
             f"SpadPoseModel expected raw SPAD B,T,H,W,1 or rendered B,T,3,H,W input, got shape={tuple(x.shape)}"
         )
+
+    def _spad_maybe_letterbox_for_detector(
+        self, frames_t_b_c_h_w: torch.Tensor
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Keep native recon for viz; letterbox a copy for the detector when spad_detect_imgsz>0."""
+        imgsz = int(getattr(self, "spad_detect_imgsz", 0) or 0)
+        t_index_ll = list(getattr(self, "spad_t_index_ll", []) or [])
+        if imgsz <= 0:
+            self.spad_scale_meta = None
+            return frames_t_b_c_h_w, t_index_ll
+
+        if frames_t_b_c_h_w.ndim != 5 or int(frames_t_b_c_h_w.shape[2]) != 3:
+            raise ValueError(f"Expected T,B,3,H,W frames, got shape={tuple(frames_t_b_c_h_w.shape)}")
+        t, b, c, h, w = map(int, frames_t_b_c_h_w.shape)
+        if h == imgsz and w == imgsz:
+            self.spad_scale_meta = {
+                "ratio": 1.0,
+                "pad_x": 0.0,
+                "pad_y": 0.0,
+                "native_hw": (h, w),
+                "imgsz": imgsz,
+            }
+            return frames_t_b_c_h_w, t_index_ll
+
+        ratio = min(imgsz / float(h), imgsz / float(w))
+        new_h = max(int(round(h * ratio)), 1)
+        new_w = max(int(round(w * ratio)), 1)
+        flat = frames_t_b_c_h_w.reshape(t * b, c, h, w)
+        resized = torch.nn.functional.interpolate(flat, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        pad_h = imgsz - new_h
+        pad_w = imgsz - new_w
+        pad_top = pad_h // 2
+        pad_left = pad_w // 2
+        boxed = torch.nn.functional.pad(
+            resized,
+            (pad_left, pad_w - pad_left, pad_top, pad_h - pad_top),
+            value=0.0,
+        )
+        self.spad_scale_meta = {
+            "ratio": float(ratio),
+            "pad_x": float(pad_left),
+            "pad_y": float(pad_top),
+            "native_hw": (h, w),
+            "imgsz": imgsz,
+        }
+        # Native recon remains in spad_last_recon_frames for visualization / native-space preds.
+        return boxed.reshape(t, b, c, imgsz, imgsz), t_index_ll
 
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
         """Run the standard YOLO graph, injecting SPAD modules for raw SPAD video tensors."""
@@ -1053,7 +1103,7 @@ class SpadPoseModel(PoseModel):
         self.spad_num_frame = int(frames_t_b_c_h_w.shape[0])
         self.spad_t_index_ll = t_index_ll or []
         self.spad_last_recon_frames = frames_t_b_c_h_w.detach()
-        return frames_t_b_c_h_w, self.spad_t_index_ll
+        return self._spad_maybe_letterbox_for_detector(frames_t_b_c_h_w)
 
     def _spad_process_full_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
         """Process one full raw SPAD window into reconstructed frames."""

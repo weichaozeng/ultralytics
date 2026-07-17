@@ -45,6 +45,7 @@ from det_spad_pose import (
     _resolve_device,
     _results_from_preds,
     _resize_to_shape_bgr,
+    _scale_pose_preds_to_native,
     _set_velocity_field_on_preprocessor,
     _slice_raw_chunk,
     _trained_chunk_t,
@@ -905,6 +906,19 @@ def parse_args():
         action="store_true",
         help="Deprecated: final chunks shorter than cube_chunk_t are always dropped.",
     )
+    ap.add_argument(
+        "--imgsz",
+        type=int,
+        default=512,
+        help="Letterbox reconstructed frames to this square size for the detector. "
+        "Preprocessor still runs at native resolution. Predictions are scaled back. 0 disables.",
+    )
+    ap.add_argument(
+        "--expected_w",
+        type=int,
+        default=0,
+        help="Unpacked RGB-plane width for packed SPAD. 0 = auto (Wpacked*8, no VisionSIM 512 crop).",
+    )
     ap.add_argument("--vis", nargs="?", const="video", default="none", choices=["none", "image", "video"])
     ap.add_argument("--vis_bg", type=str, default="recon", choices=["sum", "recon"])
     ap.add_argument("--save_readrgb", action=argparse.BooleanOptionalAction, default=False)
@@ -941,6 +955,12 @@ def main():
     spad_model.to(device)
     spad_model.eval()
     _configure_model_spad_bin_rate(spad_model, current_bin_rate_hz=float(args.spad_bin_rate_hz))
+    spad_model.spad_detect_imgsz = int(args.imgsz)
+    if int(args.imgsz) > 0:
+        print(
+            f"Detector letterbox imgsz={int(args.imgsz)} "
+            f"(preprocess at native resolution; preds scaled back for viz/JSON)"
+        )
 
     names = yolo.names
     kpt_shape = getattr(spad_model, "kpt_shape", (21, 3))
@@ -1079,6 +1099,8 @@ def main():
                 "spad_online": bool(args.spad_online),
                 "requested_spad_online": bool(args.spad_online),
                 "source_bin_convention": "chunk_end_bin",
+                "imgsz": int(args.imgsz),
+                "expected_w": int(args.expected_w),
             },
             "source": {
                 "path": str(sample_path),
@@ -1090,7 +1112,9 @@ def main():
             sample_record["source"]["split_record"] = sample_spec["record"]
 
         if resolved_cache_mode == "raw":
-            video_iter = _iter_raw_video_sources_from_sample_path(sample_path)
+            video_iter = _iter_raw_video_sources_from_sample_path(
+                sample_path, expected_w=int(args.expected_w)
+            )
             for video_idx, source in enumerate(tqdm(video_iter, desc=f"Testing [{sample_name}]")):
                 total_bins = _video_num_bins(source)
                 gt_aligned = sample_spec.get("record") is not None
@@ -1125,6 +1149,7 @@ def main():
                     "video_idx": int(video_idx),
                     "layout": source.layout,
                     "packed_nch": int(source.packed_nch),
+                    "expected_w": int(getattr(source, "expected_w", 0) or 0),
                     "total_bins": int(total_bins),
                     "chunk_t": int(chunk_size),
                     "chunk_stride": int(stride_bins),
@@ -1156,6 +1181,11 @@ def main():
                             iou=args.iou,
                             nc=len(names),
                             max_det=args.max_det,
+                            kpt_shape=kpt_shape,
+                        )
+                        preds = _scale_pose_preds_to_native(
+                            preds,
+                            scale_meta=getattr(spad_model, "spad_scale_meta", None),
                             kpt_shape=kpt_shape,
                         )
                         recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
@@ -1303,6 +1333,11 @@ def main():
                         iou=args.iou,
                         nc=len(names),
                         max_det=args.max_det,
+                        kpt_shape=kpt_shape,
+                    )
+                    preds = _scale_pose_preds_to_native(
+                        preds,
+                        scale_meta=getattr(spad_model, "spad_scale_meta", None),
                         kpt_shape=kpt_shape,
                     )
                     recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
