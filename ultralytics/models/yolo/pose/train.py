@@ -244,22 +244,12 @@ class SpadPoseSequenceTrainer(PoseTrainer):
                 "quantile": float(getattr(self.args, "ema_quantile", 1.0)),
             }
         if preprocessor_name == "hire":
-            def _tau_or_none(key: str) -> float | None:
-                val = getattr(self.args, key, 0.0)
-                if val in {None, 0, 0.0}:
-                    return None
-                return float(val)
-
             return {
                 "subsampling": spad_subsampling,
                 "sample_rate_hz": float(getattr(self.args, "spad_bin_rate_hz", 2000.0)),
-                "ref_rate_hz": float(getattr(self.args, "hire_ref_rate_hz", 2000.0)),
                 "fast_bins": int(getattr(self.args, "hire_fast_bins", 24)),
                 "slow_bins": int(getattr(self.args, "hire_slow_bins", 160)),
                 "surprise_bins": int(getattr(self.args, "hire_surprise_bins", 4)),
-                "tau_fast": _tau_or_none("hire_tau_fast"),
-                "tau_slow": _tau_or_none("hire_tau_slow"),
-                "tau_surprise": _tau_or_none("hire_tau_surprise"),
                 "mix_hold_bins": int(getattr(self.args, "hire_mix_hold_bins", 80)),
                 "mix_bins": float(
                     getattr(

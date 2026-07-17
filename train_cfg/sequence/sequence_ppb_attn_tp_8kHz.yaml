@@ -1,18 +1,20 @@
-spad_train_mode: frame
+spad_train_mode: sequence
 model: /home/zvc/Project/SPADHand/ultralytics/weights/detector.pt
 
 spad_train_json: /home/zvc/Data/visionsim/outputs/train_8kHz.json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test_8kHz.json
 
 project: Runs/spad_pose
-name: frame_ppb
+name: sequence_ppb_attn_tp_8kHz
 device: "1"
 epochs: 60
 spad_viz_period: 10
-batch: 40
+batch: 2
 workers: 0
 imgsz: 512
 
+# 8 kHz / GT 125 Hz: bins_per_gt=64; chunk=320 (=5 GT)
+spad_output_frames: 20
 spad_chunk_size: 320
 spad_subsampling: 64
 spad_bins_per_gt: 64
@@ -20,7 +22,9 @@ spad_stride_frames: 5
 spad_image_size: 512
 spad_packed_ch_order: RGB
 spad_cache_mode: auto
+spad_source_render_dirname: renders-spc8kHz
 
+# PPB offline cache (forward skips online preprocessing when cache_mode=rendered)
 spad_preprocessor: ppb
 ppb_bocpd_gamma: 0.001
 ppb_quantile: 1.0
@@ -28,9 +32,17 @@ ppb_normalize: true
 ppb_memory_size: 10
 ppb_min_filter_size: 5
 
-spad_frame_adapter: ua
-spad_frame_adapter_alpha_init: 0.0
+# backbone temporal-attention plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.
+spad_plugin: temporal_attn
+spad_plugin_scales: backbone
+attn_state_dim: 8
+attn_head_divisor: 4
+attn_dropout: 0.0
+attn_sr_ratio: 2
+attn_window_size: [3, 7, 7]
+spad_spatial_reduce_ratio: 2
 spad_spatial_kernel_size: 3
+spad_plugin_alpha_init: 0.0
 
 spad_bin_rate_hz: 8000.0
 spad_input_gamma: 2.2

@@ -143,8 +143,8 @@ spad_collapse: recon # (str) how to turn cube into frames, e.g. 'recon' or other
 spad_chunk_t: # (int, optional) chunk length in T for streaming large cubes
 spad_t_offset: 0 # (int) absolute T offset for causal alignment/debugging
 spad_enabled: True # (bool) enable the end-to-end SPAD pose model path
-spad_train_json: /home/zvc/Data/visionsim/outputs/train.json # (str, optional) VisionSIM training split json
-spad_test_json: /home/zvc/Data/visionsim/outputs/test.json # (str, optional) VisionSIM test split json
+spad_train_json: /home/zvc/Data/visionsim/outputs/train_8kHz.json # (str, optional) VisionSIM 8 kHz training split json
+spad_test_json: /home/zvc/Data/visionsim/outputs/test_8kHz.json # (str, optional) VisionSIM 8 kHz test split json
 spad_output_frames: 5 # (int) reconstructed output frames per training window
 spad_chunk_size: 80 # (int) raw-bin chunk size for frame-mode SPAD training/inference (2 kHz: 80 = 5 GT)
 spad_stride_frames: 5 # (int) sliding-window stride in GT frame units for the sequence baseline
@@ -191,14 +191,10 @@ stea_motion_threshold: 0.07 # (float) motion routing threshold for STEA
 stea_stable_prior: 16.0 # (float) stable-branch prior for STEA
 stea_normalize: True # (bool) normalize STEA reconstructions
 stea_quantile: 1.0 # (float) normalization quantile for STEA
-# HIRE v0.3 @ 2 kHz / chunk=80: α=exp(-1/W) from *_bins (no 8 kHz ref fold)
-hire_ref_rate_hz: 2000.0 # (float) legacy/logging; alphas use bin windows unless tau_*>0
+# HIRE v0.3: α=exp(-1/W) from *_bins
 hire_fast_bins: 24 # (int) W_f: α_f=exp(-1/W_f), n_f cap
 hire_slow_bins: 160 # (int) W_s: α_s=exp(-1/W_s), n_s cap (~2×chunk)
 hire_surprise_bins: 4 # (int) W_S: α_S=exp(-1/W_S) for surprise EMA
-hire_tau_fast: 0.0 # (float) >0 => ZOH α=exp(-1/(f_s·τ)) override (rate experiments)
-hire_tau_slow: 0.0
-hire_tau_surprise: 0.0
 hire_mix_hold_bins: 80 # (int) hold full I^f after reset; <0 => chunk/subsampling (legacy); 0 => no hold
 hire_mix_bins: 12.0 # (float) τ after hold: g=exp(-(t-H)/τ) toward I^s
 hire_mix_theta: 0.06 # (float) soft gate on relu(S̄-θ_floor); <=0 disables

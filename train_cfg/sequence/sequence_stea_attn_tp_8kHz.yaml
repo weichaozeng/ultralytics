@@ -5,7 +5,7 @@ spad_train_json: /home/zvc/Data/visionsim/outputs/train_8kHz.json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test_8kHz.json
 
 project: Runs/spad_pose
-name: sequence_stea_attn_tp
+name: sequence_stea_attn_tp_8kHz
 device: "0"
 epochs: 60
 spad_viz_period: 10
@@ -13,7 +13,7 @@ batch: 2
 workers: 0
 imgsz: 512
 
-# sequence windowing (10 consecutive cached frames per sample)
+# 8 kHz / GT 125 Hz: bins_per_gt=64; chunk=320 (=5 GT)
 spad_output_frames: 20
 spad_chunk_size: 320
 spad_subsampling: 64
@@ -22,6 +22,7 @@ spad_stride_frames: 5
 spad_image_size: 512
 spad_packed_ch_order: RGB
 spad_cache_mode: auto
+spad_source_render_dirname: renders-spc8kHz
 
 # STEA offline cache (forward skips online preprocessing when cache_mode=rendered)
 spad_preprocessor: stea

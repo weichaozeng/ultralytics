@@ -1,13 +1,10 @@
 """HIRE v0.3: dual-rate I^f / I^s with 1/n cold-start and hysteresis change-point reset.
 
-Designed around discrete bin-time at the operating SPAD rate (default 2 kHz,
-``chunk_size`` / ``subsampling`` = 80). Retention alphas are **bin-direct**:
+Retention alphas are **bin-direct**:
 
     α = exp(-1 / W)     # W = fast_bins | slow_bins | surprise_bins
 
-so ``*_bins`` plug straight into the EMA formulas (no 8 kHz ref-rate fold-back).
-Optional ``tau_* > 0`` (seconds) still maps via ZOH ``α=exp(-1/(f_s·τ))`` for later
-rate-transfer experiments.
+so ``*_bins`` plug straight into the EMA formulas.
 """
 
 from __future__ import annotations
@@ -23,43 +20,10 @@ from torch import Tensor
 from ultralytics.quanta_neural_networks.ops.array_ops import torch_quantile
 
 
-def zoh_alpha(sample_rate_hz: float, tau_s: float) -> float:
-    """Zero-order-hold discrete retention α = exp(-1/(f_s · τ))."""
-    fs = float(sample_rate_hz)
-    tau = float(tau_s)
-    if fs <= 0.0:
-        raise ValueError(f"sample_rate_hz must be > 0, got {sample_rate_hz}")
-    if tau <= 0.0:
-        raise ValueError(f"tau_s must be > 0, got {tau_s}")
-    return float(math.exp(-1.0 / (fs * tau)))
-
-
 def bin_retention(window_bins: int) -> float:
     """Discrete-time EMA retention α = exp(-1/W); new-sample weight β = 1-α."""
     w = max(int(window_bins), 1)
     return float(math.exp(-1.0 / w))
-
-
-def taus_from_presets(
-    *,
-    fast_bins: int = 24,
-    slow_bins: int = 160,
-    surprise_bins: int = 4,
-    sample_rate_hz: float = 2000.0,
-    ref_rate_hz: float | None = None,
-) -> tuple[float, float, float]:
-    """Map bin windows to wall-clock taus at ``sample_rate_hz`` (τ = W / f_s).
-
-    ``ref_rate_hz`` is accepted for back-compat but ignored; bin time is native.
-    """
-    fs = float(sample_rate_hz if ref_rate_hz is None else sample_rate_hz)
-    if fs <= 0.0:
-        raise ValueError(f"sample_rate_hz must be > 0, got {fs}")
-    return (
-        max(int(fast_bins), 1) / fs,
-        max(int(slow_bins), 1) / fs,
-        max(int(surprise_bins), 1) / fs,
-    )
 
 
 class HIRE(nn.Module):
@@ -108,13 +72,9 @@ class HIRE(nn.Module):
         subsampling: int = 80,
         sample_rate_hz: float = 2000.0,
         bin_rate_hz: float | None = None,
-        ref_rate_hz: float = 2000.0,
         fast_bins: int = 24,
         slow_bins: int = 160,
         surprise_bins: int = 4,
-        tau_fast: float | None = None,
-        tau_slow: float | None = None,
-        tau_surprise: float | None = None,
         mix_hold_bins: int = 80,
         mix_bins: float = 12.0,
         mix_theta: float = 0.06,
@@ -139,12 +99,9 @@ class HIRE(nn.Module):
         fs = float(bin_rate_hz) if bin_rate_hz is not None else float(sample_rate_hz)
         if fs <= 0.0:
             raise ValueError(f"sample_rate_hz must be > 0, got {fs}")
-        # ref_rate_hz kept for kwargs/back-compat; alphas use bin_retention unless tau override.
-        ref = float(ref_rate_hz) if float(ref_rate_hz) > 0.0 else fs
 
         self.subsampling = max(int(subsampling), 1)
         self.sample_rate_hz = fs
-        self.ref_rate_hz = ref
         self.fast_bins = max(int(fast_bins), 1)
         self.slow_bins = max(int(slow_bins), 1)
         self.surprise_bins = max(int(surprise_bins), 1)
@@ -192,12 +149,6 @@ class HIRE(nn.Module):
         self.normalize = bool(normalize)
         self.quantile = float(quantile)
 
-        self._tau_fast_override = float(tau_fast) if tau_fast is not None and float(tau_fast) > 0.0 else None
-        self._tau_slow_override = float(tau_slow) if tau_slow is not None and float(tau_slow) > 0.0 else None
-        self._tau_surprise_override = (
-            float(tau_surprise) if tau_surprise is not None and float(tau_surprise) > 0.0 else None
-        )
-        self._sync_tau_display()
         self._rebuild_alphas()
 
         self.i_fast: Tensor | None = None
@@ -256,38 +207,11 @@ class HIRE(nn.Module):
         v = float(value)
         return None if v < 0.0 else v
 
-    def _sync_tau_display(self) -> None:
-        """Wall-clock τ for logging: override or W/f_s."""
-        fs = self.sample_rate_hz
-        self.tau_fast = (
-            self._tau_fast_override if self._tau_fast_override is not None else self.fast_bins / fs
-        )
-        self.tau_slow = (
-            self._tau_slow_override if self._tau_slow_override is not None else self.slow_bins / fs
-        )
-        self.tau_surprise = (
-            self._tau_surprise_override
-            if self._tau_surprise_override is not None
-            else self.surprise_bins / fs
-        )
-
     def _rebuild_alphas(self) -> None:
-        # Primary path: α = exp(-1/W). Override: ZOH from wall-clock τ (rate experiments).
-        self.alpha_fast = (
-            zoh_alpha(self.sample_rate_hz, self._tau_fast_override)
-            if self._tau_fast_override is not None
-            else bin_retention(self.fast_bins)
-        )
-        self.alpha_slow = (
-            zoh_alpha(self.sample_rate_hz, self._tau_slow_override)
-            if self._tau_slow_override is not None
-            else bin_retention(self.slow_bins)
-        )
-        self.alpha_surprise = (
-            zoh_alpha(self.sample_rate_hz, self._tau_surprise_override)
-            if self._tau_surprise_override is not None
-            else bin_retention(self.surprise_bins)
-        )
+        """α = exp(-1/W) from bin windows."""
+        self.alpha_fast = bin_retention(self.fast_bins)
+        self.alpha_slow = bin_retention(self.slow_bins)
+        self.alpha_surprise = bin_retention(self.surprise_bins)
         self.beta_fast_floor = 1.0 - self.alpha_fast
         self.beta_slow_floor = 1.0 - self.alpha_slow
 
@@ -319,19 +243,18 @@ class HIRE(nn.Module):
         return idx[:num_frames]
 
     def update_hyperparams(self, **kwargs: Any) -> None:
-        """Update HIRE attributes and rebuild ZOH alphas when needed."""
+        """Update HIRE attributes and rebuild bin-retention alphas when needed."""
         if "subsampling" in kwargs and kwargs["subsampling"] is not None:
             self.subsampling = max(int(kwargs["subsampling"]), 1)
 
         alias_map = {
             "bin_rate_hz": "sample_rate_hz",
-            "hire_ref_rate_hz": "ref_rate_hz",
             "hire_fast_bins": "fast_bins",
             "hire_slow_bins": "slow_bins",
             "hire_surprise_bins": "surprise_bins",
             "hire_mix_hold_bins": "mix_hold_bins",
             "hire_mix_bins": "mix_bins",
-            "hire_mix_kappa": "mix_bins",  # legacy → τ
+            "hire_mix_kappa": "mix_bins",  # legacy → mix_bins
             "hire_gate_theta": "mix_bins",  # legacy
             "mix_kappa": "mix_bins",  # legacy
             "gate_theta": "mix_bins",  # legacy
@@ -347,34 +270,26 @@ class HIRE(nn.Module):
             "hire_reset_open": "reset_open",
             "hire_reset_grow": "reset_grow",
             "hire_reset_dilate": "reset_dilate",  # legacy → grow steps
-            "hire_tau_fast": "tau_fast",
-            "hire_tau_slow": "tau_slow",
-            "hire_tau_surprise": "tau_surprise",
         }
         normalized: dict[str, Any] = {}
         for key, value in kwargs.items():
             if value is None or key == "subsampling":
+                continue
+            # Silently ignore removed legacy keys so old configs/fingerprints do not crash.
+            if key in {"ref_rate_hz", "hire_ref_rate_hz", "tau_fast", "tau_slow", "tau_surprise",
+                       "hire_tau_fast", "hire_tau_slow", "hire_tau_surprise"}:
                 continue
             normalized[alias_map.get(key, key)] = value
         if not normalized:
             return
 
         preset_changed = False
-        rate_changed = False
 
         if "sample_rate_hz" in normalized:
             fs = float(normalized["sample_rate_hz"])
             if fs <= 0.0:
                 raise ValueError(f"sample_rate_hz must be > 0, got {fs}")
             self.sample_rate_hz = fs
-            rate_changed = True
-
-        if "ref_rate_hz" in normalized:
-            ref = float(normalized["ref_rate_hz"])
-            if ref <= 0.0:
-                raise ValueError(f"ref_rate_hz must be > 0, got {ref}")
-            self.ref_rate_hz = ref
-            preset_changed = True
 
         for bins_key in ("fast_bins", "slow_bins", "surprise_bins"):
             if bins_key in normalized:
@@ -446,20 +361,7 @@ class HIRE(nn.Module):
         if "quantile" in normalized:
             self.quantile = float(normalized["quantile"])
 
-        tau_set = False
-        for tau_key, override_attr in (
-            ("tau_fast", "_tau_fast_override"),
-            ("tau_slow", "_tau_slow_override"),
-            ("tau_surprise", "_tau_surprise_override"),
-        ):
-            if tau_key not in normalized:
-                continue
-            val = float(normalized[tau_key])
-            setattr(self, override_attr, val if val > 0.0 else None)
-            tau_set = True
-
-        if rate_changed or preset_changed or tau_set:
-            self._sync_tau_display()
+        if preset_changed:
             self._rebuild_alphas()
 
     @staticmethod

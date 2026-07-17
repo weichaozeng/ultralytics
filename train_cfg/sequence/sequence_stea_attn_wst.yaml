@@ -1,8 +1,8 @@
 spad_train_mode: sequence
 model: /home/zvc/Project/SPADHand/ultralytics/weights/detector.pt
 
-spad_train_json: /home/zvc/Data/visionsim/outputs/train.json
-spad_test_json: /home/zvc/Data/visionsim/outputs/test.json
+spad_train_json: /home/zvc/Data/visionsim/outputs/train_8kHz.json
+spad_test_json: /home/zvc/Data/visionsim/outputs/test_8kHz.json
 
 project: Runs/spad_pose
 name: sequence_stea_attn_wst

@@ -132,15 +132,11 @@ def _parse_args() -> argparse.Namespace:
         "--bin_rate_hz",
         type=float,
         default=2000.0,
-        help="SPAD bin rate f_s (logging / optional tau_* ZOH override).",
+        help="SPAD bin rate f_s (logging / wall-clock τ display = W/f_s).",
     )
-    ap.add_argument("--hire_ref_rate_hz", type=float, default=2000.0)
     ap.add_argument("--hire_fast_bins", type=int, default=24, help="W_f: α_f=exp(-1/W_f)")
     ap.add_argument("--hire_slow_bins", type=int, default=160, help="W_s: α_s=exp(-1/W_s), n_s cap")
     ap.add_argument("--hire_surprise_bins", type=int, default=4, help="W_S: α_S=exp(-1/W_S)")
-    ap.add_argument("--hire_tau_fast", type=float, default=0.0)
-    ap.add_argument("--hire_tau_slow", type=float, default=0.0)
-    ap.add_argument("--hire_tau_surprise", type=float, default=0.0)
     ap.add_argument(
         "--hire_mix_hold_bins",
         type=int,
@@ -412,19 +408,12 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             quantile=float(args.stea_quantile),
         ).to(device)
     if "hire" in preprocessors:
-        def _tau_or_none(val: float) -> float | None:
-            return None if float(val) <= 0.0 else float(val)
-
         out["hire"] = HIRE(
             subsampling=emit,
             sample_rate_hz=float(args.bin_rate_hz),
-            ref_rate_hz=float(args.hire_ref_rate_hz),
             fast_bins=int(args.hire_fast_bins),
             slow_bins=int(args.hire_slow_bins),
             surprise_bins=int(args.hire_surprise_bins),
-            tau_fast=_tau_or_none(args.hire_tau_fast),
-            tau_slow=_tau_or_none(args.hire_tau_slow),
-            tau_surprise=_tau_or_none(args.hire_tau_surprise),
             mix_hold_bins=int(args.hire_mix_hold_bins),
             mix_bins=float(args.hire_mix_bins),
             mix_theta=float(args.hire_mix_theta),
@@ -438,44 +427,10 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
             gate_pool=str(args.hire_gate_pool),
             reset_open=int(args.hire_reset_open),
             reset_grow=int(args.hire_reset_grow),
-            eps=float(args.hire_eps),
             normalize=bool(args.hire_normalize),
             quantile=float(args.hire_quantile),
         ).to(device)
     return out
-
-
-def _emit_subsampling_for_chunk(raw_chunk: np.ndarray) -> int:
-    """Emit one reconstruction at the end of this chunk (handles short tails)."""
-    return max(int(raw_chunk.shape[0]), 1)
-
-
-def _reset_integrator_states(integrators: dict[str, object]) -> None:
-    for integrator in integrators.values():
-        reset = getattr(integrator, "reset", None)
-        if callable(reset):
-            reset()
-            continue
-        # PPB / STEA: drop absolute time so the next clear_states path re-inits.
-        if hasattr(integrator, "t_absolute"):
-            integrator.t_absolute = 0
-        clear = getattr(integrator, "clear_states", None)
-        if callable(clear):
-            clear()
-
-
-def _gray_hwt_to_chw(recons: torch.Tensor) -> torch.Tensor:
-    if recons.ndim != 3:
-        raise ValueError(f"Expected grayscale reconstructions (H,W,T), got {tuple(recons.shape)}")
-    if int(recons.shape[-1]) <= 0:
-        h, w = map(int, recons.shape[:2])
-        return recons.new_zeros((0, 1, h, w))
-    return recons.permute(2, 0, 1).unsqueeze(1).contiguous().float()
-
-
-def _gray_chunk_to_cube(raw_chunk: np.ndarray, device: torch.device) -> torch.Tensor:
-    plane = np.ascontiguousarray(raw_chunk[..., 0])
-    return raw_plane_to_photon_cube(plane, device=device, as_bool=True)
 
 
 def _preprocess_sum_gray(
@@ -838,7 +793,6 @@ def main() -> None:
     if "hire" in preprocessors:
         print(
             f"hire: bin_rate_hz={float(args.bin_rate_hz):g} "
-            f"ref_rate_hz={float(args.hire_ref_rate_hz):g} "
             f"bins={int(args.hire_fast_bins)}/{int(args.hire_slow_bins)}/{int(args.hire_surprise_bins)} "
             f"mix_hold={int(args.hire_mix_hold_bins)}(<0=chunk,0=none) mix_τ={float(args.hire_mix_bins):g} "
             f"mix_θ/floor={float(args.hire_mix_theta):g}/{float(args.hire_mix_floor):g} "

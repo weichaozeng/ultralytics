@@ -172,19 +172,12 @@ def _build_frame_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsa
     if name == "ema":
         return {"subsampling": spad_subsampling, "ema_alpha": float(args.ema_alpha)}
     if name == "hire":
-        def _tau_or_none(val: float) -> float | None:
-            return None if float(val) <= 0.0 else float(val)
-
         return {
             "subsampling": spad_subsampling,
             "sample_rate_hz": float(getattr(args, "spad_bin_rate_hz", 2000.0)),
-            "ref_rate_hz": float(getattr(args, "hire_ref_rate_hz", 2000.0)),
             "fast_bins": int(getattr(args, "hire_fast_bins", 24)),
             "slow_bins": int(getattr(args, "hire_slow_bins", 160)),
             "surprise_bins": int(getattr(args, "hire_surprise_bins", 4)),
-            "tau_fast": _tau_or_none(float(getattr(args, "hire_tau_fast", 0.0))),
-            "tau_slow": _tau_or_none(float(getattr(args, "hire_tau_slow", 0.0))),
-            "tau_surprise": _tau_or_none(float(getattr(args, "hire_tau_surprise", 0.0))),
             "mix_hold_bins": int(getattr(args, "hire_mix_hold_bins", 80)),
             "mix_bins": float(
                 getattr(args, "hire_mix_bins", getattr(args, "hire_mix_kappa", getattr(args, "hire_gate_theta", 12.0)))
@@ -592,13 +585,9 @@ def parse_args():
     ap.add_argument("--stea-stable-prior", type=float, default=16.0)
     ap.add_argument("--stea-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea-quantile", type=float, default=1.0)
-    ap.add_argument("--hire-ref-rate-hz", type=float, default=8000.0)
     ap.add_argument("--hire-fast-bins", type=int, default=16)
     ap.add_argument("--hire-slow-bins", type=int, default=128)
     ap.add_argument("--hire-surprise-bins", type=int, default=8)
-    ap.add_argument("--hire-tau-fast", type=float, default=0.0)
-    ap.add_argument("--hire-tau-slow", type=float, default=0.0)
-    ap.add_argument("--hire-tau-surprise", type=float, default=0.0)
     ap.add_argument("--hire-gate-theta", type=float, default=0.2)
     ap.add_argument("--hire-spatial-kernel", type=int, default=3)
     ap.add_argument(

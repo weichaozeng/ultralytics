@@ -1,9 +1,7 @@
-from .integrator import HIRE, HIREFrame, bin_retention, taus_from_presets, zoh_alpha
+from .integrator import HIRE, HIREFrame, bin_retention
 
 __all__ = (
     "HIRE",
     "HIREFrame",
     "bin_retention",
-    "taus_from_presets",
-    "zoh_alpha",
 )

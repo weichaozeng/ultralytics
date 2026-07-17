@@ -255,13 +255,9 @@ def parse_args():
     ap.add_argument("--stea-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea-quantile", type=float, default=1.0)
     ap.add_argument("--spad-bin-rate-hz", type=float, default=8000.0)
-    ap.add_argument("--hire-ref-rate-hz", type=float, default=8000.0)
     ap.add_argument("--hire-fast-bins", type=int, default=16)
     ap.add_argument("--hire-slow-bins", type=int, default=128)
     ap.add_argument("--hire-surprise-bins", type=int, default=8)
-    ap.add_argument("--hire-tau-fast", type=float, default=0.0)
-    ap.add_argument("--hire-tau-slow", type=float, default=0.0)
-    ap.add_argument("--hire-tau-surprise", type=float, default=0.0)
     ap.add_argument("--hire-gate-theta", type=float, default=0.05)
     ap.add_argument("--hire-spatial-kernel", type=int, default=3)
     ap.add_argument(

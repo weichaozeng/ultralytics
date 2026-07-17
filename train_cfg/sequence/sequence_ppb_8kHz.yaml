@@ -5,8 +5,8 @@ spad_train_json: /home/zvc/Data/visionsim/outputs/train_8kHz.json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test_8kHz.json
 
 project: Runs/spad_pose
-name: sequence_ema
-device: "2"
+name: sequence_ppb_8kHz
+device: "0"
 epochs: 60
 spad_viz_period: 10
 batch: 2
@@ -20,9 +20,12 @@ spad_stride_frames: 5
 spad_image_size: 512
 spad_packed_ch_order: RGB
 
-# causal EMA baseline (fixed recency weighting; no motion/changepoint adaptation)
-spad_preprocessor: ema
-ema_alpha: 0.0 # <=0 => 2/(subsampling+1) SMA-equivalent default
+spad_preprocessor: ppb
+ppb_bocpd_gamma: 0.001
+ppb_quantile: 1.0
+ppb_normalize: true
+ppb_memory_size: 10
+ppb_min_filter_size: 5
 
 spad_plugin: temporal_ssd
 ssd_state_dim: 20

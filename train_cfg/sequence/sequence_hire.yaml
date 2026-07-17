@@ -28,7 +28,6 @@ spad_cache_mode: auto
 # HIRE offline cache @ 2 kHz; α=exp(-1/W) from *_bins
 spad_preprocessor: hire
 spad_bin_rate_hz: 2000.0
-hire_ref_rate_hz: 2000.0
 hire_fast_bins: 24
 hire_slow_bins: 160
 hire_surprise_bins: 4

@@ -1,18 +1,21 @@
 spad_train_mode: sequence
 model: /home/zvc/Project/SPADHand/ultralytics/weights/detector.pt
 
+# data
 spad_train_json: /home/zvc/Data/visionsim/outputs/train_8kHz.json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test_8kHz.json
 
+# run
 project: Runs/spad_pose
-name: sequence_ema
-device: "2"
+name: sequence_stea_8kHz
+device: "0"
 epochs: 60
 spad_viz_period: 10
 batch: 2
 workers: 0
 imgsz: 512
 
+# sequence windowing
 spad_output_frames: 20
 spad_subsampling: 64
 spad_bins_per_gt: 64
@@ -20,10 +23,19 @@ spad_stride_frames: 5
 spad_image_size: 512
 spad_packed_ch_order: RGB
 
-# causal EMA baseline (fixed recency weighting; no motion/changepoint adaptation)
-spad_preprocessor: ema
-ema_alpha: 0.0 # <=0 => 2/(subsampling+1) SMA-equivalent default
+# preprocessor
+spad_preprocessor: stea
+stea_fast_window: 16
+stea_slow_window: 128
+stea_temporal_window: 5
+stea_fast_tau: 6.0
+stea_motion_sharpness: 60.0
+stea_motion_threshold: 0.07
+stea_stable_prior: 16.0
+stea_normalize: true
+stea_quantile: 1.0
 
+# detector-side sequence plugin
 spad_plugin: temporal_ssd
 ssd_state_dim: 20
 ssd_head_divisor: 4
@@ -31,6 +43,7 @@ spad_spatial_reduce_ratio: 2
 spad_spatial_kernel_size: 3
 spad_plugin_alpha_init: 0.0
 
+# misc
 spad_bin_rate_hz: 8000.0
 spad_input_gamma: 2.2
 spad_freeze_detector: true

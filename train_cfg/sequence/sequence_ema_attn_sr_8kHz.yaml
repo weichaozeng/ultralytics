@@ -5,7 +5,7 @@ spad_train_json: /home/zvc/Data/visionsim/outputs/train_8kHz.json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test_8kHz.json
 
 project: Runs/spad_pose
-name: sequence_ema
+name: sequence_ema_attn_sr_8kHz
 device: "2"
 epochs: 60
 spad_viz_period: 10
@@ -13,20 +13,32 @@ batch: 2
 workers: 0
 imgsz: 512
 
+# 8 kHz / GT 125 Hz: bins_per_gt=64; chunk=320 (=5 GT)
 spad_output_frames: 20
+spad_chunk_size: 320
 spad_subsampling: 64
 spad_bins_per_gt: 64
 spad_stride_frames: 5
 spad_image_size: 512
 spad_packed_ch_order: RGB
+spad_cache_mode: auto
+spad_source_render_dirname: renders-spc8kHz
+spad_render_contains_confidence: false
 
-# causal EMA baseline (fixed recency weighting; no motion/changepoint adaptation)
+# EMA offline cache @ 8 kHz
 spad_preprocessor: ema
 ema_alpha: 0.0 # <=0 => 2/(subsampling+1) SMA-equivalent default
+ema_normalize: true
+ema_quantile: 1.0
 
-spad_plugin: temporal_ssd
-ssd_state_dim: 20
-ssd_head_divisor: 4
+# backbone SR-attention
+spad_plugin: sr_attn
+spad_plugin_scales: backbone
+attn_state_dim: 8
+attn_head_divisor: 4
+attn_dropout: 0.0
+attn_sr_ratio: 2
+attn_window_size: [3, 7, 7]
 spad_spatial_reduce_ratio: 2
 spad_spatial_kernel_size: 3
 spad_plugin_alpha_init: 0.0

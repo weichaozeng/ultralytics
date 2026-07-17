@@ -297,19 +297,12 @@ def _build_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsampling
     if name == "ema":
         return {"subsampling": spad_subsampling, "ema_alpha": float(args.ema_alpha)}
     if name == "hire":
-        def _tau_or_none(val: float) -> float | None:
-            return None if float(val) <= 0.0 else float(val)
-
         return {
             "subsampling": spad_subsampling,
             "sample_rate_hz": float(args.spad_bin_rate_hz),
-            "ref_rate_hz": float(args.hire_ref_rate_hz),
             "fast_bins": int(args.hire_fast_bins),
             "slow_bins": int(args.hire_slow_bins),
             "surprise_bins": int(args.hire_surprise_bins),
-            "tau_fast": _tau_or_none(float(args.hire_tau_fast)),
-            "tau_slow": _tau_or_none(float(args.hire_tau_slow)),
-            "tau_surprise": _tau_or_none(float(args.hire_tau_surprise)),
             "mix_hold_bins": int(args.hire_mix_hold_bins),
             "mix_bins": float(args.hire_mix_bins),
             "mix_theta": float(args.hire_mix_theta),
@@ -891,13 +884,9 @@ def parse_args():
     ap.add_argument("--stea-stable-prior", type=float, default=16.0)
     ap.add_argument("--stea-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea-quantile", type=float, default=1.0)
-    ap.add_argument("--hire-ref-rate-hz", type=float, default=2000.0)
     ap.add_argument("--hire-fast-bins", type=int, default=24)
     ap.add_argument("--hire-slow-bins", type=int, default=160)
     ap.add_argument("--hire-surprise-bins", type=int, default=4)
-    ap.add_argument("--hire-tau-fast", type=float, default=0.0)
-    ap.add_argument("--hire-tau-slow", type=float, default=0.0)
-    ap.add_argument("--hire-tau-surprise", type=float, default=0.0)
     ap.add_argument("--hire-mix-hold-bins", type=int, default=80)
     ap.add_argument("--hire-mix-bins", type=float, default=12.0)
     ap.add_argument("--hire-mix-theta", type=float, default=0.06)
