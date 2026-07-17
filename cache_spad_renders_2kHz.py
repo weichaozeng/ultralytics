@@ -120,7 +120,7 @@ def parse_args():
     ap.add_argument("--ema-normalize", type=str, default="true")
     ap.add_argument("--ema-quantile", type=float, default=1.0)
     # PPB
-    ap.add_argument("--ppb-bocpd-gamma", type=float, default=2e-3)
+    ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
     ap.add_argument("--ppb-min-filter-size", type=int, default=5)
     ap.add_argument("--ppb-normalize", type=str, default="true")
     ap.add_argument("--ppb-quantile", type=float, default=1.0)

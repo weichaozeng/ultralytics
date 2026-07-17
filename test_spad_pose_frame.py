@@ -571,7 +571,7 @@ def parse_args():
     ap.add_argument("--spad_bins_per_gt", type=int, default=0)
     ap.add_argument("--spad_subsampling", type=int, default=0)
     ap.add_argument("--input_gamma", type=float, default=0.0, help="Used for rendered-cache fingerprinting and override preprocessors")
-    ap.add_argument("--ppb-bocpd-gamma", type=float, default=5e-4)
+    ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb-min-filter-size", type=int, default=7)

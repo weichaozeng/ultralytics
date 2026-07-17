@@ -61,7 +61,7 @@ def parse_args():
         default="renders-spc8kHz",
         help="Name of the source packed-SPAD render directory used to infer sibling render roots.",
     )
-    ap.add_argument("--ppb-bocpd-gamma", type=float, default=5e-4)
+    ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", type=str, default="true")
     ap.add_argument("--ppb-min-filter-size", type=int, default=7)

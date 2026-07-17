@@ -145,19 +145,19 @@ spad_t_offset: 0 # (int) absolute T offset for causal alignment/debugging
 spad_enabled: True # (bool) enable the end-to-end SPAD pose model path
 spad_train_json: /home/zvc/Data/visionsim/outputs/train.json # (str, optional) VisionSIM training split json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test.json # (str, optional) VisionSIM test split json
-spad_output_frames: 5 # (int) reconstructed output frames per training window (5 * 64 = 320 raw bins)
-spad_chunk_size: 320 # (int) raw-bin chunk size for frame-mode SPAD training/inference
+spad_output_frames: 5 # (int) reconstructed output frames per training window
+spad_chunk_size: 80 # (int) raw-bin chunk size for frame-mode SPAD training/inference (2 kHz: 80 = 5 GT)
 spad_stride_frames: 5 # (int) sliding-window stride in GT frame units for the sequence baseline
-spad_bins_per_gt: 64 # (int) raw SPAD bins per one GT frame (8000 FPS / 125 FPS GT = 64)
+spad_bins_per_gt: 16 # (int) raw SPAD bins per one GT frame (2000 FPS / 125 FPS GT = 16)
 spad_image_size: 512 # (int) square image size for SPAD pose windows
 spad_packed_ch_order: RGB # (str) packed SPAD channel order used when unpacking raw windows
-spad_subsampling: 64 # (int) shared temporal downsampling factor for SPAD preprocessors and GT alignment
-spad_bin_rate_hz: 8000.0 # (float) reference raw-bin frequency used to normalize detector-side SSD time deltas
+spad_subsampling: 80 # (int) shared temporal downsampling factor for SPAD preprocessors and GT alignment
+spad_bin_rate_hz: 2000.0 # (float) reference raw-bin frequency used to normalize detector-side SSD time deltas
 spad_input_gamma: 2.2 # (float) gamma correction applied to reconstructed detector inputs
 spad_cache_mode: auto # (str) frame-mode detector input source: auto, raw, or rendered
 spad_render_root: # (str, optional) root directory containing cached rendered frames
-spad_render_contains_confidence: True # (bool) whether cached renders include confidence.npy for UA/residual adapters
-spad_source_render_dirname: renders-spc8kHz # (str) source render dirname used to infer sibling rendered cache roots
+spad_render_contains_confidence: False # (bool) whether cached renders include confidence.npy for UA/residual adapters
+spad_source_render_dirname: renders-spc2kHz # (str) source render dirname used to infer sibling rendered cache roots
 spad_preprocessor: ppb # (str) detector input preprocessor: ppb, sum, ema, stea, hire
 spad_plugin: temporal_ssd # (str) detector-side feature plugin: none, temporal_ssd, temporal_attn, sr_attn, window_st_attn, spatial_only, spatial_temporal
 spad_frame_adapter: ua # (str) frame-mode image-space adapter: none, residual, ua
@@ -172,7 +172,7 @@ spad_viz_period: 10 # (int) eval visualization period in epochs (0 disables peri
 spad_viz_conf: 0.25 # (float) confidence threshold used in SPAD eval visualization
 spad_viz_iou: 0.7 # (float) IoU threshold used in SPAD eval visualization
 spad_viz_max_det: 20 # (int) max detections per frame used in SPAD eval visualization
-ppb_bocpd_gamma: 0.0005 # (float) BOCPD hazard rate for PerPixelBayesian
+ppb_bocpd_gamma: 0.001 # (float) BOCPD hazard rate for PerPixelBayesian
 ppb_quantile: 1.0 # (float) normalization quantile for PerPixelBayesian
 ppb_normalize: True # (bool) normalize PerPixelBayesian reconstructions
 ppb_min_filter_size: 7 # (int) odd min-filter size for PerPixelBayesian

@@ -202,18 +202,62 @@ def _resolve_spad_stride_frames(spad_model, args, *, ckpt: dict | None = None) -
     return 5
 
 
-def _resolve_spad_bins_per_gt(spad_model, args) -> int:
+_GT_FRAME_HZ = 125.0  # VisionSIM / H2O GT rate used for bin↔frame alignment
+
+
+def _resolve_spad_bin_rate_hz(spad_model, args, *, ckpt: dict | None = None) -> float:
+    """Prefer checkpoint/model train rate; fall back to CLI (2 kHz default)."""
+    for src in ((ckpt or {}).get("train_args"), getattr(spad_model, "args", None)):
+        val = _cfg_get(src, "spad_bin_rate_hz", None)
+        if val not in {None, 0, ""}:
+            return float(val)
+    cli = float(getattr(args, "spad_bin_rate_hz", 0.0) or 0.0)
+    return cli if cli > 0 else 2000.0
+
+
+def _resolve_spad_bins_per_gt(spad_model, args, *, ckpt: dict | None = None) -> int:
+    """Resolve bins/GT; keep consistent with bin rate (rate / 125 Hz).
+
+    Older checkpoints / default.yaml still carry 8 kHz ``spad_bins_per_gt=64``.
+    Prefer an explicit CLI override, otherwise derive from ``spad_bin_rate_hz``.
+    """
     if int(args.spad_bins_per_gt) > 0:
         return int(args.spad_bins_per_gt)
-    train_args = getattr(spad_model, "args", None)
-    return int(_cfg_get(train_args, "spad_bins_per_gt", 64) or 64)
+
+    stored = None
+    for src in ((ckpt or {}).get("train_args"), getattr(spad_model, "args", None)):
+        val = _cfg_get(src, "spad_bins_per_gt", None)
+        if val not in {None, 0, ""}:
+            stored = int(val)
+            break
+
+    bin_rate = _resolve_spad_bin_rate_hz(spad_model, args, ckpt=ckpt)
+    inferred = max(1, int(round(float(bin_rate) / _GT_FRAME_HZ)))
+    if stored is not None and stored != inferred:
+        print(
+            f"Warning: spad_bins_per_gt={stored} from checkpoint disagrees with "
+            f"spad_bin_rate_hz={bin_rate:g} (expect {inferred} at {_GT_FRAME_HZ:g} Hz GT); "
+            f"using {inferred}."
+        )
+        return inferred
+    if stored is not None:
+        return stored
+    return inferred
 
 
-def _resolve_spad_subsampling(spad_model, args) -> int:
+def _resolve_spad_subsampling(spad_model, args, *, ckpt: dict | None = None) -> int:
     if int(args.spad_subsampling) > 0:
         return int(args.spad_subsampling)
-    train_args = getattr(spad_model, "args", None)
-    return int(_cfg_get(train_args, "spad_subsampling", getattr(getattr(spad_model, "preprocessor", None), "subsampling", 64)) or 64)
+    for src in ((ckpt or {}).get("train_args"), getattr(spad_model, "args", None)):
+        val = _cfg_get(src, "spad_subsampling", None)
+        if val not in {None, 0, ""}:
+            return int(val)
+    prep = getattr(spad_model, "preprocessor", None)
+    prep_sub = getattr(prep, "subsampling", None) if prep is not None else None
+    if prep_sub not in {None, 0, ""}:
+        return int(prep_sub)
+    # Match 2 kHz train/cache default (one reconstructed frame per chunk).
+    return int(_resolve_chunk_size(spad_model, args) or 80)
 
 
 def _resolve_input_gamma(spad_model, args) -> float:
@@ -807,7 +851,7 @@ def parse_args():
         "Use --no-spad_online for training-style windowed batch plugins without state carry.",
     )
     # PPB / EMA / HIRE defaults match cache_spad_renders_2kHz.py and sequence_*_2kHz.yaml
-    ap.add_argument("--ppb-bocpd-gamma", type=float, default=2e-3)
+    ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb-min-filter-size", type=int, default=5)
@@ -928,14 +972,14 @@ def main():
     chunk_size = _resolve_chunk_size(spad_model, args)
     if chunk_size <= 0:
         raise ValueError(f"Sequence chunk size must be positive, got {chunk_size}")
-    spad_bins_per_gt = _resolve_spad_bins_per_gt(spad_model, args)
+    spad_bins_per_gt = _resolve_spad_bins_per_gt(spad_model, args, ckpt=yolo.ckpt)
     stride_frames = _resolve_spad_stride_frames(spad_model, args, ckpt=yolo.ckpt)
     print(
         f"Resolved sequence windowing: chunk_size={chunk_size}, "
         f"spad_bins_per_gt={spad_bins_per_gt}, stride_frames={stride_frames}, "
         f"chunk_stride_bins={int(stride_frames * spad_bins_per_gt)}, cache_mode={resolved_cache_mode}"
     )
-    spad_subsampling = _resolve_spad_subsampling(spad_model, args)
+    spad_subsampling = _resolve_spad_subsampling(spad_model, args, ckpt=yolo.ckpt)
     input_gamma = _resolve_input_gamma(spad_model, args)
     preprocessor_kwargs = _build_preprocessor_kwargs(
         args, preprocessor_name=effective_preprocessor, spad_subsampling=spad_subsampling

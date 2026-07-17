@@ -27,7 +27,7 @@ spad_render_contains_confidence: false
 
 # PPB offline cache @ 2 kHz
 spad_preprocessor: ppb
-ppb_bocpd_gamma: 0.002
+ppb_bocpd_gamma: 0.001
 ppb_quantile: 1.0
 ppb_normalize: true
 ppb_min_filter_size: 5

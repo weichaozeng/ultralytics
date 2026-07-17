@@ -529,7 +529,7 @@ def main():
     )
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     # PerPixelBayesian preprocessor
-    ap.add_argument("--ppb_gamma", type=float, default=5e-4)
+    ap.add_argument("--ppb_gamma", type=float, default=1e-3)
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)

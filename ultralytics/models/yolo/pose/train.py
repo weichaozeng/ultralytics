@@ -211,7 +211,7 @@ class SpadPoseSequenceTrainer(PoseTrainer):
         if preprocessor_name == "ppb":
             return {
                 "subsampling": spad_subsampling,
-                "bocpd_gamma": float(getattr(self.args, "ppb_bocpd_gamma", getattr(self.args, "bocpd_gamma", 5e-4))),
+                "bocpd_gamma": float(getattr(self.args, "ppb_bocpd_gamma", getattr(self.args, "bocpd_gamma", 1e-3))),
                 "normalize": bool(getattr(self.args, "ppb_normalize", True)),
                 "quantile": float(getattr(self.args, "ppb_quantile", getattr(self.args, "quantile", 1.0))),
                 "min_filter_size": int(getattr(self.args, "ppb_min_filter_size", getattr(self.args, "min_filter_size", 7))),

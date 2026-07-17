@@ -17,7 +17,7 @@ class PerPixelBayesian(nn.Module):
 
     def __init__(
         self,
-        bocpd_gamma: float = 5e-4,
+        bocpd_gamma: float = 1e-3,
         memory_size: int = 8,
         subsampling: int = 1,
         hot_pixel_mask: Bool[np.ndarray, "h w"] = None,

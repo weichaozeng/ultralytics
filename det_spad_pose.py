@@ -505,7 +505,7 @@ def main():
         help="Optionally override the checkpoint's internal SPAD preprocessor at inference time.",
     )
     ap.add_argument("--spad-subsampling", type=int, default=320, help="Temporal subsampling used by override preprocessors.")
-    ap.add_argument("--ppb-bocpd-gamma", type=float, default=5e-4)
+    ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb-min-filter-size", type=int, default=7)

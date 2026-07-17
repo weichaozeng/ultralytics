@@ -96,7 +96,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--label_h", type=int, default=28, help="Header height for compare labels")
     ap.add_argument("--font_scale", type=float, default=0.7)
     # PerPixelBayesian
-    ap.add_argument("--ppb_gamma", type=float, default=5e-4)
+    ap.add_argument("--ppb_gamma", type=float, default=1e-3)
     ap.add_argument("--ppb_quantile", type=float, default=1.0)
     ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppb_min_filter_size", type=int, default=7)
