@@ -433,23 +433,38 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
     return out
 
 
+def _emit_subsampling_for_chunk(raw_chunk: np.ndarray) -> int:
+    """Emit one reconstruction at the end of this chunk (handles short tails)."""
+    return max(int(raw_chunk.shape[0]), 1)
+
+
 def _reset_integrator_states(integrators: dict[str, object]) -> None:
     """Clear causal state before the first chunk (idempotent on fresh builds)."""
     for integrator in integrators.values():
+        reset = getattr(integrator, "reset", None)
+        if callable(reset):
+            reset()
+            continue
+        # PPB / STEA: drop absolute time so the next clear_states path re-inits.
+        if hasattr(integrator, "t_absolute"):
+            integrator.t_absolute = 0
         clear = getattr(integrator, "clear_states", None)
         if callable(clear):
             clear()
-            continue
-        # PPB / STEA: mirror process_photon_cube(clear_states=True) entry.
-        if hasattr(integrator, "t_absolute"):
-            integrator.t_absolute = 0
-        clear_hist = getattr(integrator, "_clear_histories", None)
-        if callable(clear_hist):
-            clear_hist()
-        if hasattr(integrator, "_h"):
-            integrator._h = None
-            integrator._w = None
-            integrator._t = None
+
+
+def _gray_hwt_to_chw(recons: torch.Tensor) -> torch.Tensor:
+    if recons.ndim != 3:
+        raise ValueError(f"Expected grayscale reconstructions (H,W,T), got {tuple(recons.shape)}")
+    if int(recons.shape[-1]) <= 0:
+        h, w = map(int, recons.shape[:2])
+        return recons.new_zeros((0, 1, h, w))
+    return recons.permute(2, 0, 1).unsqueeze(1).contiguous().float()
+
+
+def _gray_chunk_to_cube(raw_chunk: np.ndarray, device: torch.device) -> torch.Tensor:
+    plane = np.ascontiguousarray(raw_chunk[..., 0])
+    return raw_plane_to_photon_cube(plane, device=device, as_bool=True)
 
 
 def _preprocess_sum_gray(
