@@ -113,13 +113,37 @@ class AbsolutePositionalEncoding3D(nn.Module):
         self.register_buffer("pe_h", pe_h, persistent=False)
         self.register_buffer("pe_w", pe_w, persistent=False)
 
+    def _ensure_t(self, needed: int) -> None:
+        """Grow temporal PE table for long online streams (training windows stay << max_t)."""
+        needed = int(needed)
+        if needed <= self.max_t:
+            return
+        # Grow with headroom so we do not reallocate every frame.
+        new_max = max(needed, self.max_t * 2)
+        pe_t = _sinusoidal_1d(new_max, self.dim_t, self.pe_t.device, self.pe_t.dtype)
+        self.register_buffer("pe_t", pe_t, persistent=False)
+        self.max_t = new_max
+
+    def _ensure_hw(self, h: int, w: int) -> None:
+        h, w = int(h), int(w)
+        if h > self.max_h:
+            new_h = max(h, self.max_h * 2)
+            pe_h = _sinusoidal_1d(new_h, self.dim_h, self.pe_h.device, self.pe_h.dtype)
+            self.register_buffer("pe_h", pe_h, persistent=False)
+            self.max_h = new_h
+        if w > self.max_w:
+            new_w = max(w, self.max_w * 2)
+            pe_w = _sinusoidal_1d(new_w, self.dim_w, self.pe_w.device, self.pe_w.dtype)
+            self.register_buffer("pe_w", pe_w, persistent=False)
+            self.max_w = new_w
+
     def _encode_tbchw(self, x: Tensor, *, t_start: int = 0) -> Tensor:
         t, b, c, h, w = x.shape
         device, dtype = x.device, x.dtype
         t_start = int(t_start)
         t_end = t_start + t
-        if t_end > self.max_t:
-            raise ValueError(f"t_start+t={t_end} exceeds max_t={self.max_t}")
+        self._ensure_t(t_end)
+        self._ensure_hw(h, w)
         enc_t = self.pe_t[t_start:t_end, : self.dim_t].to(device=device, dtype=dtype)
         enc_h = self.pe_h[:h, : self.dim_h].to(device=device, dtype=dtype)
         enc_w = self.pe_w[:w, : self.dim_w].to(device=device, dtype=dtype)
@@ -263,8 +287,8 @@ class TemporalAttention(TemporalCoreBase):
 
     def _apply_temporal_pe_step(self, x: Tensor, time_index: int) -> Tensor:
         device, dtype = x.device, x.dtype
-        if time_index >= self.pos_enc.max_t:
-            raise ValueError(f"time_index={time_index} exceeds max_t={self.pos_enc.max_t}")
+        time_index = int(time_index)
+        self.pos_enc._ensure_t(time_index + 1)
         enc_t = self.pos_enc.pe_t[time_index : time_index + 1, : self.pos_enc.dim_t].to(device=device, dtype=dtype)
         enc = repeat(enc_t, "1 dt -> b dt", b=x.shape[0])
         if enc.shape[-1] < self.in_dim:
