@@ -256,29 +256,27 @@ def _build_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsampling
 
         return {
             "subsampling": spad_subsampling,
-            "sample_rate_hz": float(getattr(args, "spad_bin_rate_hz", 2000.0)),
-            "ref_rate_hz": float(getattr(args, "hire_ref_rate_hz", 2000.0)),
-            "fast_bins": int(getattr(args, "hire_fast_bins", 24)),
-            "slow_bins": int(getattr(args, "hire_slow_bins", 160)),
-            "surprise_bins": int(getattr(args, "hire_surprise_bins", 4)),
-            "tau_fast": _tau_or_none(float(getattr(args, "hire_tau_fast", 0.0))),
-            "tau_slow": _tau_or_none(float(getattr(args, "hire_tau_slow", 0.0))),
-            "tau_surprise": _tau_or_none(float(getattr(args, "hire_tau_surprise", 0.0))),
-            "mix_hold_bins": int(getattr(args, "hire_mix_hold_bins", 80)),
-            "mix_bins": float(
-                getattr(args, "hire_mix_bins", getattr(args, "hire_mix_kappa", getattr(args, "hire_gate_theta", 12.0)))
-            ),
-            "mix_theta": float(getattr(args, "hire_mix_theta", 0.06)),
-            "mix_floor": float(getattr(args, "hire_mix_floor", -1.0)),
-            "theta_on": float(getattr(args, "hire_theta_on", 0.08)),
-            "theta_off": float(getattr(args, "hire_theta_off", 0.02)),
-            "theta_grow": float(getattr(args, "hire_theta_grow", -1.0)),
-            "confirm_bins": int(getattr(args, "hire_confirm_bins", 4)),
-            "cooldown_bins": int(getattr(args, "hire_cooldown_bins", 0)),
-            "spatial_kernel": int(getattr(args, "hire_spatial_kernel", 5)),
-            "gate_pool": str(getattr(args, "hire_gate_pool", "max")),
-            "reset_open": int(getattr(args, "hire_reset_open", 15)),
-            "reset_grow": int(getattr(args, "hire_reset_grow", 6)),
+            "sample_rate_hz": float(args.spad_bin_rate_hz),
+            "ref_rate_hz": float(args.hire_ref_rate_hz),
+            "fast_bins": int(args.hire_fast_bins),
+            "slow_bins": int(args.hire_slow_bins),
+            "surprise_bins": int(args.hire_surprise_bins),
+            "tau_fast": _tau_or_none(float(args.hire_tau_fast)),
+            "tau_slow": _tau_or_none(float(args.hire_tau_slow)),
+            "tau_surprise": _tau_or_none(float(args.hire_tau_surprise)),
+            "mix_hold_bins": int(args.hire_mix_hold_bins),
+            "mix_bins": float(args.hire_mix_bins),
+            "mix_theta": float(args.hire_mix_theta),
+            "mix_floor": float(args.hire_mix_floor),
+            "theta_on": float(args.hire_theta_on),
+            "theta_off": float(args.hire_theta_off),
+            "theta_grow": float(args.hire_theta_grow),
+            "confirm_bins": int(args.hire_confirm_bins),
+            "cooldown_bins": int(args.hire_cooldown_bins),
+            "spatial_kernel": int(args.hire_spatial_kernel),
+            "gate_pool": str(args.hire_gate_pool),
+            "reset_open": int(args.hire_reset_open),
+            "reset_grow": int(args.hire_reset_grow),
         }
     if name == "hyb":
         return {
@@ -763,8 +761,8 @@ def parse_args():
     ap.add_argument(
         "--spad-bin-rate-hz",
         type=float,
-        default=8000.0,
-        help="Raw-bin frequency of the current inference input. Detector-side SSD time deltas are scaled relative to training.",
+        default=2000.0,
+        help="Raw-bin frequency of the current inference input (2 kHz default). Detector-side SSD time deltas are scaled relative to training.",
     )
     ap.add_argument("--cache_mode", type=str, default="auto", choices=["auto", "raw", "rendered"])
     ap.add_argument("--preprocessor", type=str, default="model", choices=PREPROCESSOR_CHOICES)
@@ -776,13 +774,30 @@ def parse_args():
         help="Deprecated alias for --preprocessor when --preprocessor model.",
     )
     ap.add_argument("--render_root", type=str, default=None, help="Optional explicit root for cached rendered frames")
-    ap.add_argument("--source_render_dirname", type=str, default="renders-spc8kHz")
-    ap.add_argument("--render_contains_confidence", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--spad_chunk_t", "--cube_chunk_t", dest="cube_chunk_t", type=int, default=0)
+    ap.add_argument(
+        "--source_render_dirname",
+        type=str,
+        default="renders-spc2kHz",
+        help="Packed SPAD source dirname used when remapping sibling render caches.",
+    )
+    ap.add_argument(
+        "--render_contains_confidence",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If set, require confidence.npy in rendered cache (2 kHz caches are frames+meta only).",
+    )
+    ap.add_argument(
+        "--spad_chunk_t",
+        "--cube_chunk_t",
+        dest="cube_chunk_t",
+        type=int,
+        default=0,
+        help="Raw-bin chunk size. 0 = from checkpoint; 2 kHz train/cache use 80.",
+    )
     ap.add_argument("--cube_chunk_stride", type=int, default=0, help="Only used for raw direct-path evaluation without GT alignment")
-    ap.add_argument("--spad_stride_frames", type=int, default=0)
-    ap.add_argument("--spad_bins_per_gt", type=int, default=0)
-    ap.add_argument("--spad_subsampling", type=int, default=0)
+    ap.add_argument("--spad_stride_frames", type=int, default=0, help="0 = from checkpoint; 2 kHz train uses 5.")
+    ap.add_argument("--spad_bins_per_gt", type=int, default=0, help="0 = from checkpoint; 2 kHz uses 16 (2000/125).")
+    ap.add_argument("--spad_subsampling", type=int, default=0, help="0 = from checkpoint; 2 kHz train/cache use 80.")
     ap.add_argument("--input_gamma", type=float, default=0.0, help="Used for rendered-cache fingerprinting and override preprocessors")
     ap.add_argument(
         "--spad_online",
@@ -791,15 +806,16 @@ def parse_args():
         help="Serial/online inference: carry detector temporal state across frames (default). "
         "Use --no-spad_online for training-style windowed batch plugins without state carry.",
     )
-    ap.add_argument("--ppb-bocpd-gamma", type=float, default=5e-4)
+    # PPB / EMA / HIRE defaults match cache_spad_renders_2kHz.py and sequence_*_2kHz.yaml
+    ap.add_argument("--ppb-bocpd-gamma", type=float, default=2e-3)
     ap.add_argument("--ppb-quantile", type=float, default=1.0)
     ap.add_argument("--ppb-normalize", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--ppb-min-filter-size", type=int, default=7)
+    ap.add_argument("--ppb-min-filter-size", type=int, default=5)
     ap.add_argument(
         "--ema-alpha",
         type=float,
-        default=0.0,
-        help="EMA new-sample weight. <=0 uses 2/(subsampling+1) SMA-equivalent default.",
+        default=0.01,
+        help="EMA new-sample weight (2 kHz cache default 0.01). <=0 uses 2/(subsampling+1) SMA-equivalent.",
     )
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
@@ -810,15 +826,26 @@ def parse_args():
     ap.add_argument("--stea-stable-prior", type=float, default=16.0)
     ap.add_argument("--stea-normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea-quantile", type=float, default=1.0)
-    ap.add_argument("--hire-ref-rate-hz", type=float, default=8000.0)
-    ap.add_argument("--hire-fast-bins", type=int, default=16)
-    ap.add_argument("--hire-slow-bins", type=int, default=128)
-    ap.add_argument("--hire-surprise-bins", type=int, default=8)
+    ap.add_argument("--hire-ref-rate-hz", type=float, default=2000.0)
+    ap.add_argument("--hire-fast-bins", type=int, default=24)
+    ap.add_argument("--hire-slow-bins", type=int, default=160)
+    ap.add_argument("--hire-surprise-bins", type=int, default=4)
     ap.add_argument("--hire-tau-fast", type=float, default=0.0)
     ap.add_argument("--hire-tau-slow", type=float, default=0.0)
     ap.add_argument("--hire-tau-surprise", type=float, default=0.0)
-    ap.add_argument("--hire-gate-theta", type=float, default=0.2)
-    ap.add_argument("--hire-spatial-kernel", type=int, default=3)
+    ap.add_argument("--hire-mix-hold-bins", type=int, default=80)
+    ap.add_argument("--hire-mix-bins", type=float, default=12.0)
+    ap.add_argument("--hire-mix-theta", type=float, default=0.06)
+    ap.add_argument("--hire-mix-floor", type=float, default=-1.0)
+    ap.add_argument("--hire-theta-on", type=float, default=0.08)
+    ap.add_argument("--hire-theta-off", type=float, default=0.02)
+    ap.add_argument("--hire-theta-grow", type=float, default=-1.0)
+    ap.add_argument("--hire-confirm-bins", type=int, default=4)
+    ap.add_argument("--hire-cooldown-bins", type=int, default=0)
+    ap.add_argument("--hire-spatial-kernel", type=int, default=5)
+    ap.add_argument("--hire-gate-pool", type=str, default="max", choices=["max", "avg"])
+    ap.add_argument("--hire-reset-open", type=int, default=15)
+    ap.add_argument("--hire-reset-grow", type=int, default=6)
     ap.add_argument("--hyb-motion-sharpness", type=float, default=60.0)
     ap.add_argument("--hyb-motion-threshold", type=float, default=0.05)
     ap.add_argument("--hyb-warp-block-size", type=int, default=16)
