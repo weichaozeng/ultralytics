@@ -321,6 +321,10 @@ def main():
             sample_vis_dir.mkdir(parents=True, exist_ok=True)
         video_path = vis_root / f"{sample_name}.mp4" if vis_root is not None and args.vis == "video" else None
 
+        # End-of-chunk GT index: RGB/cache frame i <-> GT (i+1)*gt_per_rgb (matches RgbPoseFrameDataset).
+        gt_fps = 125.0
+        rgb_fps = float(args.frame_rate)
+        gt_per_rgb = max(int(round(gt_fps / rgb_fps)), 1)
         sample_record: dict[str, Any] = {
             "metadata": {
                 "format": "spadhand_rgb_predictions_v1",
@@ -336,6 +340,8 @@ def main():
                 "tracker": args.tracker,
                 "frame_rate": int(args.frame_rate),
                 "rgb_fps": int(args.frame_rate),
+                "gt_fps": float(gt_fps),
+                "gt_per_rgb": int(gt_per_rgb),
                 "vis_mode": str(args.vis),
                 "names": _names_to_dict(names),
                 "kpt_shape": list(map(int, kpt_shape)),
@@ -387,7 +393,7 @@ def main():
                 "end_bin": int(frame_idx + 1),
                 "input_bins": 1,
                 "model_input_bins": 1,
-                "target_gt_time": float(frame_idx),
+                "target_gt_time": float((frame_idx + 1) * gt_per_rgb),
                 "frames": [],
             }
 

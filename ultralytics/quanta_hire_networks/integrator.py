@@ -151,6 +151,7 @@ class HIRE(nn.Module):
 
         self._rebuild_alphas()
 
+        # Persistent streaming state (inference). No debug/vis maps here.
         self.i_fast: Tensor | None = None
         self.i_slow: Tensor | None = None
         self.n_fast: Tensor | None = None
@@ -158,9 +159,7 @@ class HIRE(nn.Module):
         self.s_tilde: Tensor | None = None
         self.in_change: Tensor | None = None
         self.confirm_count: Tensor | None = None
-        self.cooldown: Tensor | None = None
         self.t_mix: Tensor | None = None
-        self.w_slow: Tensor | None = None
 
     def effective_mix_hold_bins(self) -> int:
         """Hold length H. ``H<0`` → chunk/subsampling (legacy); ``H>=0`` → that many bins."""
@@ -223,9 +222,7 @@ class HIRE(nn.Module):
         self.s_tilde = None
         self.in_change = None
         self.confirm_count = None
-        self.cooldown = None
         self.t_mix = None
-        self.w_slow = None
 
     def reset(self) -> None:
         self.clear_states()
@@ -416,6 +413,9 @@ class HIRE(nn.Module):
 
     def _expand_reset_mask(self, seed: Tensor, s_chg: Tensor) -> Tensor:
         """Open (optional) then geodesic-grow confirmed reset seeds inside {S̄>θ_grow}."""
+        # Empty seed → empty mask; skip morph/geodesic (bit-identical, much cheaper).
+        if not bool(seed.any()):
+            return seed
         seed = self._open_mask(seed)
         support = s_chg > self.effective_theta_grow()
         return self._geodesic_grow(seed, support)
@@ -430,41 +430,45 @@ class HIRE(nn.Module):
         s_tilde: Tensor,
         in_change: Tensor,
         confirm_count: Tensor,
-        cooldown: Tensor,
         t_mix: Tensor,
+        *,
+        beta_f_floor: Tensor,
+        beta_s_floor: Tensor,
+        n_f_max_t: Tensor,
+        n_s_max_t: Tensor,
+        hold_h: float,
+        tau_mix: float,
+        mix_floor: float,
+        record_debug: bool = False,
     ) -> tuple[Tensor, ...]:
-        """One-bin HIRE update.
+        """One-bin HIRE update (inference-first).
 
-        Returns
-        ``(i_fast, i_slow, n_fast, n_slow, s_tilde, in_change, confirm_count,
-          cooldown, t_mix, i_out, w_slow, g_fast, s_raw, s_spat, did_reset)``.
+        Always returns
+        ``(i_fast, i_slow, n_fast, n_slow, s_tilde, in_change, confirm_count, t_mix, i_out)``.
+        When ``record_debug``, also appends
+        ``(w_slow, g_fast, s_raw, did_reset)`` for visualization only.
         """
         eps = self.eps
         c_min = self.confirm_bins
-        n_f_max = float(self.fast_bins)
-        n_s_max = float(self.slow_bins)
-        hold_h = float(self.effective_mix_hold_bins())
-        tau_mix = float(self.mix_bins)
         in_change_prev = in_change
 
         # --- fast always updates ---
-        beta_f = torch.maximum(1.0 / n_fast, xt.new_tensor(self.beta_fast_floor))
+        beta_f = torch.maximum(1.0 / n_fast, beta_f_floor)
         i_fast = (1.0 - beta_f) * i_fast + beta_f * xt
-        n_fast = torch.minimum(n_fast + 1.0, xt.new_tensor(n_f_max))
+        n_fast = torch.minimum(n_fast + 1.0, n_f_max_t)
 
         # --- slow bank: freeze while in_change (keep pre-change I^s for sharp KL) ---
-        beta_s = torch.maximum(1.0 / n_slow, xt.new_tensor(self.beta_slow_floor))
+        beta_s = torch.maximum(1.0 / n_slow, beta_s_floor)
         i_slow_upd = (1.0 - beta_s) * i_slow + beta_s * xt
-        n_slow_upd = torch.minimum(n_slow + 1.0, xt.new_tensor(n_s_max))
+        n_slow_upd = torch.minimum(n_slow + 1.0, n_s_max_t)
         static = in_change_prev < 0.5
         i_slow = torch.where(static, i_slow_upd, i_slow)
         n_slow = torch.where(static, n_slow_upd, n_slow)
 
-        # --- evidence (S only for hard reset) ---
+        # --- evidence ---
         s_raw = self._bernoulli_kl(i_fast, i_slow, eps)
-        s_spat = s_raw
         a_s = self.alpha_surprise
-        s_tilde = a_s * s_tilde + (1.0 - a_s) * s_spat
+        s_tilde = a_s * s_tilde + (1.0 - a_s) * s_raw
 
         # --- hysteresis on pooled S (also feeds soft output gate below) ---
         s_chg = self._spatial_mean(s_tilde)
@@ -474,23 +478,14 @@ class HIRE(nn.Module):
         in_change = torch.where(leave, xt.new_zeros(xt.shape), in_change)
 
         confirm_count = torch.where(in_change > 0.5, confirm_count + 1.0, xt.new_zeros(xt.shape))
-        # Level trigger: once confirmed, keep resetting every bin while still in_change
-        # (fills motion bands over time; edge-only left thin ridges).
         can_reset = (in_change > 0.5) & (confirm_count >= float(c_min) - 1e-6)
-        # Expand seeds through moderate-S support (geodesic); not blind dilate.
         can_reset = self._expand_reset_mask(can_reset, s_chg)
         i_slow = torch.where(can_reset, i_fast, i_slow)
-        # Both ages → W_f: I^s matches I^f content without n←1 under-integration dark rims.
-        n_age = xt.new_full(xt.shape, n_f_max)
-        n_slow = torch.where(can_reset, n_age, n_slow)
-        n_fast = torch.where(can_reset, n_age, n_fast)
-        # Do not clear S / in_change here: zeroing S would trip leave and disarm the level latch.
-        # Leave (S̄<θ_off) alone ends the sustained-reset episode.
-        cooldown = xt.new_zeros(xt.shape)  # kept for debug/vis; anti-chatter unused
+        n_slow = torch.where(can_reset, n_f_max_t, n_slow)
+        n_fast = torch.where(can_reset, n_f_max_t, n_fast)
 
-        # --- hold+exp mix age (independent of n_s) ---
+        # --- hold+exp mix age ---
         t_mix = torch.where(can_reset, xt.new_zeros(xt.shape), t_mix + 1.0)
-        # g_reset=1 for t<H (full I^f); then exp(-(t-H)/τ) toward I^s
         over = torch.clamp(t_mix - hold_h, min=0.0)
         if hold_h > 0.0:
             g_reset = torch.where(
@@ -500,18 +495,15 @@ class HIRE(nn.Module):
             )
         else:
             g_reset = torch.exp(-t_mix / tau_mix)
-        # Deadzoned soft gate: background below θ_floor contributes 0 (no I^f bleed).
         if self.mix_theta > 0.0:
-            s_eff = torch.clamp(s_chg - self.effective_mix_floor(), min=0.0)
+            s_eff = torch.clamp(s_chg - mix_floor, min=0.0)
             g_soft = s_eff / (s_eff + self.mix_theta)
             g_fast = torch.maximum(g_reset, g_soft)
         else:
             g_fast = g_reset
-        w_slow = 1.0 - g_fast
-        i_out = w_slow * i_slow + g_fast * i_fast
+        i_out = (1.0 - g_fast) * i_slow + g_fast * i_fast
 
-        did_reset = can_reset.to(dtype=xt.dtype)
-        return (
+        base = (
             i_fast,
             i_slow,
             n_fast,
@@ -519,37 +511,52 @@ class HIRE(nn.Module):
             s_tilde,
             in_change,
             confirm_count,
-            cooldown,
             t_mix,
             i_out,
-            w_slow,
-            g_fast,
-            s_raw,
-            s_spat,
-            did_reset,
         )
+        if not record_debug:
+            return base
+        w_slow = 1.0 - g_fast
+        did_reset = can_reset.to(dtype=xt.dtype)
+        return base + (w_slow, g_fast, s_raw, did_reset)
 
-    def _update_causal(self, photon_cube: Tensor, *, clear_states: bool) -> Tensor:
-        recons, _ = self._update_causal_with_debug(photon_cube, clear_states=clear_states, record_debug=False)
-        return recons
+    def _store_states(
+        self,
+        *,
+        i_fast: Tensor | None,
+        i_slow: Tensor | None,
+        n_fast: Tensor | None,
+        n_slow: Tensor | None,
+        s_tilde: Tensor | None,
+        in_change: Tensor | None,
+        confirm_count: Tensor | None,
+        t_mix: Tensor | None,
+    ) -> None:
+        self.i_fast = None if i_fast is None else i_fast.detach()
+        self.i_slow = None if i_slow is None else i_slow.detach()
+        self.n_fast = None if n_fast is None else n_fast.detach()
+        self.n_slow = None if n_slow is None else n_slow.detach()
+        self.s_tilde = None if s_tilde is None else s_tilde.detach()
+        self.in_change = None if in_change is None else in_change.detach()
+        self.confirm_count = None if confirm_count is None else confirm_count.detach()
+        self.t_mix = None if t_mix is None else t_mix.detach()
 
-    def _update_causal_with_debug(
+    def _update_causal(
         self,
         photon_cube: Tensor,
         *,
         clear_states: bool,
-        record_debug: bool = True,
-    ) -> tuple[Tensor, dict[str, Tensor]]:
+        keep_last_only: bool = False,
+    ) -> Tensor:
+        """Lean causal recon path (no debug volumes, no confidence state)."""
         if photon_cube.ndim != 3:
             raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
         if clear_states:
             self.clear_states()
 
         h, w, t_raw = map(int, photon_cube.shape)
-        empty_debug: dict[str, Tensor] = {}
         if t_raw == 0:
-            empty = photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
-            return empty, empty_debug
+            return photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
 
         raw = photon_cube.float()
         i_fast = self.i_fast
@@ -559,11 +566,144 @@ class HIRE(nn.Module):
         s_tilde = self.s_tilde
         in_change = self.in_change
         confirm_count = self.confirm_count
-        cooldown = self.cooldown
         t_mix = self.t_mix
-        w_slow = self.w_slow
-        frames: list[Tensor] = []
 
+        beta_f_floor = raw.new_tensor(self.beta_fast_floor)
+        beta_s_floor = raw.new_tensor(self.beta_slow_floor)
+        n_f_max_t = raw.new_tensor(float(self.fast_bins))
+        n_s_max_t = raw.new_tensor(float(self.slow_bins))
+        hold_h = float(self.effective_mix_hold_bins())
+        tau_mix = float(self.mix_bins)
+        mix_floor = float(self.effective_mix_floor())
+        t_mix_init = float(max(hold_h, 1) + 10.0 * tau_mix)
+
+        # keep_last_only avoids storing every emit. If normalize uses a non-max
+        # quantile we must keep the full stack for an identical clamp_recons.
+        use_last_only = bool(keep_last_only)
+        if use_last_only and self.normalize and abs(float(self.quantile) - 1.0) > 1e-12:
+            use_last_only = False
+
+        frames: list[Tensor] | None = None if use_last_only else []
+        last_out: Tensor | None = None
+        running_max: Tensor | None = None
+        i_out: Tensor | None = None
+
+        for t0 in range(0, t_raw, self.subsampling):
+            t1 = min(t_raw, t0 + self.subsampling)
+            for t in range(t0, t1):
+                xt = raw[..., t]
+                if i_fast is None or i_slow is None or s_tilde is None:
+                    i_fast = xt.clone()
+                    i_slow = xt.clone()
+                    n_fast = xt.new_ones(xt.shape)
+                    n_slow = xt.new_ones(xt.shape)
+                    s_tilde = xt.new_zeros(xt.shape)
+                    in_change = xt.new_zeros(xt.shape)
+                    confirm_count = xt.new_zeros(xt.shape)
+                    t_mix = xt.new_full(xt.shape, t_mix_init)
+                    i_out = i_slow
+                else:
+                    (
+                        i_fast,
+                        i_slow,
+                        n_fast,
+                        n_slow,
+                        s_tilde,
+                        in_change,
+                        confirm_count,
+                        t_mix,
+                        i_out,
+                    ) = self._step(
+                        xt,
+                        i_fast,
+                        i_slow,
+                        n_fast,
+                        n_slow,
+                        s_tilde,
+                        in_change,
+                        confirm_count,
+                        t_mix,
+                        beta_f_floor=beta_f_floor,
+                        beta_s_floor=beta_s_floor,
+                        n_f_max_t=n_f_max_t,
+                        n_s_max_t=n_s_max_t,
+                        hold_h=hold_h,
+                        tau_mix=tau_mix,
+                        mix_floor=mix_floor,
+                        record_debug=False,
+                    )
+            assert i_out is not None
+            if use_last_only:
+                last_out = i_out
+                if self.normalize:
+                    frame_max = i_out.detach().amax()
+                    running_max = frame_max if running_max is None else torch.maximum(running_max, frame_max)
+            else:
+                assert frames is not None
+                frames.append(i_out.unsqueeze(-1))
+
+        self._store_states(
+            i_fast=i_fast,
+            i_slow=i_slow,
+            n_fast=n_fast,
+            n_slow=n_slow,
+            s_tilde=s_tilde,
+            in_change=in_change,
+            confirm_count=confirm_count,
+            t_mix=t_mix,
+        )
+
+        if use_last_only:
+            if last_out is None:
+                return photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
+            recons_prenorm = last_out.unsqueeze(-1)
+            if self.normalize:
+                max_value = (running_max if running_max is not None else recons_prenorm.new_tensor(1.0)).clamp(
+                    min=1e-6
+                )
+                return (recons_prenorm / max_value).clamp(0, 1)
+            return recons_prenorm.clamp(0, 1)
+
+        assert frames is not None
+        return self.clamp_recons(torch.cat(frames, dim=-1))
+
+    def _update_causal_with_debug(
+        self,
+        photon_cube: Tensor,
+        *,
+        clear_states: bool,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Vis/debug path: same recon math, plus per-bin CPU maps (higher memory)."""
+        if photon_cube.ndim != 3:
+            raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
+        if clear_states:
+            self.clear_states()
+
+        h, w, t_raw = map(int, photon_cube.shape)
+        if t_raw == 0:
+            empty = photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
+            return empty, {}
+
+        raw = photon_cube.float()
+        i_fast = self.i_fast
+        i_slow = self.i_slow
+        n_fast = self.n_fast
+        n_slow = self.n_slow
+        s_tilde = self.s_tilde
+        in_change = self.in_change
+        confirm_count = self.confirm_count
+        t_mix = self.t_mix
+
+        beta_f_floor = raw.new_tensor(self.beta_fast_floor)
+        beta_s_floor = raw.new_tensor(self.beta_slow_floor)
+        n_f_max_t = raw.new_tensor(float(self.fast_bins))
+        n_s_max_t = raw.new_tensor(float(self.slow_bins))
+        hold_h = float(self.effective_mix_hold_bins())
+        tau_mix = float(self.mix_bins)
+        mix_floor = float(self.effective_mix_floor())
+        t_mix_init = float(max(hold_h, 1) + 10.0 * tau_mix)
+
+        frames: list[Tensor] = []
         dbg_keys = (
             "i_fast",
             "i_slow",
@@ -581,15 +721,12 @@ class HIRE(nn.Module):
             "cooldown",
             "did_reset",
         )
-        dbg_lists: dict[str, list[Tensor]] = {k: [] for k in dbg_keys} if record_debug else {}
+        dbg_lists: dict[str, list[Tensor]] = {k: [] for k in dbg_keys}
 
         def _dbg_cpu(x: Tensor) -> Tensor:
-            """Debug H×W frames on CPU — keeps algorithm tensors on the compute device."""
             return x.detach().to(device="cpu", dtype=torch.float32)
 
-        # Large age ⇒ g≈0 (full slow) until the first hard reset.
-        t_mix_init = float(max(self.effective_mix_hold_bins(), 1) + 10.0 * self.mix_bins)
-
+        i_out: Tensor | None = None
         for t0 in range(0, t_raw, self.subsampling):
             t1 = min(t_raw, t0 + self.subsampling)
             for t in range(t0, t1):
@@ -602,13 +739,11 @@ class HIRE(nn.Module):
                     s_tilde = xt.new_zeros(xt.shape)
                     in_change = xt.new_zeros(xt.shape)
                     confirm_count = xt.new_zeros(xt.shape)
-                    cooldown = xt.new_zeros(xt.shape)
                     t_mix = xt.new_full(xt.shape, t_mix_init)
-                    g_fast = xt.new_zeros(xt.shape)
-                    w_slow = xt.new_ones(xt.shape)
-                    s_raw = xt.new_zeros(xt.shape)
-                    s_spat = xt.new_zeros(xt.shape)
                     i_out = i_slow
+                    w_slow = xt.new_ones(xt.shape)
+                    g_fast = xt.new_zeros(xt.shape)
+                    s_raw = xt.new_zeros(xt.shape)
                     did_reset = xt.new_zeros(xt.shape)
                 else:
                     (
@@ -619,13 +754,11 @@ class HIRE(nn.Module):
                         s_tilde,
                         in_change,
                         confirm_count,
-                        cooldown,
                         t_mix,
                         i_out,
                         w_slow,
                         g_fast,
                         s_raw,
-                        s_spat,
                         did_reset,
                     ) = self._step(
                         xt,
@@ -636,59 +769,60 @@ class HIRE(nn.Module):
                         s_tilde,
                         in_change,
                         confirm_count,
-                        cooldown,
                         t_mix,
+                        beta_f_floor=beta_f_floor,
+                        beta_s_floor=beta_s_floor,
+                        n_f_max_t=n_f_max_t,
+                        n_s_max_t=n_s_max_t,
+                        hold_h=hold_h,
+                        tau_mix=tau_mix,
+                        mix_floor=mix_floor,
+                        record_debug=True,
                     )
-                if record_debug:
-                    dbg_lists["i_fast"].append(_dbg_cpu(i_fast))
-                    dbg_lists["i_slow"].append(_dbg_cpu(i_slow))
-                    dbg_lists["i_out"].append(_dbg_cpu(i_out))
-                    dbg_lists["s_raw"].append(_dbg_cpu(s_raw))
-                    dbg_lists["s_spat"].append(_dbg_cpu(s_spat))
-                    dbg_lists["s_tilde"].append(_dbg_cpu(s_tilde))
-                    dbg_lists["w_slow"].append(_dbg_cpu(w_slow))
-                    dbg_lists["g_fast"].append(_dbg_cpu(g_fast))
-                    dbg_lists["t_mix"].append(_dbg_cpu(t_mix))
-                    dbg_lists["n_slow"].append(_dbg_cpu(n_slow))
-                    dbg_lists["n_fast"].append(_dbg_cpu(n_fast))
-                    dbg_lists["in_change"].append(_dbg_cpu(in_change))
-                    dbg_lists["confirm"].append(_dbg_cpu(confirm_count))
-                    dbg_lists["cooldown"].append(_dbg_cpu(cooldown))
-                    dbg_lists["did_reset"].append(_dbg_cpu(did_reset))
+                assert i_out is not None
+                dbg_lists["i_fast"].append(_dbg_cpu(i_fast))
+                dbg_lists["i_slow"].append(_dbg_cpu(i_slow))
+                dbg_lists["i_out"].append(_dbg_cpu(i_out))
+                dbg_lists["s_raw"].append(_dbg_cpu(s_raw))
+                dbg_lists["s_spat"].append(_dbg_cpu(s_raw))  # alias (no separate spatial S)
+                dbg_lists["s_tilde"].append(_dbg_cpu(s_tilde))
+                dbg_lists["w_slow"].append(_dbg_cpu(w_slow))
+                dbg_lists["g_fast"].append(_dbg_cpu(g_fast))
+                dbg_lists["t_mix"].append(_dbg_cpu(t_mix))
+                dbg_lists["n_slow"].append(_dbg_cpu(n_slow))
+                dbg_lists["n_fast"].append(_dbg_cpu(n_fast))
+                dbg_lists["in_change"].append(_dbg_cpu(in_change))
+                dbg_lists["confirm"].append(_dbg_cpu(confirm_count))
+                dbg_lists["cooldown"].append(_dbg_cpu(xt.new_zeros(xt.shape)))
+                dbg_lists["did_reset"].append(_dbg_cpu(did_reset))
             frames.append(i_out.unsqueeze(-1))
 
-        self.i_fast = None if i_fast is None else i_fast.detach()
-        self.i_slow = None if i_slow is None else i_slow.detach()
-        self.n_fast = None if n_fast is None else n_fast.detach()
-        self.n_slow = None if n_slow is None else n_slow.detach()
-        self.s_tilde = None if s_tilde is None else s_tilde.detach()
-        self.in_change = None if in_change is None else in_change.detach()
-        self.confirm_count = None if confirm_count is None else confirm_count.detach()
-        self.cooldown = None if cooldown is None else cooldown.detach()
-        self.t_mix = None if t_mix is None else t_mix.detach()
-        self.w_slow = None if w_slow is None else w_slow.detach()
+        self._store_states(
+            i_fast=i_fast,
+            i_slow=i_slow,
+            n_fast=n_fast,
+            n_slow=n_slow,
+            s_tilde=s_tilde,
+            in_change=in_change,
+            confirm_count=confirm_count,
+            t_mix=t_mix,
+        )
 
         recons_prenorm = torch.cat(frames, dim=-1)
         recons = self.clamp_recons(recons_prenorm)
-
-        if not record_debug:
-            return recons, empty_debug
-
         debug: dict[str, Tensor] = {
             "recons_prenorm": recons_prenorm.detach().cpu(),
             "recons": recons.detach().cpu(),
         }
         for key, parts in dbg_lists.items():
-            vol = torch.stack(parts, dim=-1)  # already on CPU
+            vol = torch.stack(parts, dim=-1)
             debug[f"{key}_hwt"] = vol
             debug[f"{key}_last"] = vol[..., -1]
             debug[f"{key}_peak"] = vol.amax(dim=-1)
             debug[f"{key}_mean"] = vol.mean(dim=-1)
         debug["w_fast_last"] = debug["g_fast_last"]
-        # Chunk summaries: any hard reset / min age over the processed volume.
         debug["reset_any"] = debug["did_reset_peak"]
         debug["n_slow_min"] = debug["n_slow_hwt"].amin(dim=-1)
-        # Back-compat aliases for older vis scripts.
         debug["gate_last"] = debug["w_slow_last"]
         debug["gate_hwt"] = debug["w_slow_hwt"]
         debug["conf_last"] = debug["w_fast_last"]
@@ -715,7 +849,7 @@ class HIRE(nn.Module):
         if subsampling is not None or kwargs:
             self.update_hyperparams(subsampling=subsampling, **kwargs)
         try:
-            return self._update_causal(photon_cube, clear_states=clear_states)
+            return self._update_causal(photon_cube, clear_states=clear_states, keep_last_only=False)
         finally:
             self.subsampling = prev
 
@@ -732,19 +866,13 @@ class HIRE(nn.Module):
         if subsampling is not None or kwargs:
             self.update_hyperparams(subsampling=subsampling, **kwargs)
         try:
-            return self._update_causal_with_debug(photon_cube, clear_states=clear_states, record_debug=True)
+            return self._update_causal_with_debug(photon_cube, clear_states=clear_states)
         finally:
             self.subsampling = prev
 
 
 class HIREFrame(HIRE):
-    """Frame-mode HIRE: last emitted recon + Bayer-pooled confidence ``1 - g``."""
-
-    @staticmethod
-    def _confidence_to_frame_space(confidence_hw: Tensor) -> Tensor:
-        if confidence_hw.ndim != 2:
-            raise ValueError(f"Expected confidence map (H,W), got shape={tuple(confidence_hw.shape)}")
-        return F.avg_pool2d(confidence_hw.unsqueeze(0).unsqueeze(0).float(), kernel_size=2, stride=2).squeeze(0)
+    """Frame-mode HIRE: emit only the last recon of each chunk (no confidence)."""
 
     @torch.no_grad()
     def process_photon_cube_to_frame(
@@ -754,25 +882,20 @@ class HIREFrame(HIRE):
         subsampling: int | None = None,
         **kwargs: Any,
     ) -> tuple[Tensor, Tensor]:
+        """Return ``(H,W,1)`` recon and a cheap zero confidence placeholder for API compat."""
         prev = self.subsampling
         if subsampling is not None or kwargs:
             self.update_hyperparams(subsampling=subsampling, **kwargs)
         try:
-            recons = self._update_causal(photon_cube, clear_states=clear_states)
+            recons = self._update_causal(
+                photon_cube, clear_states=clear_states, keep_last_only=True
+            )
         finally:
             self.subsampling = prev
 
+        h, w = map(int, photon_cube.shape[:2])
+        confidence = photon_cube.new_zeros((1, h // 2, w // 2), dtype=torch.float32)
         if recons.ndim != 3 or int(recons.shape[-1]) == 0:
-            h, w = map(int, photon_cube.shape[:2])
             empty = photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
-            confidence = photon_cube.new_zeros((1, h // 2, w // 2), dtype=torch.float32)
             return empty, confidence
-
-        frame = recons[..., -1:].contiguous()
-        if self.w_slow is None:
-            conf_hw = photon_cube.new_ones(photon_cube.shape[0], photon_cube.shape[1], dtype=torch.float32)
-        else:
-            # High when recently reset (prefer I^f).
-            conf_hw = (1.0 - self.w_slow.float()).clamp(0.0, 1.0)
-        confidence = self._confidence_to_frame_space(conf_hw).to(device=frame.device, dtype=frame.dtype)
-        return frame, confidence
+        return recons, confidence
