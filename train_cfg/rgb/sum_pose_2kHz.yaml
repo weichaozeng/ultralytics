@@ -14,7 +14,7 @@ spad_test_json: /home/zvc/Data/visionsim/outputs/test_2kHz.json
 
 project: Runs/spad_pose
 name: sum_pose_2kHz
-device: "0"
+device: "2"
 epochs: 20
 spad_viz_period: 5
 batch: 40
