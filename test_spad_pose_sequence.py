@@ -341,6 +341,7 @@ def _render_paths_from_record(
     preprocessor: str,
     render_root: str | Path | None,
     source_render_dirname: str,
+    render_tag: str = "",
 ) -> tuple[Path, Path, Path | None, Path]:
     sample_name = str(record["name"])
     explicit_frames = record.get(preprocessor) or record.get(f"render_{preprocessor}_frames")
@@ -367,6 +368,7 @@ def _render_paths_from_record(
             preprocessor=preprocessor,
             sample_name=sample_name,
             source_render_dirname=source_render_dirname,
+            render_tag=str(render_tag or "").strip(),
         )
     return render_dir, render_dir / "frames.npy", render_dir / "confidence.npy", render_dir / "meta.json"
 
