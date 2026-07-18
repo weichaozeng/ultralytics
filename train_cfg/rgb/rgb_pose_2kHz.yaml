@@ -1,0 +1,32 @@
+# Finetune original detector.pt on VisionSIM RGB (renders-rgb25fps*) from the 2 kHz split.
+# Temporal alignment matches sequence_*_2kHz.yaml:
+#   GT 125 Hz, RGB 25 FPS => 1 RGB frame = 5 GT = SPAD chunk_size 80.
+# batch=40 ≈ sequence batch=2 * spad_output_frames=20 detector forwards.
+#
+# Epochs: full-parameter finetune from pretrained detector; 20 is usually enough
+# (SPAD plugin runs keep 60 because only adapters train). Override with epochs=30
+# if val loss still improves.
+model: /home/zvc/Project/SPADHand/ultralytics/weights/detector.pt
+
+spad_train_json: /home/zvc/Data/visionsim/outputs/train_2kHz.json
+spad_test_json: /home/zvc/Data/visionsim/outputs/test_2kHz.json
+
+project: Runs/spad_pose
+name: rgb_pose_2kHz
+device: "0"
+epochs: 20
+spad_viz_period: 5
+batch: 40
+workers: 0
+imgsz: 512
+
+# Align with sequence_hire_attn_wst_2kHz windowing / GT
+rgb_frame_source: rgb
+spad_bins_per_gt: 16
+spad_stride_frames: 5
+spad_image_size: 512
+rgb_fps: 25.0
+rgb_gt_rate_hz: 125.0
+
+# Open-train the detector (no SPAD plugins)
+spad_freeze_detector: false

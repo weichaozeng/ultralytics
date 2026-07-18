@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from ultralytics.data.spad_pose_dataset import (
+    RgbPoseFrameDataset,
     SpadPoseDataset,
     SpadPoseFrameDataset,
     SpadPoseRenderedFrameDataset,
@@ -627,6 +628,7 @@ class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
                 render_contains_confidence=bool(getattr(self.args, "spad_render_contains_confidence", True)),
                 expected_render_config=expected_config,
                 source_render_dirname=str(getattr(self.args, "spad_source_render_dirname", "renders-spc8kHz")),
+                render_tag=str(getattr(self.args, "spad_render_tag", "")).strip(),
             )
 
         return SpadPoseFrameDataset(
@@ -690,6 +692,294 @@ class SpadPoseFrameTrainer(SpadPoseSequenceTrainer):
         rgb = frames[0, si].detach().float().cpu().permute(1, 2, 0).numpy()
         rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
         return np.ascontiguousarray(rgb_u8[:, :, ::-1])
+
+
+class RgbPoseTrainer(PoseTrainer):
+    """Finetune a standard YOLO pose detector on VisionSIM frame caches.
+
+    Default source is RGB ``frames.npy`` (25 FPS). Set ``rgb_frame_source`` to a
+    preprocessor name (e.g. ``sum``) to train on offline ``renders-{src}-2kHz``
+    caches instead. Always trains the original PoseModel with the detector
+    unfrozen (no SPAD temporal plugin).
+    """
+
+    _RENDER_SOURCES = frozenset({"sum", "ema", "ppb", "stea", "hire"})
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
+        overrides = overrides or {}
+        custom_prefixes = ("spad_", "rgb_", "ppb_", "stea_", "hire_", "ssd_", "attn_", "sum_")
+        if any(str(k).startswith(custom_prefixes) for k in overrides):
+            cfg_dict = dict(vars(cfg)) if hasattr(cfg, "__dict__") else dict(cfg)
+            cfg_dict.update({k: v for k, v in overrides.items() if str(k).startswith(custom_prefixes)})
+            cfg = cfg_dict
+        super().__init__(cfg, overrides, _callbacks)
+        # Never freeze the detector for RGB finetune unless the user sets freeze explicitly.
+        if getattr(self.args, "freeze", None) in {None, False, ""} and bool(
+            getattr(self.args, "spad_freeze_detector", False)
+        ):
+            LOGGER.warning(
+                "RgbPoseTrainer: spad_freeze_detector=True is ignored for RGB finetune; "
+                "set freeze=<layer list> if you really want to freeze layers."
+            )
+        self.add_callback("on_train_start", self._rgb_on_train_start)
+        self.add_callback("on_fit_epoch_end", self._rgb_on_fit_epoch_end)
+
+    def get_dataset(self) -> dict[str, Any]:
+        """Return a minimal dataset dictionary for RGB / rendered-frame pose training."""
+        spad_train_json = getattr(self.args, "spad_train_json", None)
+        spad_test_json = getattr(self.args, "spad_test_json", None)
+        if spad_train_json and spad_test_json:
+            return {
+                "train": spad_train_json,
+                "val": spad_test_json,
+                "nc": 2,
+                "names": {0: "left_hand", 1: "right_hand"},
+                "channels": 3,
+                "kpt_shape": [21, 3],
+                "spad_train_json": spad_train_json,
+                "spad_test_json": spad_test_json,
+            }
+        return super().get_dataset()
+
+    def _resolve_frame_source(self) -> str:
+        source = str(getattr(self.args, "rgb_frame_source", "rgb")).strip().lower()
+        if source in {"", "rgb", "rgb25", "rgb25fps"}:
+            return "rgb"
+        if source in self._RENDER_SOURCES:
+            return source
+        raise ValueError(
+            f"Unsupported rgb_frame_source={source!r}; expected 'rgb' or one of "
+            f"{sorted(self._RENDER_SOURCES)}."
+        )
+
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+        """Build RGB or offline-rendered frame dataset from VisionSIM split JSON."""
+        json_path = getattr(self.args, "spad_train_json", None) or self.data.get("spad_train_json")
+        if mode != "train":
+            json_path = getattr(self.args, "spad_test_json", None) or self.data.get("spad_test_json")
+        if not json_path:
+            raise ValueError("RgbPoseTrainer requires `spad_train_json` and `spad_test_json` in args or data yaml.")
+
+        samples = load_visionsim_split_json(json_path)
+        frame_source = self._resolve_frame_source()
+        image_size = int(getattr(self.args, "spad_image_size", self.data.get("spad_image_size", self.args.imgsz)))
+        LOGGER.info(
+            f"Loaded {len(samples)} samples from {json_path} for mode={mode!r} "
+            f"(detector finetune, source={frame_source!r})"
+        )
+
+        if frame_source == "rgb":
+            gt_rate_hz = float(getattr(self.args, "rgb_gt_rate_hz", getattr(self.args, "gt_rate_hz", 125.0)))
+            rgb_fps = float(getattr(self.args, "rgb_fps", 25.0))
+            stride_frames = int(getattr(self.args, "spad_stride_frames", self.data.get("spad_stride_frames", 5)))
+            bins_per_gt = int(getattr(self.args, "spad_bins_per_gt", self.data.get("spad_bins_per_gt", 16)))
+            dataset = RgbPoseFrameDataset(
+                samples=samples,
+                image_size=image_size,
+                gt_rate_hz=gt_rate_hz,
+                rgb_fps=rgb_fps,
+                stride_frames=stride_frames,
+                bins_per_gt=bins_per_gt,
+            )
+            LOGGER.info(
+                f"RgbPoseTrainer: {len(dataset)} RGB frames | rgb_fps={rgb_fps} gt_rate_hz={gt_rate_hz} "
+                f"gt_per_rgb={dataset.gt_per_rgb} stride_frames={stride_frames} image_size={image_size}"
+            )
+            return dataset
+
+        # Offline preprocessor cache (e.g. renders-sum-2kHz)
+        spad_bins_per_gt = int(getattr(self.args, "spad_bins_per_gt", self.data.get("spad_bins_per_gt", 16)))
+        spad_subsampling = int(getattr(self.args, "spad_subsampling", self.data.get("spad_subsampling", 80)))
+        chunk_size = int(getattr(self.args, "spad_chunk_size", 0)) or spad_subsampling
+        stride_frames = int(getattr(self.args, "spad_stride_frames", self.data.get("spad_stride_frames", 0))) or None
+        stride_bins = chunk_size if stride_frames is None else (int(stride_frames) * spad_bins_per_gt)
+        input_gamma = float(getattr(self.args, "spad_input_gamma", getattr(self.args, "input_gamma", 2.2)))
+        render_root = getattr(self.args, "spad_render_root", None)
+        source_dirname = str(getattr(self.args, "spad_source_render_dirname", "renders-spc2kHz"))
+        render_tag = str(getattr(self.args, "spad_render_tag", "2kHz")).strip()
+        has_explicit = SpadPoseSequenceTrainer._samples_have_explicit_render(samples, frame_source)
+        expected_config = None if has_explicit else build_render_config(
+            preprocessor=frame_source,
+            chunk_size=chunk_size,
+            stride_bins=stride_bins,
+            spad_bins_per_gt=spad_bins_per_gt,
+            packed_ch_order=getattr(self.args, "spad_packed_ch_order", self.data.get("spad_packed_ch_order", "RGB")),
+            input_gamma=input_gamma,
+            extra_kwargs=SpadPoseSequenceTrainer._build_preprocessor_kwargs(self, frame_source, spad_subsampling),
+        )
+        dataset = SpadPoseRenderedFrameDataset(
+            samples=samples,
+            render_root=render_root,
+            preprocessor=frame_source,
+            image_size=image_size,
+            render_contains_confidence=bool(getattr(self.args, "spad_render_contains_confidence", False)),
+            expected_render_config=expected_config,
+            source_render_dirname=source_dirname,
+            render_tag=render_tag,
+        )
+        LOGGER.info(
+            f"RgbPoseTrainer: {len(dataset)} {frame_source} frames | chunk={chunk_size} "
+            f"tag={render_tag!r} source_dir={source_dirname!r} image_size={image_size}"
+        )
+        return dataset
+
+    def get_model(
+        self,
+        cfg: str | Path | dict[str, Any] | None = None,
+        weights: str | Path | None = None,
+        verbose: bool = True,
+    ) -> PoseModel:
+        """Build a standard PoseModel (original detector) and load pretrained weights."""
+        model = PoseModel(
+            cfg, nc=self.data["nc"], ch=self.data["channels"], data_kpt_shape=self.data["kpt_shape"], verbose=verbose
+        )
+        if weights:
+            model.load(weights)
+        return model
+
+    def set_model_attributes(self):
+        """Set pose attributes; keep the detector trainable by default."""
+        super().set_model_attributes()
+        if bool(getattr(self.args, "spad_freeze_detector", False)):
+            # Explicit opt-in only; RGB baseline is open-train.
+            self.args.freeze = list(range(len(self.model.model)))
+            LOGGER.info("RgbPoseTrainer: freezing detector layers (spad_freeze_detector=True).")
+        else:
+            LOGGER.info("RgbPoseTrainer: training full detector (unfrozen).")
+
+    def preprocess_batch(self, batch: dict) -> dict:
+        """Move RGB batches to device; images are already float in [0, 1]."""
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
+        return batch
+
+    def get_validator(self):
+        """Return a no-op validator; RGB val loss/visualization runs from the training callback."""
+        self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
+        return _SpadNoOpValidator(self.args)
+
+    def validate(self):
+        """Skip built-in PoseValidator; fitness comes from RGB eval callback loss."""
+        fitness = -float(self.loss.detach().cpu()) if hasattr(self, "loss") else 0.0
+        if not self.best_fitness or self.best_fitness < fitness:
+            self.best_fitness = fitness
+        return {}, fitness
+
+    def plot_training_labels(self):
+        """Skip dense label scatter plots for large RGB frame datasets."""
+        return
+
+    def plot_training_samples(self, batch: dict[str, Any], ni: int) -> None:
+        """Save a simple RGB overlay of the first few samples in the batch."""
+        if RANK not in {-1, 0}:
+            return
+        save_dir = Path(self.save_dir) / "train_batch_rgb"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        n = min(4, int(batch["img"].shape[0]))
+        for si in range(n):
+            canvas = self._rgb_canvas_from_batch(batch, si)
+            self._spad_draw_labels(canvas, batch, si)
+            cv2.imwrite(str(save_dir / f"train_batch{ni}_sample{si:03d}.png"), canvas)
+
+    def _rgb_on_train_start(self, trainer):
+        if RANK in {-1, 0}:
+            initial_path = Path(self.save_dir) / "weights" / "initial.pt"
+            initial_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"epoch": -1, "model": self.model, "train_args": vars(self.args)}, initial_path)
+        self._rgb_eval_visualize(epoch_idx=0)
+
+    def _rgb_on_fit_epoch_end(self, trainer):
+        period = int(getattr(self.args, "spad_viz_period", 1))
+        if period <= 0 or (self.epoch + 1) % period != 0:
+            return
+        self._rgb_eval_visualize(epoch_idx=self.epoch + 1)
+
+    def _rgb_eval_visualize(self, *, epoch_idx: int):
+        """Evaluate random RGB test frames and save overlays on rank 0."""
+        if RANK not in {-1, 0}:
+            return
+        model = self.ema.ema if getattr(self, "ema", None) is not None else self.model
+        was_training = model.training
+        model.eval()
+
+        dataset = self.test_loader.dataset
+        max_batches = int(getattr(self.args, "spad_eval_max_batches", -1))
+        eval_count = len(dataset) if max_batches < 0 else min(max_batches, len(dataset))
+        eval_count = max(eval_count, 1)
+        generator = torch.Generator().manual_seed(int(getattr(self.args, "spad_eval_seed", 0)) + int(epoch_idx))
+        indices = torch.randperm(len(dataset), generator=generator)[:eval_count].tolist()
+        loader = DataLoader(
+            Subset(dataset, indices), batch_size=1, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn
+        )
+
+        save_dir = Path(self.save_dir) / "rgb_viz" / f"epoch{epoch_idx:03d}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        loss_sum_total = 0.0
+        loss_items_total = None
+        seen_batches = 0
+        written = []
+        viz_batches = int(getattr(self.args, "spad_viz_batches", 1))
+
+        with torch.no_grad():
+            for batch_i, batch in enumerate(loader):
+                batch = self.preprocess_batch(batch)
+                preds = model(batch["img"])
+                loss, loss_items = model.loss(batch, preds)
+                processed = self._spad_postprocess_pose(preds)
+
+                loss_sum_total += float(loss.sum().detach().cpu())
+                loss_items_cpu = loss_items.detach().cpu()
+                loss_items_total = loss_items_cpu if loss_items_total is None else loss_items_total + loss_items_cpu
+                seen_batches += 1
+
+                if batch_i < viz_batches:
+                    for si in range(int(batch["img"].shape[0])):
+                        canvas = self._rgb_canvas_from_batch(batch, si)
+                        cv2.imwrite(str(save_dir / f"batch{batch_i:03d}_sample{si:03d}_rgb.png"), canvas)
+                        self._spad_draw_labels(canvas, batch, si)
+                        if si < len(processed):
+                            self._spad_draw_predictions(canvas, processed[si])
+                        out_path = save_dir / f"batch{batch_i:03d}_sample{si:03d}_overlay.png"
+                        ok = cv2.imwrite(str(out_path), canvas)
+                        written.append(f"{out_path.name}: {'ok' if ok else 'failed'}")
+
+        if seen_batches:
+            self.metrics["rgb_val/loss_sum"] = loss_sum_total / seen_batches
+            mean_loss_items = loss_items_total / seen_batches
+            for i, value in enumerate(mean_loss_items.tolist()):
+                self.metrics[f"rgb_val/loss_{i}"] = float(value)
+        else:
+            mean_loss_items = torch.zeros(5)
+
+        with (save_dir / "summary.txt").open("w", encoding="utf-8") as f:
+            f.write(f"epoch_idx: {epoch_idx}\n")
+            f.write(f"seen_batches: {seen_batches}\n")
+            f.write(f"eval_max_batches: {max_batches}\n")
+            f.write(f"random_indices: {indices}\n")
+            f.write(f"mean_loss_sum: {self.metrics.get('rgb_val/loss_sum', 0.0)}\n")
+            f.write(f"mean_loss_items: {mean_loss_items.tolist()}\n")
+            f.write("\n".join(written))
+            f.write("\n")
+
+        if was_training:
+            model.train()
+
+    def _rgb_canvas_from_batch(self, batch: dict[str, Any], si: int) -> np.ndarray:
+        image_size = int(getattr(self.args, "spad_image_size", self.args.imgsz))
+        img = batch["img"][si].detach().float().cpu()
+        if img.ndim != 3:
+            return np.zeros((image_size, image_size, 3), dtype=np.uint8)
+        rgb = img.permute(1, 2, 0).numpy()
+        rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(rgb_u8[:, :, ::-1])
+
+    # Reuse SPAD overlay helpers (bbox / keypoints in image-size space).
+    _spad_postprocess_pose = SpadPoseSequenceTrainer._spad_postprocess_pose
+    _spad_draw_pose = SpadPoseSequenceTrainer._spad_draw_pose
+    _spad_draw_labels = SpadPoseSequenceTrainer._spad_draw_labels
+    _spad_draw_predictions = SpadPoseSequenceTrainer._spad_draw_predictions
 
 
 SpadPoseTrainer = SpadPoseSequenceTrainer

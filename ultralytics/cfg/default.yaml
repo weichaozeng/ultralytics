@@ -222,4 +222,8 @@ spad_spatial_reduce_ratio: 2 # (int) channel bottleneck ratio for spatial detect
 spad_spatial_kernel_size: 3 # (int) depthwise kernel size for spatial detector plugins
 spad_plugin_alpha_init: 0.0 # (float) initial residual gate value for detector plugins
 spad_frame_adapter_alpha_init: 0.0 # (float) initial residual gate value for the frame-mode adapter
+rgb_fps: 25.0 # (float) RGB camera FPS for VisionSIM rgb25fps finetune alignment
+rgb_gt_rate_hz: 125.0 # (float) GT annotation rate used with RGB finetune (matches SPAD bins_per_gt timing)
+rgb_frame_source: rgb # (str) detector-finetune input: rgb, or offline cache sum/ema/ppb/stea/hire
+spad_render_tag: 2kHz # (str) sibling cache suffix: renders-{prep}-{tag}; empty => renders-{prep}
 

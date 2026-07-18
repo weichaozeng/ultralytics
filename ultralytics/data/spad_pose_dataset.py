@@ -533,6 +533,7 @@ class SpadPoseRenderedFrameDataset(Dataset):
         render_contains_confidence: bool = True,
         expected_render_config: dict[str, Any] | None = None,
         source_render_dirname: str = "renders-spc8kHz",
+        render_tag: str = "",
     ):
         if not samples:
             raise ValueError("samples must be a non-empty list")
@@ -543,6 +544,7 @@ class SpadPoseRenderedFrameDataset(Dataset):
         self.render_contains_confidence = bool(render_contains_confidence)
         self.expected_render_config = dict(expected_render_config or {})
         self.source_render_dirname = str(source_render_dirname).strip()
+        self.render_tag = str(render_tag).strip()
         self.expected_render_fingerprint = (
             render_config_fingerprint(self.expected_render_config) if self.expected_render_config else None
         )
@@ -592,6 +594,7 @@ class SpadPoseRenderedFrameDataset(Dataset):
                 preprocessor=self.preprocessor,
                 sample_name=sample_name,
                 source_render_dirname=self.source_render_dirname,
+                render_tag=self.render_tag,
             )
         return render_dir, render_dir / "frames.npy", render_dir / "meta.json"
 
@@ -1124,6 +1127,244 @@ class SpadPoseRenderedSequenceDataset(Dataset):
         new_batch["spad_end_bin"] = torch.tensor([b["spad_end_bin"] for b in batch], dtype=torch.long)
         new_batch["chunk_size"] = torch.tensor([b["chunk_size"] for b in batch], dtype=torch.long)
         new_batch["t_index_ll"] = batch[0]["t_index_ll"]
+        return new_batch
+
+
+@dataclass(frozen=True)
+class RgbPoseFrameWindow:
+    """One RGB frame supervised at the end of its GT exposure window."""
+
+    name: str
+    gt_ann_path: Path
+    rgb_path: Path
+    frame_index: int
+    target_gt_time: float
+    gt_per_rgb: int
+
+
+class RgbPoseFrameDataset(Dataset):
+    """Load VisionSIM ``renders-rgb25fps*`` frames.npy with GT-aligned hand labels.
+
+    Temporal alignment matches 2 kHz SPAD chunking:
+    - GT @ 125 Hz, RGB @ 25 FPS => ``gt_per_rgb = 5``
+    - RGB frame ``i`` is supervised at ``target_gt_time = (i + 1) * gt_per_rgb``
+      (end of the 5-GT / 80-bin SPAD chunk that maps 1:1 onto that RGB frame)
+    - ``stride_frames`` is in GT units; default 5 => one sample per RGB frame
+    """
+
+    HAND_TO_CLASS = SpadPoseSequenceDataset.HAND_TO_CLASS
+
+    def __init__(
+        self,
+        samples: list[dict[str, str]],
+        *,
+        image_size: int = 512,
+        gt_rate_hz: float = 125.0,
+        rgb_fps: float = 25.0,
+        stride_frames: int | None = 5,
+        bins_per_gt: int = 16,
+    ):
+        if not samples:
+            raise ValueError("samples must be a non-empty list")
+
+        self.image_size = int(image_size)
+        self.gt_rate_hz = float(gt_rate_hz)
+        self.rgb_fps = float(rgb_fps)
+        self.bins_per_gt = int(bins_per_gt)
+        self.gt_per_rgb = max(int(round(self.gt_rate_hz / self.rgb_fps)), 1)
+        self.stride_frames = int(stride_frames if stride_frames is not None else self.gt_per_rgb)
+        if self.stride_frames <= 0:
+            raise ValueError(f"stride_frames must be > 0, got {self.stride_frames}")
+        if self.stride_frames % self.gt_per_rgb != 0:
+            raise ValueError(
+                f"stride_frames={self.stride_frames} must be a multiple of gt_per_rgb={self.gt_per_rgb} "
+                f"(gt_rate_hz={self.gt_rate_hz}, rgb_fps={self.rgb_fps})"
+            )
+        self.stride_rgb = self.stride_frames // self.gt_per_rgb
+
+        missing_rgb = [rec["id"] for rec in samples if not rec.get("rgb")]
+        if missing_rgb:
+            raise ValueError(
+                f"{len(missing_rgb)} samples lack `rgb` paths (e.g. {missing_rgb[0]!r}). "
+                "Rebuild the VisionSIM split JSON so each sample includes rgb."
+            )
+
+        self.sample_records = {rec["id"]: rec for rec in samples}
+        self.video_names = sorted(self.sample_records)
+        self.annotations = {name: self._load_annotation(name) for name in self.video_names}
+        self.windows = self._build_windows()
+        if not self.windows:
+            raise RuntimeError(f"No RGB pose frames found for {len(self.video_names)} samples")
+        self.labels = self._build_ultralytics_labels()
+        self.im_files = [str(lb["im_file"]) for lb in self.labels]
+        self.ni = len(self.labels)
+        self._frames_cache: dict[str, np.ndarray] = {}
+
+    def _load_annotation(self, name: str) -> dict[str, Any]:
+        path = Path(self.sample_records[name]["gt"])
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _rgb_path(self, name: str) -> Path:
+        return Path(self.sample_records[name]["rgb"])
+
+    def _build_windows(self) -> list[RgbPoseFrameWindow]:
+        windows: list[RgbPoseFrameWindow] = []
+        for name in self.video_names:
+            ann = self.annotations[name]
+            n_gt = len(ann)
+            rgb_path = self._rgb_path(name)
+            if not rgb_path.is_file():
+                raise FileNotFoundError(f"RGB frames not found for {name!r}: {rgb_path}")
+
+            frames = np.load(rgb_path, mmap_mode="r")
+            n_rgb = int(frames.shape[0])
+            # End-of-chunk supervision: frame i -> GT time (i+1)*gt_per_rgb
+            max_frame = min(n_rgb - 1, int(np.floor((n_gt - 1) / self.gt_per_rgb)) - 1)
+            if max_frame < 0:
+                continue
+            gt_ann_path = Path(self.sample_records[name]["gt"])
+            for frame_index in range(0, max_frame + 1, self.stride_rgb):
+                target_gt_time = float((frame_index + 1) * self.gt_per_rgb)
+                windows.append(
+                    RgbPoseFrameWindow(
+                        name=name,
+                        gt_ann_path=gt_ann_path,
+                        rgb_path=rgb_path,
+                        frame_index=int(frame_index),
+                        target_gt_time=target_gt_time,
+                        gt_per_rgb=int(self.gt_per_rgb),
+                    )
+                )
+        return windows
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def _frames_array(self, window: RgbPoseFrameWindow) -> np.ndarray:
+        key = str(window.rgb_path)
+        frames = self._frames_cache.get(key)
+        if frames is None:
+            frames = np.load(window.rgb_path, mmap_mode="r")
+            self._frames_cache[key] = frames
+        return frames
+
+    def _frame_to_chw_float(self, frame: np.ndarray) -> torch.Tensor:
+        arr = np.asarray(frame)
+        if arr.ndim == 3 and arr.shape[-1] == 3:
+            # HWC RGB -> CHW
+            tensor = torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1)
+        elif arr.ndim == 3 and arr.shape[0] == 3:
+            tensor = torch.from_numpy(np.ascontiguousarray(arr))
+        else:
+            raise ValueError(f"Expected RGB frame HWC or CHW, got shape={arr.shape}")
+
+        if tensor.dtype == torch.uint8:
+            tensor = tensor.float() / 255.0
+        else:
+            tensor = tensor.float()
+            if float(tensor.max()) > 1.5:
+                tensor = tensor / 255.0
+
+        if tensor.shape[-2] != self.image_size or tensor.shape[-1] != self.image_size:
+            tensor = torch.nn.functional.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+        return tensor
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str | float | int]:
+        window = self.windows[index]
+        frame = np.array(self._frames_array(window)[window.frame_index], copy=True)
+        img = self._frame_to_chw_float(frame)
+        cls, bboxes, keypoints, batch_idx = self._labels_for_window(window)
+        spad_end_bin = int(round(window.target_gt_time * self.bins_per_gt))
+        spad_start_bin = max(spad_end_bin - int(window.gt_per_rgb * self.bins_per_gt), 0)
+        return {
+            "img": img,
+            "cls": cls,
+            "bboxes": bboxes,
+            "keypoints": keypoints,
+            "batch_idx": batch_idx,
+            "im_file": f"{window.name}:rgb{window.frame_index}:gt{window.target_gt_time:g}",
+            "ori_shape": (self.image_size, self.image_size),
+            "resized_shape": (self.image_size, self.image_size),
+            "sample_name": window.name,
+            "target_gt_time": float(window.target_gt_time),
+            "frame_index": int(window.frame_index),
+            "spad_start_bin": spad_start_bin,
+            "spad_end_bin": spad_end_bin,
+            "chunk_size": int(window.gt_per_rgb * self.bins_per_gt),
+        }
+
+    def _labels_for_window(self, window: RgbPoseFrameWindow):
+        ann = self.annotations[window.name]
+        cls_ll, bbox_ll, kpt_ll = [], [], []
+        for hand_name, cls_id in self.HAND_TO_CLASS.items():
+            hand = SpadPoseSequenceDataset._interpolate_hand_annotation(self, ann, window.target_gt_time, hand_name)
+            if not hand:
+                continue
+            cls_ll.append([float(cls_id)])
+            bbox_ll.append(SpadPoseSequenceDataset._xyxy_to_normalized_xywh(self, hand["bbox"]))
+            kpt_ll.append(SpadPoseSequenceDataset._keypoints_to_normalized_xyv(self, hand["keypoints_2d"]))
+
+        if cls_ll:
+            cls = torch.tensor(cls_ll, dtype=torch.float32)
+            bboxes = torch.tensor(bbox_ll, dtype=torch.float32)
+            keypoints = torch.tensor(kpt_ll, dtype=torch.float32)
+            batch_idx = torch.zeros((len(cls_ll), 1), dtype=torch.float32)
+        else:
+            cls = torch.zeros((0, 1), dtype=torch.float32)
+            bboxes = torch.zeros((0, 4), dtype=torch.float32)
+            keypoints = torch.zeros((0, 21, 3), dtype=torch.float32)
+            batch_idx = torch.zeros((0, 1), dtype=torch.float32)
+        return cls, bboxes, keypoints, batch_idx
+
+    def _build_ultralytics_labels(self) -> list[dict[str, Any]]:
+        labels = []
+        for window in self.windows:
+            cls, bboxes, keypoints, _ = self._labels_for_window(window)
+            labels.append(
+                {
+                    "im_file": f"{window.name}:rgb{window.frame_index}:gt{window.target_gt_time:g}",
+                    "shape": (self.image_size, self.image_size),
+                    "cls": cls.detach().cpu().numpy(),
+                    "bboxes": bboxes.detach().cpu().numpy(),
+                    "segments": [],
+                    "keypoints": keypoints.detach().cpu().numpy(),
+                    "normalized": True,
+                    "bbox_format": "xywh",
+                }
+            )
+        return labels
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        new_batch = {}
+        new_batch["img"] = torch.stack([b["img"] for b in batch], 0)
+        new_batch["cls"] = torch.cat([b["cls"] for b in batch], 0)
+        new_batch["bboxes"] = torch.cat([b["bboxes"] for b in batch], 0)
+        new_batch["keypoints"] = torch.cat([b["keypoints"] for b in batch], 0)
+
+        batch_idx = []
+        for sample_i, b in enumerate(batch):
+            idx = b["batch_idx"].clone()
+            if idx.numel():
+                idx += float(sample_i)
+            batch_idx.append(idx)
+        new_batch["batch_idx"] = torch.cat(batch_idx, 0) if batch_idx else torch.zeros((0, 1), dtype=torch.float32)
+
+        new_batch["im_file"] = [b["im_file"] for b in batch]
+        new_batch["ori_shape"] = [b["ori_shape"] for b in batch]
+        new_batch["resized_shape"] = [b["resized_shape"] for b in batch]
+        new_batch["sample_name"] = [b["sample_name"] for b in batch]
+        new_batch["target_gt_time"] = torch.tensor([b["target_gt_time"] for b in batch], dtype=torch.float32)
+        new_batch["frame_index"] = torch.tensor([b["frame_index"] for b in batch], dtype=torch.long)
+        new_batch["spad_start_bin"] = torch.tensor([b["spad_start_bin"] for b in batch], dtype=torch.long)
+        new_batch["spad_end_bin"] = torch.tensor([b["spad_end_bin"] for b in batch], dtype=torch.long)
+        new_batch["chunk_size"] = torch.tensor([b["chunk_size"] for b in batch], dtype=torch.long)
         return new_batch
 
 
