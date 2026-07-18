@@ -11,7 +11,7 @@ model: /home/zvc/Project/SPADHand/ultralytics/weights/detector.pt
 spad_train_json: /home/zvc/Data/visionsim/outputs/train_2kHz.json
 spad_test_json: /home/zvc/Data/visionsim/outputs/test_2kHz.json
 
-project: Runs/spad_pose
+project: Runs/rgb_pose
 name: rgb_pose_2kHz
 device: "0"
 epochs: 20
