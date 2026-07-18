@@ -160,6 +160,12 @@ class HIRE(nn.Module):
         self.in_change: Tensor | None = None
         self.confirm_count: Tensor | None = None
         self.t_mix: Tensor | None = None
+        # Scratch buffers / compiled step (filled lazily on first infer call).
+        self._buf_key: tuple[Any, ...] | None = None
+        self._ones_hw: Tensor | None = None
+        self._zeros_hw: Tensor | None = None
+        self._compiled_step = None
+        self._use_compiled_step = True
 
     def effective_mix_hold_bins(self) -> int:
         """Hold length H. ``H<0`` → chunk/subsampling (legacy); ``H>=0`` → that many bins."""
@@ -223,6 +229,28 @@ class HIRE(nn.Module):
         self.in_change = None
         self.confirm_count = None
         self.t_mix = None
+
+    def _ensure_scratch(self, ref: Tensor) -> tuple[Tensor, Tensor]:
+        """Reuse ones/zeros H×W buffers across bins (same device/dtype/shape)."""
+        key = (ref.device, ref.dtype, int(ref.shape[0]), int(ref.shape[1]))
+        if self._buf_key != key or self._ones_hw is None or self._zeros_hw is None:
+            self._ones_hw = ref.new_ones(ref.shape)
+            self._zeros_hw = ref.new_zeros(ref.shape)
+            self._buf_key = key
+        return self._ones_hw, self._zeros_hw
+
+    def _get_infer_step(self):
+        """Optionally ``torch.compile`` the per-bin infer step (eager fallback)."""
+        if not self._use_compiled_step:
+            return self._step
+        if self._compiled_step is not None:
+            return self._compiled_step
+        try:
+            self._compiled_step = torch.compile(self._step, fullgraph=False, dynamic=False)
+        except Exception:
+            self._use_compiled_step = False
+            self._compiled_step = self._step
+        return self._compiled_step
 
     def reset(self) -> None:
         self.clear_states()
@@ -391,7 +419,7 @@ class HIRE(nn.Module):
             return seed
         k = self.reset_open
         pad = k // 2
-        x = seed.to(dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        x = seed.float().unsqueeze(0).unsqueeze(0)
         x = -F.max_pool2d(-x, kernel_size=k, stride=1, padding=pad)
         x = F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
         return x.squeeze(0).squeeze(0) > 0.5
@@ -402,22 +430,25 @@ class HIRE(nn.Module):
         Unlike blind dilate, pixels without KL support never join the reset region —
         so motion edge bands fill while quiet background stays untouched.
         """
-        region = seed & support
         steps = int(self.reset_grow)
+        support_f = support.float()
+        region_f = (seed & support).float()
         if steps <= 0:
-            return region
+            return region_f > 0.5
+        # Stay in float for the dilate loop (fewer bool casts; same 0/1 semantics).
         for _ in range(steps):
-            dil = F.max_pool2d(region.float().unsqueeze(0).unsqueeze(0), 3, 1, 1).squeeze(0).squeeze(0) > 0.5
-            region = dil & support
-        return region
+            region_f = F.max_pool2d(region_f.unsqueeze(0).unsqueeze(0), 3, 1, 1).squeeze(0).squeeze(0)
+            region_f = region_f * support_f
+        return region_f > 0.5
 
-    def _expand_reset_mask(self, seed: Tensor, s_chg: Tensor) -> Tensor:
+    def _expand_reset_mask(self, seed: Tensor, s_chg: Tensor, *, theta_grow: float) -> Tensor:
         """Open (optional) then geodesic-grow confirmed reset seeds inside {S̄>θ_grow}."""
         # Empty seed → empty mask; skip morph/geodesic (bit-identical, much cheaper).
+        # Note: ``.any()`` may graph-break under torch.compile; still a net win vs always morphing.
         if not bool(seed.any()):
             return seed
         seed = self._open_mask(seed)
-        support = s_chg > self.effective_theta_grow()
+        support = s_chg > theta_grow
         return self._geodesic_grow(seed, support)
 
     def _step(
@@ -432,6 +463,8 @@ class HIRE(nn.Module):
         confirm_count: Tensor,
         t_mix: Tensor,
         *,
+        ones_hw: Tensor,
+        zeros_hw: Tensor,
         beta_f_floor: Tensor,
         beta_s_floor: Tensor,
         n_f_max_t: Tensor,
@@ -439,6 +472,7 @@ class HIRE(nn.Module):
         hold_h: float,
         tau_mix: float,
         mix_floor: float,
+        theta_grow: float,
         record_debug: bool = False,
     ) -> tuple[Tensor, ...]:
         """One-bin HIRE update (inference-first).
@@ -474,23 +508,23 @@ class HIRE(nn.Module):
         s_chg = self._spatial_mean(s_tilde)
         enter = s_chg > self.theta_on
         leave = s_chg < self.theta_off
-        in_change = torch.where(enter, xt.new_ones(xt.shape), in_change)
-        in_change = torch.where(leave, xt.new_zeros(xt.shape), in_change)
+        in_change = torch.where(enter, ones_hw, in_change)
+        in_change = torch.where(leave, zeros_hw, in_change)
 
-        confirm_count = torch.where(in_change > 0.5, confirm_count + 1.0, xt.new_zeros(xt.shape))
+        confirm_count = torch.where(in_change > 0.5, confirm_count + 1.0, zeros_hw)
         can_reset = (in_change > 0.5) & (confirm_count >= float(c_min) - 1e-6)
-        can_reset = self._expand_reset_mask(can_reset, s_chg)
+        can_reset = self._expand_reset_mask(can_reset, s_chg, theta_grow=theta_grow)
         i_slow = torch.where(can_reset, i_fast, i_slow)
         n_slow = torch.where(can_reset, n_f_max_t, n_slow)
         n_fast = torch.where(can_reset, n_f_max_t, n_fast)
 
         # --- hold+exp mix age ---
-        t_mix = torch.where(can_reset, xt.new_zeros(xt.shape), t_mix + 1.0)
+        t_mix = torch.where(can_reset, zeros_hw, t_mix + 1.0)
         over = torch.clamp(t_mix - hold_h, min=0.0)
         if hold_h > 0.0:
             g_reset = torch.where(
                 t_mix < hold_h,
-                xt.new_ones(xt.shape),
+                ones_hw,
                 torch.exp(-over / tau_mix),
             )
         else:
@@ -575,7 +609,10 @@ class HIRE(nn.Module):
         hold_h = float(self.effective_mix_hold_bins())
         tau_mix = float(self.mix_bins)
         mix_floor = float(self.effective_mix_floor())
+        theta_grow = float(self.effective_theta_grow())
         t_mix_init = float(max(hold_h, 1) + 10.0 * tau_mix)
+        ones_hw, zeros_hw = self._ensure_scratch(raw[..., 0])
+        step_fn = self._get_infer_step()
 
         # keep_last_only avoids storing every emit. If normalize uses a non-max
         # quantile we must keep the full stack for an identical clamp_recons.
@@ -613,7 +650,7 @@ class HIRE(nn.Module):
                         confirm_count,
                         t_mix,
                         i_out,
-                    ) = self._step(
+                    ) = step_fn(
                         xt,
                         i_fast,
                         i_slow,
@@ -623,6 +660,8 @@ class HIRE(nn.Module):
                         in_change,
                         confirm_count,
                         t_mix,
+                        ones_hw=ones_hw,
+                        zeros_hw=zeros_hw,
                         beta_f_floor=beta_f_floor,
                         beta_s_floor=beta_s_floor,
                         n_f_max_t=n_f_max_t,
@@ -630,6 +669,7 @@ class HIRE(nn.Module):
                         hold_h=hold_h,
                         tau_mix=tau_mix,
                         mix_floor=mix_floor,
+                        theta_grow=theta_grow,
                         record_debug=False,
                     )
             assert i_out is not None
@@ -701,7 +741,9 @@ class HIRE(nn.Module):
         hold_h = float(self.effective_mix_hold_bins())
         tau_mix = float(self.mix_bins)
         mix_floor = float(self.effective_mix_floor())
+        theta_grow = float(self.effective_theta_grow())
         t_mix_init = float(max(hold_h, 1) + 10.0 * tau_mix)
+        ones_hw, zeros_hw = self._ensure_scratch(raw[..., 0])
 
         frames: list[Tensor] = []
         dbg_keys = (
@@ -770,6 +812,8 @@ class HIRE(nn.Module):
                         in_change,
                         confirm_count,
                         t_mix,
+                        ones_hw=ones_hw,
+                        zeros_hw=zeros_hw,
                         beta_f_floor=beta_f_floor,
                         beta_s_floor=beta_s_floor,
                         n_f_max_t=n_f_max_t,
@@ -777,6 +821,7 @@ class HIRE(nn.Module):
                         hold_h=hold_h,
                         tau_mix=tau_mix,
                         mix_floor=mix_floor,
+                        theta_grow=theta_grow,
                         record_debug=True,
                     )
                 assert i_out is not None
