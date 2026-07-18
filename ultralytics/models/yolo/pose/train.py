@@ -721,6 +721,8 @@ class RgbPoseTrainer(PoseTrainer):
                 "RgbPoseTrainer: spad_freeze_detector=True is ignored for RGB finetune; "
                 "set freeze=<layer list> if you really want to freeze layers."
             )
+        self._rgb_val_sample_names: list[str] | None = None
+        self._rgb_val_indices: list[int] | None = None
         self.add_callback("on_train_start", self._rgb_on_train_start)
         self.add_callback("on_fit_epoch_end", self._rgb_on_fit_epoch_end)
 
@@ -855,16 +857,17 @@ class RgbPoseTrainer(PoseTrainer):
         return batch
 
     def get_validator(self):
-        """Return a no-op validator; RGB val loss/visualization runs from the training callback."""
+        """Return a no-op validator; real RGB val runs in ``validate()`` on a fixed test subset."""
         self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
         return _SpadNoOpValidator(self.args)
 
     def validate(self):
-        """Skip built-in PoseValidator; fitness comes from RGB eval callback loss."""
-        fitness = -float(self.loss.detach().cpu()) if hasattr(self, "loss") else 0.0
+        """Run val loss on a fixed subset of test videos (default 5) to watch for overfitting."""
+        metrics = self._rgb_run_val(epoch_idx=int(getattr(self, "epoch", -1)) + 1, visualize=False)
+        fitness = -float(metrics.get("rgb_val/loss_sum", 0.0))
         if not self.best_fitness or self.best_fitness < fitness:
             self.best_fitness = fitness
-        return {}, fitness
+        return metrics, fitness
 
     def plot_training_labels(self):
         """Skip dense label scatter plots for large RGB frame datasets."""
@@ -882,59 +885,106 @@ class RgbPoseTrainer(PoseTrainer):
             self._spad_draw_labels(canvas, batch, si)
             cv2.imwrite(str(save_dir / f"train_batch{ni}_sample{si:03d}.png"), canvas)
 
+    def _rgb_ensure_val_subset(self) -> tuple[list[str], list[int]]:
+        """Pick a fixed set of test video samples once; reuse their frame indices every epoch."""
+        if self._rgb_val_sample_names is not None and self._rgb_val_indices is not None:
+            return self._rgb_val_sample_names, self._rgb_val_indices
+
+        dataset = self.test_loader.dataset
+        windows = getattr(dataset, "windows", None)
+        if not windows:
+            raise RuntimeError("RGB val requires a test dataset with `.windows`")
+
+        names = sorted({str(w.name) for w in windows})
+        n_pick = max(int(getattr(self.args, "rgb_val_samples", 5)), 1)
+        n_pick = min(n_pick, len(names))
+        generator = torch.Generator().manual_seed(int(getattr(self.args, "rgb_val_seed", 0)))
+        pick = torch.randperm(len(names), generator=generator)[:n_pick].tolist()
+        selected = [names[i] for i in pick]
+        selected_set = set(selected)
+        indices = [i for i, w in enumerate(windows) if str(w.name) in selected_set]
+        if not indices:
+            raise RuntimeError(f"RGB val subset empty after selecting samples {selected}")
+
+        self._rgb_val_sample_names = selected
+        self._rgb_val_indices = indices
+        LOGGER.info(
+            f"RgbPoseTrainer val subset: {len(selected)} videos / {len(indices)} frames "
+            f"(seed={int(getattr(self.args, 'rgb_val_seed', 0))}): {selected}"
+        )
+        return selected, indices
+
     def _rgb_on_train_start(self, trainer):
         if RANK in {-1, 0}:
             initial_path = Path(self.save_dir) / "weights" / "initial.pt"
             initial_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"epoch": -1, "model": self.model, "train_args": vars(self.args)}, initial_path)
-        self._rgb_eval_visualize(epoch_idx=0)
+            # Baseline val before epoch 0 (also materializes the fixed 5-sample subset).
+            metrics = self._rgb_run_val(epoch_idx=0, visualize=True)
+            self.metrics.update(metrics)
 
     def _rgb_on_fit_epoch_end(self, trainer):
         period = int(getattr(self.args, "spad_viz_period", 1))
         if period <= 0 or (self.epoch + 1) % period != 0:
             return
-        self._rgb_eval_visualize(epoch_idx=self.epoch + 1)
+        # Val loss already ran in validate(); here only refresh overlays on the same subset.
+        self._rgb_run_val(epoch_idx=self.epoch + 1, visualize=True, reuse_metrics=True)
 
-    def _rgb_eval_visualize(self, *, epoch_idx: int):
-        """Evaluate random RGB test frames and save overlays on rank 0."""
+    def _rgb_run_val(
+        self,
+        *,
+        epoch_idx: int,
+        visualize: bool = False,
+        reuse_metrics: bool = False,
+    ) -> dict[str, float]:
+        """Compute mean loss on the fixed test-video subset; optionally save overlays."""
+        selected, indices = self._rgb_ensure_val_subset()
         if RANK not in {-1, 0}:
-            return
+            return {}
+
         model = self.ema.ema if getattr(self, "ema", None) is not None else self.model
         was_training = model.training
         model.eval()
 
         dataset = self.test_loader.dataset
-        max_batches = int(getattr(self.args, "spad_eval_max_batches", -1))
-        eval_count = len(dataset) if max_batches < 0 else min(max_batches, len(dataset))
-        eval_count = max(eval_count, 1)
-        generator = torch.Generator().manual_seed(int(getattr(self.args, "spad_eval_seed", 0)) + int(epoch_idx))
-        indices = torch.randperm(len(dataset), generator=generator)[:eval_count].tolist()
+        batch_size = max(int(getattr(self.args, "batch", 1)), 1)
         loader = DataLoader(
-            Subset(dataset, indices), batch_size=1, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn
+            Subset(dataset, indices),
+            batch_size=min(batch_size, len(indices)),
+            shuffle=False,
+            num_workers=0,
+            collate_fn=dataset.collate_fn,
         )
 
-        save_dir = Path(self.save_dir) / "rgb_viz" / f"epoch{epoch_idx:03d}"
-        save_dir.mkdir(parents=True, exist_ok=True)
+        save_dir = None
+        written: list[str] = []
+        if visualize:
+            save_dir = Path(self.save_dir) / "rgb_viz" / f"epoch{epoch_idx:03d}"
+            save_dir.mkdir(parents=True, exist_ok=True)
 
         loss_sum_total = 0.0
         loss_items_total = None
         seen_batches = 0
-        written = []
-        viz_batches = int(getattr(self.args, "spad_viz_batches", 1))
+        viz_batches = int(getattr(self.args, "spad_viz_batches", 2))
+        compute_loss = not reuse_metrics
 
         with torch.no_grad():
             for batch_i, batch in enumerate(loader):
+                # Viz-only pass: stop after a few batches (loss already computed in validate()).
+                if visualize and not compute_loss and batch_i >= viz_batches:
+                    break
+
                 batch = self.preprocess_batch(batch)
                 preds = model(batch["img"])
-                loss, loss_items = model.loss(batch, preds)
-                processed = self._spad_postprocess_pose(preds)
+                if compute_loss:
+                    loss, loss_items = model.loss(batch, preds)
+                    loss_sum_total += float(loss.sum().detach().cpu())
+                    loss_items_cpu = loss_items.detach().cpu()
+                    loss_items_total = loss_items_cpu if loss_items_total is None else loss_items_total + loss_items_cpu
+                    seen_batches += 1
 
-                loss_sum_total += float(loss.sum().detach().cpu())
-                loss_items_cpu = loss_items.detach().cpu()
-                loss_items_total = loss_items_cpu if loss_items_total is None else loss_items_total + loss_items_cpu
-                seen_batches += 1
-
-                if batch_i < viz_batches:
+                if visualize and save_dir is not None and batch_i < viz_batches:
+                    processed = self._spad_postprocess_pose(preds)
                     for si in range(int(batch["img"].shape[0])):
                         canvas = self._rgb_canvas_from_batch(batch, si)
                         cv2.imwrite(str(save_dir / f"batch{batch_i:03d}_sample{si:03d}_rgb.png"), canvas)
@@ -945,26 +995,38 @@ class RgbPoseTrainer(PoseTrainer):
                         ok = cv2.imwrite(str(out_path), canvas)
                         written.append(f"{out_path.name}: {'ok' if ok else 'failed'}")
 
-        if seen_batches:
-            self.metrics["rgb_val/loss_sum"] = loss_sum_total / seen_batches
+        metrics: dict[str, float] = {}
+        if compute_loss and seen_batches:
+            metrics["rgb_val/loss_sum"] = loss_sum_total / seen_batches
             mean_loss_items = loss_items_total / seen_batches
             for i, value in enumerate(mean_loss_items.tolist()):
-                self.metrics[f"rgb_val/loss_{i}"] = float(value)
+                metrics[f"rgb_val/loss_{i}"] = float(value)
+            LOGGER.info(
+                f"RgbPoseTrainer val epoch={epoch_idx}: loss_sum={metrics['rgb_val/loss_sum']:.4f} "
+                f"on {len(selected)} videos / {len(indices)} frames"
+            )
+        elif reuse_metrics:
+            mean_loss_items = torch.tensor(
+                [float(self.metrics.get(f"rgb_val/loss_{i}", 0.0)) for i in range(5)], dtype=torch.float32
+            )
+            metrics = {k: float(v) for k, v in self.metrics.items() if str(k).startswith("rgb_val/")}
         else:
             mean_loss_items = torch.zeros(5)
 
-        with (save_dir / "summary.txt").open("w", encoding="utf-8") as f:
-            f.write(f"epoch_idx: {epoch_idx}\n")
-            f.write(f"seen_batches: {seen_batches}\n")
-            f.write(f"eval_max_batches: {max_batches}\n")
-            f.write(f"random_indices: {indices}\n")
-            f.write(f"mean_loss_sum: {self.metrics.get('rgb_val/loss_sum', 0.0)}\n")
-            f.write(f"mean_loss_items: {mean_loss_items.tolist()}\n")
-            f.write("\n".join(written))
-            f.write("\n")
+        if visualize and save_dir is not None:
+            with (save_dir / "summary.txt").open("w", encoding="utf-8") as f:
+                f.write(f"epoch_idx: {epoch_idx}\n")
+                f.write(f"val_videos: {selected}\n")
+                f.write(f"val_frames: {len(indices)}\n")
+                f.write(f"seen_batches: {seen_batches}\n")
+                f.write(f"mean_loss_sum: {metrics.get('rgb_val/loss_sum', self.metrics.get('rgb_val/loss_sum', 0.0))}\n")
+                f.write(f"mean_loss_items: {mean_loss_items.tolist()}\n")
+                f.write("\n".join(written))
+                f.write("\n")
 
         if was_training:
             model.train()
+        return metrics
 
     def _rgb_canvas_from_batch(self, batch: dict[str, Any], si: int) -> np.ndarray:
         image_size = int(getattr(self.args, "spad_image_size", self.args.imgsz))

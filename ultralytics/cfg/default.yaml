@@ -225,5 +225,7 @@ spad_frame_adapter_alpha_init: 0.0 # (float) initial residual gate value for the
 rgb_fps: 25.0 # (float) RGB camera FPS for VisionSIM rgb25fps finetune alignment
 rgb_gt_rate_hz: 125.0 # (float) GT annotation rate used with RGB finetune (matches SPAD bins_per_gt timing)
 rgb_frame_source: rgb # (str) detector-finetune input: rgb, or offline cache sum/ema/ppb/stea/hire
+rgb_val_samples: 5 # (int) number of test videos held out for RGB finetune val each epoch
+rgb_val_seed: 0 # (int) RNG seed for choosing the fixed RGB val video subset
 spad_render_tag: 2kHz # (str) sibling cache suffix: renders-{prep}-{tag}; empty => renders-{prep}
 

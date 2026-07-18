@@ -15,6 +15,7 @@ project: Runs/rgb_pose
 name: rgb_pose_2kHz
 device: "0"
 epochs: 20
+val: true
 spad_viz_period: 5
 batch: 40
 workers: 0
@@ -27,6 +28,10 @@ spad_stride_frames: 5
 spad_image_size: 512
 rgb_fps: 25.0
 rgb_gt_rate_hz: 125.0
+
+# Fixed 5-video val subset from test_2kHz.json (overfitting check; drives best.pt)
+rgb_val_samples: 5
+rgb_val_seed: 0
 
 # Open-train the detector (no SPAD plugins)
 spad_freeze_detector: false
