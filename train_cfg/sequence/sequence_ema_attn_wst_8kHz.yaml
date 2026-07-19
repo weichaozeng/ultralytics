@@ -6,7 +6,7 @@ spad_test_json: /home/zvc/Data/visionsim/outputs/test_8kHz.json
 
 project: Runs/spad_pose
 name: sequence_ema_attn_wst_8kHz
-device: "2"
+device: "1"
 epochs: 60
 spad_viz_period: 10
 batch: 2
