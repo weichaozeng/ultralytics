@@ -230,8 +230,22 @@ class HIRE(nn.Module):
         self.confirm_count = None
         self.t_mix = None
 
+    def _ensure_infer_runtime_attrs(self) -> None:
+        """Init scratch/compile fields missing on older pickled HIRE checkpoints."""
+        if not hasattr(self, "_buf_key"):
+            self._buf_key = None
+        if not hasattr(self, "_ones_hw"):
+            self._ones_hw = None
+        if not hasattr(self, "_zeros_hw"):
+            self._zeros_hw = None
+        if not hasattr(self, "_compiled_step"):
+            self._compiled_step = None
+        if not hasattr(self, "_use_compiled_step"):
+            self._use_compiled_step = True
+
     def _ensure_scratch(self, ref: Tensor) -> tuple[Tensor, Tensor]:
         """Reuse ones/zeros H×W buffers across bins (same device/dtype/shape)."""
+        self._ensure_infer_runtime_attrs()
         key = (ref.device, ref.dtype, int(ref.shape[0]), int(ref.shape[1]))
         if self._buf_key != key or self._ones_hw is None or self._zeros_hw is None:
             self._ones_hw = ref.new_ones(ref.shape)
@@ -241,6 +255,7 @@ class HIRE(nn.Module):
 
     def _get_infer_step(self):
         """Optionally ``torch.compile`` the per-bin infer step (eager fallback)."""
+        self._ensure_infer_runtime_attrs()
         if not self._use_compiled_step:
             return self._step
         if self._compiled_step is not None:
