@@ -112,8 +112,8 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--ema_alpha",
         type=float,
-        default=0.0,
-        help="EMA new-sample weight. <=0 uses 2/(chunk_size+1) SMA-equivalent default.",
+        default=0.01,
+        help="EMA new-sample weight (inference standard 0.01). <=0 uses 2/(chunk_size+1) SMA-equivalent.",
     )
     # STEA
     ap.add_argument("--stea_fast_window", type=int, default=16)

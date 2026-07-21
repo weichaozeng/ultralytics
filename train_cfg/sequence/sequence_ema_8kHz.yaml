@@ -22,7 +22,7 @@ spad_packed_ch_order: RGB
 
 # causal EMA baseline (fixed recency weighting; no motion/changepoint adaptation)
 spad_preprocessor: ema
-ema_alpha: 0.0 # <=0 => 2/(subsampling+1) SMA-equivalent default
+ema_alpha: 0.01
 
 spad_plugin: temporal_ssd
 ssd_state_dim: 20

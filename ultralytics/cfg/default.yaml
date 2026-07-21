@@ -177,7 +177,7 @@ ppb_quantile: 1.0 # (float) normalization quantile for PerPixelBayesian
 ppb_normalize: True # (bool) normalize PerPixelBayesian reconstructions
 ppb_memory_size: 10 # (int) runlength forecaster memory set size for PerPixelBayesian
 ppb_min_filter_size: 5 # (int) odd min-filter size for PerPixelBayesian
-ema_alpha: 0.0 # (float) EMA new-sample weight; <=0 => 2/(spad_subsampling+1) SMA-equivalent default
+ema_alpha: 0.01 # (float) EMA new-sample weight (inference standard); <=0 => 2/(spad_subsampling+1) SMA-equivalent
 ema_normalize: True # (bool) normalize EMA reconstructions
 ema_quantile: 1.0 # (float) normalization quantile for EMA
 sum_normalize: True # (bool) normalize sum reconstructions

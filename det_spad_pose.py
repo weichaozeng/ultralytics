@@ -340,7 +340,7 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
     elif name == "sum":
         kwargs = {"subsampling": spad_subsampling}
     elif name == "ema":
-        kwargs = {"subsampling": spad_subsampling, "ema_alpha": float(getattr(args, "ema_alpha", 0.0))}
+        kwargs = {"subsampling": spad_subsampling, "ema_alpha": float(getattr(args, "ema_alpha", 0.01))}
     elif name == "hire":
         kwargs.update(
             {
@@ -601,8 +601,8 @@ def main():
     ap.add_argument(
         "--ema-alpha",
         type=float,
-        default=0.0,
-        help="EMA new-sample weight. <=0 uses 2/(subsampling+1) SMA-equivalent default.",
+        default=0.01,
+        help="EMA new-sample weight (inference standard 0.01). <=0 uses 2/(subsampling+1) SMA-equivalent.",
     )
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)

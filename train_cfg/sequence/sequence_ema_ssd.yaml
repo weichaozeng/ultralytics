@@ -25,7 +25,7 @@ spad_cache_mode: auto
 
 # causal EMA offline cache (recency-weighted; forward skips online preprocessing when cache_mode=rendered)
 spad_preprocessor: ema
-ema_alpha: 0.0 # <=0 => 2/(subsampling+1) SMA-equivalent default
+ema_alpha: 0.01
 
 # backbone SSD plugins (no frame_adapter). Use "backbone" to auto-match YOLOv8/v11 layer ids.
 spad_plugin: temporal_ssd

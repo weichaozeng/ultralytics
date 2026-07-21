@@ -27,7 +27,7 @@ spad_render_contains_confidence: false
 
 # EMA offline cache @ 8 kHz
 spad_preprocessor: ema
-ema_alpha: 0.0 # <=0 => 2/(subsampling+1) SMA-equivalent default
+ema_alpha: 0.01
 ema_normalize: true
 ema_quantile: 1.0
 

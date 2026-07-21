@@ -875,7 +875,7 @@ def parse_args():
         "--ema-alpha",
         type=float,
         default=0.01,
-        help="EMA new-sample weight (2 kHz cache default 0.01). <=0 uses 2/(subsampling+1) SMA-equivalent.",
+        help="EMA new-sample weight (inference standard 0.01). <=0 uses 2/(subsampling+1) SMA-equivalent.",
     )
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
@@ -1024,6 +1024,16 @@ def main():
             effective_preprocessor,
             spad_subsampling=spad_subsampling,
         )
+        # Inference standard: always use CLI ema_alpha (default 0.01), even if ckpt was trained with 0.0/SMA.
+        if effective_preprocessor == "ema" and hasattr(spad_model, "preprocessor") and spad_model.preprocessor is not None:
+            alpha = float(args.ema_alpha)
+            if alpha <= 0.0:
+                alpha = 2.0 / (max(int(spad_subsampling), 1) + 1)
+            if hasattr(spad_model.preprocessor, "ema_alpha"):
+                old = float(getattr(spad_model.preprocessor, "ema_alpha", alpha))
+                spad_model.preprocessor.ema_alpha = float(alpha)
+                if abs(old - alpha) > 1e-12:
+                    print(f"EMA inference: override ema_alpha {old:g} -> {alpha:g}")
         spad_model.spad_cache_mode = "raw"
     else:
         spad_model.spad_cache_mode = "rendered"

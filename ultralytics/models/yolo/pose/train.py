@@ -240,7 +240,7 @@ class SpadPoseSequenceTrainer(PoseTrainer):
         if preprocessor_name == "ema":
             return {
                 "subsampling": spad_subsampling,
-                "ema_alpha": float(getattr(self.args, "ema_alpha", 0.0)),
+                "ema_alpha": float(getattr(self.args, "ema_alpha", 0.01)),
                 "normalize": bool(getattr(self.args, "ema_normalize", True)),
                 "quantile": float(getattr(self.args, "ema_quantile", 1.0)),
             }

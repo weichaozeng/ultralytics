@@ -573,8 +573,8 @@ def parse_args():
     ap.add_argument(
         "--ema-alpha",
         type=float,
-        default=0.0,
-        help="EMA new-sample weight. <=0 uses 2/(subsampling+1) SMA-equivalent default.",
+        default=0.01,
+        help="EMA new-sample weight (inference standard 0.01). <=0 uses 2/(subsampling+1) SMA-equivalent.",
     )
     ap.add_argument("--stea-fast-window", type=int, default=16)
     ap.add_argument("--stea-slow-window", type=int, default=128)
