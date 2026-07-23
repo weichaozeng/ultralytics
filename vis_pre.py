@@ -9,13 +9,18 @@ Supported input layouts
 - Single-channel packed video: `(T, H, Wpacked)` via `--bitdim`
 - Three-channel packed video: `(T, H, Wpacked, 3)` via `--bitdim`
 
+Per-chunk extras (when those methods are selected)
+-------------------------------------------------
+- ``{stem}_ppb_run_length.npy`` — PPB estimated run length ``(H, W)`` float32 at chunk end
+- ``{stem}_hire_n_slow.npy`` — HIRE slow-branch age ``n_slow`` ``(H, W)`` float32 at chunk end
+
 Examples
 --------
-python ultralytics/vis_pre.py \
-  --in_path /path/to/binary.npy \
-  --save_dir /tmp/vis_pre \
-  --bitdim 2 \
-  --expected_w 512
+python ultralytics/vis_pre.py \\
+  --in_path /path/to/frames.npy \\
+  --save_dir /tmp/vis_pre
+  # defaults match sequence_hire_attn_wst_8kHz / vis_hire_det:
+  # chunk=320, bin_rate=8000, HIRE W_f/s/S=24/160/4, hold=80, θ_on/off=0.08/0.02, ...
 """
 from __future__ import annotations
 
@@ -61,10 +66,10 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--chunk_size",
         type=int,
-        default=80,
+        default=320,
         help=(
             "Raw bins per output frame (= preprocessor emit interval). "
-            "HIRE defaults assume 2 kHz @ 25 FPS => chunk_size=80."
+            "Default 320 for 8 kHz @ 25 FPS; use 80 for 2 kHz."
         ),
     )
     ap.add_argument("--chunk_stride", type=int, default=0, help="0 means equal to chunk_size")
@@ -127,12 +132,12 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--stea_kernel_size", type=int, default=None)
     ap.add_argument("--stea_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--stea_quantile", type=float, default=1.0)
-    # HIRE (2 kHz / chunk=80; α=exp(-1/W) from *_bins)
+    # HIRE defaults = train_cfg sequence_hire_attn_wst_8kHz / cfg/default.yaml (α=exp(-1/W))
     ap.add_argument(
         "--bin_rate_hz",
         type=float,
-        default=2000.0,
-        help="SPAD bin rate f_s (logging / wall-clock τ display = W/f_s).",
+        default=8000.0,
+        help="SPAD bin rate f_s (logging / wall-clock τ display = W/f_s). Default 8000; use 2000 for 2 kHz.",
     )
     ap.add_argument("--hire_fast_bins", type=int, default=24, help="W_f: α_f=exp(-1/W_f)")
     ap.add_argument("--hire_slow_bins", type=int, default=160, help="W_s: α_s=exp(-1/W_s), n_s cap")
@@ -365,8 +370,8 @@ def _build_integrators(args: argparse.Namespace, device: torch.device, preproces
     """Build stateful preprocessors.
 
     In vis_pre, ``--chunk_size`` is the emit interval (bins per output frame), e.g.
-    80 for 2 kHz -> 25 FPS. That is exactly what PPB/STEA/EMA/HIRE ``subsampling`` means
-    here — not the training ``spad_subsampling=64`` (8 kHz / 125 Hz alignment).
+    320 for 8 kHz -> 25 FPS (default), or 80 for 2 kHz. That is PPB/STEA/EMA/HIRE
+    ``subsampling`` here — not training ``spad_subsampling=64`` (8 kHz / 125 Hz GT).
     """
     emit = max(int(args.chunk_size), 1)
     out: dict[str, object] = {}
@@ -630,6 +635,35 @@ def _preprocess_hire_rgb(
         clear_states=clear_states,
         subsampling=_emit_subsampling_for_chunk(raw_chunk),
     )
+
+
+def _tensor_hw_to_npy(x: torch.Tensor | None) -> np.ndarray | None:
+    if x is None or not torch.is_tensor(x):
+        return None
+    return np.ascontiguousarray(x.detach().float().cpu().numpy())
+
+
+def _save_chunk_aux_maps(
+    *,
+    out_dir: Path,
+    stem: str,
+    method: str,
+    integrators: dict[str, object],
+) -> None:
+    """Save per-chunk diagnostic maps for PPB run_length and HIRE n_slow."""
+    if method == "ppb" and "ppb" in integrators:
+        ppb = integrators["ppb"]
+        run_length = None
+        if hasattr(ppb, "estimated_run_length_hw"):
+            run_length = ppb.estimated_run_length_hw()
+        arr = _tensor_hw_to_npy(run_length)
+        if arr is not None:
+            np.save(out_dir / f"{stem}_ppb_run_length.npy", arr)
+    if method == "hire" and "hire" in integrators:
+        hire = integrators["hire"]
+        arr = _tensor_hw_to_npy(getattr(hire, "n_slow", None))
+        if arr is not None:
+            np.save(out_dir / f"{stem}_hire_n_slow.npy", arr)
 
 
 def _apply_vis_scaling(x: np.ndarray, *, mode: str, gamma: float, percentile: float) -> np.ndarray:
@@ -897,6 +931,12 @@ def main() -> None:
                 continue
             frame_bgr = frames_bgr[-1]
             cv2.imwrite(str(out_dir / f"{stem}_{method}_recon.png"), frame_bgr)
+            _save_chunk_aux_maps(
+                out_dir=out_dir,
+                stem=stem,
+                method=method,
+                integrators=integrators,
+            )
             labels.append(method)
             panels.append(frame_bgr)
 
@@ -913,7 +953,7 @@ def main() -> None:
         frame_idx += 1
         cube_idx += 1
 
-    print(f"Done. Wrote method PNGs to {out_dir}")
+    print(f"Done. Wrote method PNGs + ppb_run_length/hire_n_slow npy to {out_dir}")
     print(f"Done. Wrote comparison PNGs to {compare_dir}")
 
 

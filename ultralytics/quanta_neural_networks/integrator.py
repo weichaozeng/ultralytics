@@ -211,6 +211,25 @@ class PerPixelBayesian(nn.Module):
         self.beta_ll += 1 - reward
         self.total_occupied += (mask_should_insert & mask_has_capacity).long()
 
+    def estimated_run_length_hw(self) -> Tensor | None:
+        """Return last-bin estimated run length ``(H, W)`` after ``process_photon_cube``.
+
+        Rebuilds from BOCPD state so ``@torch.compile`` on the update loop need not
+        write auxiliary attributes.
+        """
+        if not hasattr(self, "forecaster_distribution") or self.forecaster_distribution is None:
+            return None
+        if int(self.t_absolute) <= 0:
+            return None
+        # After process_photon_cube, t_absolute is past the last processed bin.
+        run_lengths = (float(self.t_absolute) - self.forecaster_distribution_index.float()).clamp(min=0)
+        estimated = torch.expm1(
+            torch.sum(self.forecaster_distribution * torch.log1p(run_lengths), dim=-1)
+        )
+        if self.min_filter_size > 1:
+            estimated = self.min_pool2d(estimated, self.min_filter_size)
+        return estimated
+
     def clamp_recons(self, recons: Tensor) -> Tensor:
         """Clamps and optionally normalizes the reconstruction."""
         if recons.numel() == 0:
