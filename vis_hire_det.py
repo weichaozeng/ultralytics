@@ -651,3 +651,108 @@ def main() -> None:
     save_root.mkdir(parents=True, exist_ok=True)
     device = _resolve_device(args.device)
     cmap_id = COLORMAPS[args.colormap]
+
+    hire = HIRE(
+        subsampling=int(args.chunk_size),
+        sample_rate_hz=float(args.bin_rate_hz),
+        fast_bins=int(args.hire_fast_bins),
+        slow_bins=int(args.hire_slow_bins),
+        surprise_bins=int(args.hire_surprise_bins),
+        mix_hold_bins=int(args.hire_mix_hold_bins),
+        mix_bins=float(args.hire_mix_bins),
+        mix_theta=float(args.hire_mix_theta),
+        mix_floor=float(args.hire_mix_floor),
+        theta_on=float(args.hire_theta_on),
+        theta_off=float(args.hire_theta_off),
+        theta_grow=float(args.hire_theta_grow),
+        confirm_bins=int(args.hire_confirm_bins),
+        cooldown_bins=int(args.hire_cooldown_bins),
+        spatial_kernel=int(args.hire_spatial_kernel),
+        gate_pool=str(args.hire_gate_pool),
+        reset_open=int(args.hire_reset_open),
+        reset_grow=int(args.hire_reset_grow),
+        reset_dilate=None if int(args.hire_reset_dilate) < 0 else int(args.hire_reset_dilate),
+        eps=float(args.hire_eps),
+        normalize=bool(args.hire_normalize),
+        quantile=float(args.hire_quantile),
+    ).to(device)
+
+    sample_name = in_path.name if in_path.is_dir() else in_path.stem
+    stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else int(args.chunk_size)
+    print(f"Loading sources from {in_path} ...", flush=True)
+    sources = list(_iter_sources(in_path))
+    if not sources:
+        raise RuntimeError(f"No SPAD sources found under {in_path}")
+
+    print(
+        f"HIRE v0.3 fs={hire.sample_rate_hz:g} W_f/s/S={hire.fast_bins}/{hire.slow_bins}/{hire.surprise_bins} "
+        f"theta_on/off={hire.theta_on:g}/{hire.theta_off:g} confirm={hire.confirm_bins} "
+        f"chunk={int(args.chunk_size)} device={device} n_sources={len(sources)}",
+        flush=True,
+    )
+
+    for video_idx, source in enumerate(tqdm(sources, desc=f"hire vis [{sample_name}]")):
+        n_bins = _num_bins(source)
+        out_dir = _output_dir(save_root, sample_name, video_idx)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"source[{video_idx}] layout={source.layout} shape={tuple(source.array.shape)} "
+            f"n_bins={n_bins} -> {out_dir}",
+            flush=True,
+        )
+
+        frame_idx = 0
+        for cube_idx, t0 in enumerate(range(0, n_bins, stride)):
+            t1 = min(t0 + int(args.chunk_size), n_bins)
+            raw_chunk = _slice_raw(source, t0, t1, packed_ch_order=args.packed_ch_order)
+            if raw_chunk.shape[0] == 0:
+                continue
+
+            raw = raw_plane_to_photon_cube(raw_chunk[..., 0], device=device, as_bool=True)
+            recons, debug = hire.process_photon_cube_with_debug(raw, clear_states=(cube_idx == 0))
+            if int(recons.shape[-1]) == 0:
+                tqdm.write(f"Skip cube {cube_idx} (empty recon): t{t0:06d}_{t1:06d}")
+                continue
+
+            vis_kw = dict(
+                vis_mode=args.vis_mode,
+                percentile=float(args.vis_percentile),
+                gamma=float(args.vis_gamma),
+            )
+            recon_rgb = raw_hwt_to_rgb_float(recons.float(), packed_nch=source.packed_nch)
+            sum_rgb = sum_raw_chunk_to_rgb(raw_chunk, packed_nch=source.packed_nch, device=device)
+            recon_bgr = _rgb_tensor_to_bgr_u8(recon_rgb, **vis_kw)[0]
+            sum_bgr = _rgb_tensor_to_bgr_u8(sum_rgb, **vis_kw)[0]
+
+            stem = f"cube{cube_idx:05d}_t{t0:06d}_{t1:06d}_frame{frame_idx:07d}"
+            _save_visuals(
+                out_dir=out_dir,
+                stem=stem,
+                recon_bgr=recon_bgr,
+                sum_bgr=sum_bgr,
+                debug=debug,
+                hire=hire,
+                cmap_id=cmap_id,
+                score_vmax=float(args.score_vmax),
+                score_percentile=float(args.score_percentile),
+                temporal_slices=int(args.temporal_slices),
+                write_stats=bool(args.write_stats),
+            )
+            # Drop large debug volumes between cubes (esp. T=320 @ 8 kHz).
+            del debug, recons, raw, raw_chunk, recon_rgb, sum_rgb
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            frame_idx += 1
+
+        if frame_idx == 0:
+            print(
+                f"Warning: no frames saved for {sample_name}/video{video_idx:05d} "
+                f"(n_bins={n_bins}; check chunk_size={args.chunk_size})",
+                flush=True,
+            )
+
+    print(f"Saved HIRE visualizations under {save_root / sample_name}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
