@@ -12,10 +12,10 @@ Example
 -------
 python ultralytics/vis_hire_det.py \\
   --in_path /path/to/frames.npy \\
-  --save_dir /tmp/hire_vis \\
-  --chunk_size 80 --bin_rate_hz 2000
-  # defaults: W_f/s/S=24/160/4, hold=80, θ_on/off=0.08/0.02,
-  # confirm=4, gate_pool=max, reset_open/grow=15/6, vis_mode=gamma
+  --save_dir /tmp/hire_vis
+  # defaults match sequence_hire_attn_wst_8kHz / default.yaml:
+  # chunk=320, bin_rate=8000, W_f/s/S=24/160/4, hold=80, mix_τ/θ=12/0.06,
+  # θ_on/off=0.08/0.02, confirm=4, gate_pool=max, reset_open/grow=15/6, vis_mode=gamma
 """
 
 from __future__ import annotations
@@ -550,12 +550,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Visualize HIRE v0.3 I^f/I^s change-point intermediates")
     ap.add_argument("--in_path", type=str, required=True, help="SPAD sample directory or .npy path")
     ap.add_argument("--save_dir", type=str, required=True, help="Output root directory")
-    ap.add_argument("--chunk_size", type=int, default=80)
+    ap.add_argument("--chunk_size", type=int, default=320, help="Bins per vis chunk (8 kHz default; use 80 for 2 kHz)")
     ap.add_argument("--chunk_stride", type=int, default=0)
     ap.add_argument("--device", type=str, default="")
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
-    # HIRE (2 kHz / chunk=80; α=exp(-1/W) from *_bins)
-    ap.add_argument("--bin_rate_hz", type=float, default=2000.0, help="SPAD bin rate f_s (logging / tau override)")
+    # HIRE defaults = train_cfg sequence_hire_attn_wst_8kHz / cfg/default.yaml (α=exp(-1/W))
+    ap.add_argument("--bin_rate_hz", type=float, default=8000.0, help="SPAD bin rate f_s (logging)")
     ap.add_argument("--hire_fast_bins", type=int, default=24, help="W_f: α_f=exp(-1/W_f)")
     ap.add_argument("--hire_slow_bins", type=int, default=160, help="W_s: α_s=exp(-1/W_s), n_s cap")
     ap.add_argument("--hire_surprise_bins", type=int, default=4, help="W_S: α_S=exp(-1/W_S)")
