@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-chunk HIRE SPAD pose inference → pose overlay PNGs on reconstruction.
+"""Per-chunk HIRE SPAD pose inference → pose-only overlay PNGs.
 
 Runs a trained ``SpadPoseModel`` (HIRE preprocessor) on packed/raw ``frames.npy``
 in **causal streaming** mode: preprocessor + detector temporal plugins carry state
@@ -7,6 +7,8 @@ across chunks (no mid-video reset).
 
 Inference emit cadence follows ``--chunk_size`` only (one recon + one pose per chunk).
 Train-time ``spad_subsampling`` is not used for how often frames are emitted.
+
+Visualization: skeleton only (no bbox). Each track/detection ID uses one bone color.
 
 Output naming (for ``vis_hire_pose_3d.py``)::
 
@@ -18,7 +20,8 @@ python ultralytics/vis_hire_pose.py \\
   --in_path /path/to/frames.npy \\
   --ckpt /path/to/last.pt \\
   --save_dir /tmp/hire_pose \\
-  --chunk_size 320
+  --chunk_size 320 \\
+  --start_frame 960
 """
 
 from __future__ import annotations
@@ -49,9 +52,61 @@ def _load_det_spad_pose():
 
 dsp = _load_det_spad_pose()
 
+# Distinct BGR colors per hand ID (all bones of one hand share one color).
+_ID_COLORS_BGR = [
+    (0, 0, 255),  # red
+    (255, 0, 0),  # blue
+    (0, 200, 0),  # green
+    (0, 220, 255),  # yellow
+    (255, 0, 255),  # magenta
+    (0, 140, 255),  # orange
+    (255, 180, 0),  # cyan-ish
+    (180, 0, 180),  # purple
+    (0, 255, 180),  # spring
+    (80, 80, 255),  # light red
+]
+
+
+def _id_color_bgr(track_id: int) -> tuple[int, int, int]:
+    return _ID_COLORS_BGR[int(track_id) % len(_ID_COLORS_BGR)]
+
+
+def _draw_pose_id(
+    img_bgr: np.ndarray,
+    pose_kpts: np.ndarray,
+    *,
+    color: tuple[int, int, int],
+    thresh: float = 0.5,
+    k: int = 21,
+    thickness: int = 3,
+) -> np.ndarray:
+    """Draw one hand skeleton with a single color for all bones/joints."""
+    if pose_kpts.shape != (k, 3):
+        raise ValueError(f"Pose shape must be ({k}, 3), but got {pose_kpts.shape}")
+
+    for s, e in dsp.BONE_CONNECTIONS:
+        ks = pose_kpts[s]
+        ke = pose_kpts[e]
+        if ks[2] > thresh and ke[2] > thresh:
+            cv2.line(
+                img_bgr,
+                (int(ks[0]), int(ks[1])),
+                (int(ke[0]), int(ke[1])),
+                color,
+                thickness,
+            )
+
+    for i in range(k):
+        kk = pose_kpts[i]
+        if kk[2] > thresh:
+            radius = 6 if i == 0 else 4
+            cv2.circle(img_bgr, (int(kk[0]), int(kk[1])), radius, color, -1)
+
+    return img_bgr
+
 
 def _parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="HIRE chunk pose viz on recon frames")
+    ap = argparse.ArgumentParser(description="HIRE chunk pose-only viz (one color per hand ID)")
     ap.add_argument("--in_path", type=Path, required=True, help="frames.npy or dir with frames.npy")
     ap.add_argument("--save_dir", type=Path, required=True)
     ap.add_argument("--ckpt", type=Path, required=True, help="Trained SpadPoseModel .pt")
@@ -64,7 +119,7 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="none",
         choices=["none", "bytetrack", "botsort", "spad_tracker", "posetrack", "spad_posetrack"],
-        help="Tracker; default none (per-chunk independent IDs)",
+        help="Tracker for stable IDs across frames (default none = per-frame det index)",
     )
     ap.add_argument("--frame_rate", type=int, default=25)
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
@@ -76,10 +131,29 @@ def _parse_args() -> argparse.Namespace:
         help="Bins per chunk (8 kHz @ 25 FPS default). 0 = checkpoint spad_chunk_size",
     )
     ap.add_argument("--chunk_stride", type=int, default=0, help="0 = chunk_size (non-overlapping)")
-    ap.add_argument("--max_chunks", type=int, default=0, help="0 = all chunks")
-    ap.add_argument("--start_bin", type=int, default=0, help="Skip bins before this index")
+    ap.add_argument("--max_chunks", type=int, default=0, help="0 = all chunks from start")
+    ap.add_argument(
+        "--start_frame",
+        type=int,
+        default=0,
+        help="Start from this emit-frame index (0-based). "
+        "Sets start bin to start_frame * chunk_stride (e.g. 960 → skip first 960 chunks).",
+    )
+    ap.add_argument(
+        "--start_bin",
+        type=int,
+        default=0,
+        help="Start from this raw bin index. If both --start_frame and --start_bin > 0, "
+        "--start_bin wins for the bin cursor; filename frame index still uses --start_frame.",
+    )
     ap.add_argument("--tail_pad", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--vis_bg", type=str, default="recon", choices=["sum", "recon"])
+    ap.add_argument(
+        "--vis_bg",
+        type=str,
+        default="recon",
+        choices=["sum", "recon", "black"],
+        help="Background under the skeleton (default recon)",
+    )
     ap.add_argument("--kpt_thresh", type=float, default=0.5)
     ap.add_argument(
         "--preprocessor_override",
@@ -189,6 +263,12 @@ def main() -> None:
         chunk_t = max(subsampling, 320)
     stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else chunk_t
 
+    start_frame = max(0, int(args.start_frame))
+    if int(args.start_bin) > 0:
+        t_begin = max(0, int(args.start_bin))
+    else:
+        t_begin = start_frame * stride
+
     tracker = None
     if args.tracker != "none":
         tracker = dsp._init_tracker(args.tracker, frame_rate=args.frame_rate, class_names=names)
@@ -206,14 +286,13 @@ def main() -> None:
     print(
         f"ckpt={args.ckpt} device={device} pre={getattr(spad_model, 'preprocessor_name', '?')} "
         f"chunk={chunk_t} stride={stride} bins={dsp._video_num_bins(sources[0])} "
-        f"stream=causal | emit=1 frame per chunk (not spad_subsampling)"
+        f"start_frame={start_frame} start_bin={t_begin} | pose-only, 1 color / ID"
     )
     print(f"save → {out_dir}")
 
-    global_frame_idx = 0
+    global_frame_idx = start_frame
     for video_idx, source in enumerate(sources):
         total_bins = dsp._video_num_bins(source)
-        t_begin = max(0, int(args.start_bin))
         if tracker is not None:
             tracker.reset()
 
@@ -275,12 +354,15 @@ def main() -> None:
                 for result in results:
                     if tracker is not None:
                         result = dsp._apply_tracker(result, tracker)
+
                     recon = (
                         np.ascontiguousarray(result.orig_img.copy())
                         if getattr(result, "orig_img", None) is not None
                         else np.zeros((512, 512, 3), dtype=np.uint8)
                     )
-                    if args.vis_bg == "recon":
+                    if args.vis_bg == "black":
+                        vis = np.zeros_like(recon)
+                    elif args.vis_bg == "recon":
                         vis = recon.copy()
                     else:
                         vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(recon)
@@ -290,36 +372,39 @@ def main() -> None:
                         if track_ids is None:
                             track_ids = torch.arange(len(result.boxes), device=result.boxes.data.device)
                         track_id = track_ids.cpu().numpy()
-                        boxes = result.boxes.xyxy.cpu().numpy()
-                        box_confs = result.boxes.conf.cpu().numpy()
-                        handedness = result.boxes.cls.cpu().numpy()
                         poses = None
                         if getattr(result, "keypoints", None) is not None:
                             poses = result.keypoints.data.cpu().numpy()
 
-                        for j, tid in enumerate(track_id):
-                            box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
-                            vis = dsp.draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
-                            if poses is not None and j < len(poses):
-                                vis = dsp.draw_pose(vis, poses[j], thresh=float(args.kpt_thresh))
+                        if poses is not None:
+                            for j, tid in enumerate(track_id):
+                                if j >= len(poses):
+                                    break
+                                color = _id_color_bgr(int(tid))
+                                vis = _draw_pose_id(
+                                    vis,
+                                    poses[j],
+                                    color=color,
+                                    thresh=float(args.kpt_thresh),
+                                )
 
                     saved_stem = f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}"
                     cv2.imwrite(str(out_dir / f"{saved_stem}.png"), vis)
-                    cv2.imwrite(str(out_dir / f"{saved_stem}_recon.png"), recon)
                     global_frame_idx += 1
 
                 chunk_i += 1
                 if saved_stem is not None:
                     print(
                         f"  [{t0:06d},{t1:06d}) → {saved_stem}.png "
-                        f"(chunk {chunk_i}, frames {global_frame_idx})",
+                        f"(chunk {chunk_i}, frame {global_frame_idx - 1})",
                         flush=True,
                     )
         finally:
             if hasattr(spad_model, "spad_end_stream"):
                 spad_model.spad_end_stream()
 
-    print(f"Done. Wrote {global_frame_idx} pose frames → {out_dir}")
+    n_saved = global_frame_idx - start_frame
+    print(f"Done. Wrote {n_saved} pose frames → {out_dir}")
 
 
 if __name__ == "__main__":
