@@ -5,7 +5,7 @@ Loads ``bin_XXXXXXX.png`` / ``.npy`` (0/1 or 0/255) and draws a 3D scatter.
 
 Modes
 -----
-- ``full`` (default): both 0 (blue) and 1 (red) voxels; xy plane upright, t along floor
+- ``full`` (default): both 0 (black) and 1 (white) voxels; xy plane upright, t along floor
 - ``hits``: only photon hits (value>0), colored by time
 
 Full Bayer volumes are huge (H×W×T); use ``--stride_xy`` / ``--max_points``.
@@ -45,7 +45,7 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="full",
         choices=["full", "hits"],
-        help="full=0/1 as blue/red; hits=only value>0 (colored by t)",
+        help="full=0/1 as black/white; hits=only value>0 (colored by t)",
     )
     ap.add_argument(
         "--stride_xy",
@@ -100,14 +100,14 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--color0",
         type=str,
-        default="#3b82f6",
-        help="Color for binary 0 (default blue)",
+        default="#000000",
+        help="Color for binary 0 (default black)",
     )
     ap.add_argument(
         "--color1",
         type=str,
-        default="#ef4444",
-        help="Color for binary 1 / photon (default red)",
+        default="#ffffff",
+        help="Color for binary 1 / photon (default white)",
     )
     ap.add_argument("--save", type=Path, default=None)
     ap.add_argument("--no_show", action="store_true")
