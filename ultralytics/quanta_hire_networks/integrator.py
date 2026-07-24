@@ -156,6 +156,7 @@ class HIRE(nn.Module):
         self.i_slow: Tensor | None = None
         self.n_fast: Tensor | None = None
         self.n_slow: Tensor | None = None
+        self.s_raw: Tensor | None = None
         self.s_tilde: Tensor | None = None
         self.in_change: Tensor | None = None
         self.confirm_count: Tensor | None = None
@@ -225,6 +226,7 @@ class HIRE(nn.Module):
         self.i_slow = None
         self.n_fast = None
         self.n_slow = None
+        self.s_raw = None
         self.s_tilde = None
         self.in_change = None
         self.confirm_count = None
@@ -493,9 +495,9 @@ class HIRE(nn.Module):
         """One-bin HIRE update (inference-first).
 
         Always returns
-        ``(i_fast, i_slow, n_fast, n_slow, s_tilde, in_change, confirm_count, t_mix, i_out)``.
+        ``(i_fast, i_slow, n_fast, n_slow, s_tilde, in_change, confirm_count, t_mix, i_out, s_raw)``.
         When ``record_debug``, also appends
-        ``(w_slow, g_fast, s_raw, did_reset)`` for visualization only.
+        ``(w_slow, g_fast, did_reset)`` for visualization only.
         """
         eps = self.eps
         c_min = self.confirm_bins
@@ -562,12 +564,13 @@ class HIRE(nn.Module):
             confirm_count,
             t_mix,
             i_out,
+            s_raw,
         )
         if not record_debug:
             return base
         w_slow = 1.0 - g_fast
         did_reset = can_reset.to(dtype=xt.dtype)
-        return base + (w_slow, g_fast, s_raw, did_reset)
+        return base + (w_slow, g_fast, did_reset)
 
     def _store_states(
         self,
@@ -580,11 +583,13 @@ class HIRE(nn.Module):
         in_change: Tensor | None,
         confirm_count: Tensor | None,
         t_mix: Tensor | None,
+        s_raw: Tensor | None = None,
     ) -> None:
         self.i_fast = None if i_fast is None else i_fast.detach()
         self.i_slow = None if i_slow is None else i_slow.detach()
         self.n_fast = None if n_fast is None else n_fast.detach()
         self.n_slow = None if n_slow is None else n_slow.detach()
+        self.s_raw = None if s_raw is None else s_raw.detach()
         self.s_tilde = None if s_tilde is None else s_tilde.detach()
         self.in_change = None if in_change is None else in_change.detach()
         self.confirm_count = None if confirm_count is None else confirm_count.detach()
@@ -639,6 +644,7 @@ class HIRE(nn.Module):
         last_out: Tensor | None = None
         running_max: Tensor | None = None
         i_out: Tensor | None = None
+        s_raw: Tensor | None = None
 
         for t0 in range(0, t_raw, self.subsampling):
             t1 = min(t_raw, t0 + self.subsampling)
@@ -654,6 +660,7 @@ class HIRE(nn.Module):
                     confirm_count = xt.new_zeros(xt.shape)
                     t_mix = xt.new_full(xt.shape, t_mix_init)
                     i_out = i_slow
+                    s_raw = xt.new_zeros(xt.shape)
                 else:
                     (
                         i_fast,
@@ -665,6 +672,7 @@ class HIRE(nn.Module):
                         confirm_count,
                         t_mix,
                         i_out,
+                        s_raw,
                     ) = step_fn(
                         xt,
                         i_fast,
@@ -706,6 +714,7 @@ class HIRE(nn.Module):
             in_change=in_change,
             confirm_count=confirm_count,
             t_mix=t_mix,
+            s_raw=s_raw,
         )
 
         if use_last_only:
@@ -813,9 +822,9 @@ class HIRE(nn.Module):
                         confirm_count,
                         t_mix,
                         i_out,
+                        s_raw,
                         w_slow,
                         g_fast,
-                        s_raw,
                         did_reset,
                     ) = self._step(
                         xt,
@@ -866,6 +875,7 @@ class HIRE(nn.Module):
             in_change=in_change,
             confirm_count=confirm_count,
             t_mix=t_mix,
+            s_raw=s_raw,
         )
 
         recons_prenorm = torch.cat(frames, dim=-1)

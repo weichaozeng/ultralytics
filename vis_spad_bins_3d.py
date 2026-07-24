@@ -267,7 +267,7 @@ def main() -> None:
 
     if args.mode == "full":
         cmap = ListedColormap([args.color0, args.color1])
-        sc = ax.scatter(
+        ax.scatter(
             px,
             py,
             pz,
@@ -279,10 +279,8 @@ def main() -> None:
             alpha=float(args.alpha),
             linewidths=0,
         )
-        cbar = fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.08, ticks=[0, 1])
-        cbar.ax.set_yticklabels(["0", "1"])
     else:
-        sc = ax.scatter(
+        ax.scatter(
             px,
             py,
             pz,
@@ -292,36 +290,21 @@ def main() -> None:
             alpha=float(args.alpha),
             linewidths=0,
         )
-        cbar = fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.08, label="t")
 
-    ax.set_xlabel("x")
-    ax.set_ylabel("t")
-    ax.set_zlabel("y")
     ax.view_init(elev=float(args.elev), azim=float(args.azim))
     # Image row increases downward → flip vertical axis for natural upright view.
     ax.invert_zaxis()
 
+    # Cube only: no axes, ticks, panes, or colorbar.
+    ax.set_axis_off()
     ax.grid(False)
-    ax.set_axisbelow(False)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis._axinfo["grid"]["linewidth"] = 0.0
         axis.pane.fill = False
-        axis.pane.set_edgecolor((1, 1, 1, 0.15))
+        axis.pane.set_edgecolor((1, 1, 1, 0.0))
         axis.pane.set_alpha(0.0)
-
-    # Dark labels read on light slides; light labels if user sets a dark --bg.
-    label_color = "#222222" if face == "none" else "#eeeeee"
-    ax.tick_params(colors=label_color, labelsize=9)
-    ax.xaxis.label.set_color(label_color)
-    ax.yaxis.label.set_color(label_color)
-    ax.zaxis.label.set_color(label_color)
-    if args.mode == "full":
-        cbar.ax.yaxis.set_tick_params(color=label_color)
-        plt.setp(cbar.ax.yaxis.get_ticklabels(), color=label_color)
-    elif args.mode == "hits":
-        cbar.ax.yaxis.label.set_color(label_color)
-        plt.setp(cbar.ax.yaxis.get_ticklabels(), color=label_color)
-    fig.tight_layout()
+        axis.line.set_color((1, 1, 1, 0.0))
+    fig.tight_layout(pad=0)
 
     if args.save is not None:
         args.save.parent.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,7 @@ Per-chunk extras (when those methods are selected)
 -------------------------------------------------
 - ``{stem}_ppb_run_length.npy`` — PPB estimated run length ``(H, W)`` float32 at chunk end
 - ``{stem}_hire_n_slow.npy`` — HIRE slow-branch age ``n_slow`` ``(H, W)`` float32 at chunk end
+- ``{stem}_hire_s_raw.npy`` — HIRE Bernoulli-KL surprise ``s_raw`` ``(H, W)`` float32 at chunk end
 
 Examples
 --------
@@ -650,7 +651,7 @@ def _save_chunk_aux_maps(
     method: str,
     integrators: dict[str, object],
 ) -> None:
-    """Save per-chunk diagnostic maps for PPB run_length and HIRE n_slow."""
+    """Save per-chunk diagnostic maps for PPB run_length and HIRE n_slow / s_raw."""
     if method == "ppb" and "ppb" in integrators:
         ppb = integrators["ppb"]
         run_length = None
@@ -664,6 +665,9 @@ def _save_chunk_aux_maps(
         arr = _tensor_hw_to_npy(getattr(hire, "n_slow", None))
         if arr is not None:
             np.save(out_dir / f"{stem}_hire_n_slow.npy", arr)
+        arr = _tensor_hw_to_npy(getattr(hire, "s_raw", None))
+        if arr is not None:
+            np.save(out_dir / f"{stem}_hire_s_raw.npy", arr)
 
 
 def _apply_vis_scaling(x: np.ndarray, *, mode: str, gamma: float, percentile: float) -> np.ndarray:
@@ -953,7 +957,7 @@ def main() -> None:
         frame_idx += 1
         cube_idx += 1
 
-    print(f"Done. Wrote method PNGs + ppb_run_length/hire_n_slow npy to {out_dir}")
+    print(f"Done. Wrote method PNGs + ppb_run_length/hire_n_slow/hire_s_raw npy to {out_dir}")
     print(f"Done. Wrote comparison PNGs to {compare_dir}")
 
 

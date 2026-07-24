@@ -3,7 +3,7 @@
 
 Supports common layouts from ``vis_pre`` / render caches:
 
-- ``(H, W)``            — e.g. ``*_hire_n_slow.npy``, ``*_ppb_run_length.npy``
+- ``(H, W)``            — e.g. ``*_hire_n_slow.npy``, ``*_hire_s_raw.npy``, ``*_ppb_run_length.npy``
 - ``(T, H, W)``         — temporal stack of maps / gray frames
 - ``(T, C, H, W)``      — RGB/float frames (C=1 or 3)
 - ``(H, W, C)``         — HWC image

@@ -130,9 +130,9 @@ def main() -> None:
                 confirm_count,
                 t_mix,
                 _i_out,
+                _s_raw,
                 _w_slow,
                 g_fast,
-                _s_raw,
                 did_reset,
             ) = hire._step(
                 xt,
