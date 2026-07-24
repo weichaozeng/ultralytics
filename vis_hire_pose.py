@@ -3,7 +3,10 @@
 
 Runs a trained ``SpadPoseModel`` (HIRE preprocessor) on packed/raw ``frames.npy``
 in **causal streaming** mode: preprocessor + detector temporal plugins carry state
-across chunks (no mid-video reset). Saves pose visualizations on the recon frame.
+across chunks (no mid-video reset).
+
+Inference emit cadence follows ``--chunk_size`` only (one recon + one pose per chunk).
+Train-time ``spad_subsampling`` is not used for how often frames are emitted.
 
 Output naming (for ``vis_hire_pose_3d.py``)::
 
@@ -203,7 +206,7 @@ def main() -> None:
     print(
         f"ckpt={args.ckpt} device={device} pre={getattr(spad_model, 'preprocessor_name', '?')} "
         f"chunk={chunk_t} stride={stride} bins={dsp._video_num_bins(sources[0])} "
-        f"stream=causal (state carries across chunks)"
+        f"stream=causal | emit=1 frame per chunk (not spad_subsampling)"
     )
     print(f"save → {out_dir}")
 

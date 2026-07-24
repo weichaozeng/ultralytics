@@ -748,11 +748,17 @@ def _iter_chunk_outputs(
     t1: int,
     subsampling: int,
 ) -> list[tuple[Any, int, int]]:
+    """Map detector Results for one fed chunk to (result, output_frame_idx, source_bin).
+
+    Streaming inference emits **one** recon/pose per chunk (chunk end bin). The
+    ``subsampling`` argument is only used as a fallback when a non-stream forward
+    still returns multiple frames (legacy / train-style).
+    """
     if not results:
         return []
-    if gt_aligned:
-        output_frame_idx = len(results) - 1
-        return [(results[-1], output_frame_idx, int(t1))]
+    # Preferred / stream path: one prediction at the end of the fed chunk.
+    if len(results) == 1 or gt_aligned:
+        return [(results[-1], max(0, len(results) - 1), int(t1))]
     outputs = []
     for output_frame_idx, result in enumerate(results):
         source_bin = int(t0 + output_frame_idx * subsampling)
@@ -856,14 +862,20 @@ def parse_args():
     ap.add_argument("--cube_chunk_stride", type=int, default=0, help="Only used for raw direct-path evaluation without GT alignment")
     ap.add_argument("--spad_stride_frames", type=int, default=0, help="0 = from checkpoint; 2 kHz train uses 5.")
     ap.add_argument("--spad_bins_per_gt", type=int, default=0, help="0 = from checkpoint; 2 kHz uses 16 (2000/125).")
-    ap.add_argument("--spad_subsampling", type=int, default=0, help="0 = from checkpoint; 2 kHz train/cache use 80.")
+    ap.add_argument(
+        "--spad_subsampling",
+        type=int,
+        default=0,
+        help="Train-time preprocessor emit interval (0 = from checkpoint). "
+        "Raw inference emit cadence uses --spad_chunk_t / chunk_size, not this.",
+    )
     ap.add_argument("--input_gamma", type=float, default=0.0, help="Used for rendered-cache fingerprinting and override preprocessors")
     ap.add_argument(
         "--spad_online",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Serial/online inference: carry detector temporal state across frames (default). "
-        "Use --no-spad_online for training-style windowed batch plugins without state carry.",
+        "Use --no-spad_online to disable plugin state carry; raw still emits 1 frame per chunk via stream mode.",
     )
     # PPB / EMA / HIRE defaults match cache_spad_renders_2kHz.py and sequence_*_2kHz.yaml
     ap.add_argument("--ppb-bocpd-gamma", type=float, default=1e-3)
@@ -1046,11 +1058,16 @@ def main():
         )
         if resolved_cache_mode == "raw":
             print(
-                "Raw mode: each chunk may reconstruct multiple frames; "
-                "detector plugins step those frames serially within and across chunks."
+                "Raw mode: spad_begin_stream → 1 recon/pose per fed chunk "
+                f"(chunk_size={chunk_size}); train spad_subsampling is not used for emit cadence."
             )
     else:
         print("Sequence inference: windowed batch plugins (state not carried across forwards)")
+        if resolved_cache_mode == "raw":
+            print(
+                "Raw mode still uses spad_begin_stream emit cadence (1 frame/chunk); "
+                "only detector plugin online carry is disabled."
+            )
 
     out_dir = _eval_dir(run_name, test_name)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1165,12 +1182,10 @@ def main():
                         packed_nch=source.packed_nch,
                     )
 
-                subsampling = int(getattr(getattr(spad_model, "preprocessor", None), "subsampling", spad_subsampling) or 1)
-                if not gt_aligned and chunk_size < subsampling:
-                    raise ValueError(
-                        f"cube_chunk_t={chunk_size} is shorter than preprocessor subsampling={subsampling}, "
-                        "which would produce zero reconstructed frames."
-                    )
+                # Metadata only: train-time emit interval. Streaming uses chunk_size as emit.
+                train_subsampling = int(
+                    getattr(getattr(spad_model, "preprocessor", None), "subsampling", spad_subsampling) or 1
+                )
 
                 video_record: dict[str, Any] = {
                     "video_idx": int(video_idx),
@@ -1180,110 +1195,135 @@ def main():
                     "total_bins": int(total_bins),
                     "chunk_t": int(chunk_size),
                     "chunk_stride": int(stride_bins),
-                    "subsampling": int(subsampling),
+                    "subsampling": int(chunk_size),
+                    "train_subsampling": int(train_subsampling),
                     "chunks": [],
                 }
 
-                for chunk in chunk_records:
-                    t0 = int(chunk.spad_start_bin)
-                    t1 = int(chunk.spad_end_bin)
-                    raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
-                    raw_chunk = _prepare_raw_chunk_for_spad(raw_chunk, chunk_t=chunk_size, tail_pad_full=False)
-                    if raw_chunk is None:
-                        continue
+                # Stream mode: 1 recon/pose per fed chunk; HIRE/plugin state across chunks.
+                if hasattr(spad_model, "spad_begin_stream"):
+                    spad_model.spad_begin_stream()
+                    if not args.spad_online:
+                        spad_model.spad_set_online_inference(False)
+                else:
+                    spad_model.spad_set_online_inference(bool(args.spad_online))
+                    if args.spad_online and hasattr(spad_model, "spad_clear_plugin_states"):
+                        spad_model.spad_clear_plugin_states()
 
-                    spad_model.spad_packed_nch = int(source.packed_nch)
-                    spad_model.spad_cached_confidence_batch = None
-                    if tracker is not None:
-                        _set_velocity_field_on_preprocessor(spad_model.preprocessor, tracker)
-                    else:
-                        _maybe_set_velocity_field(spad_model.preprocessor, tracker)
+                try:
+                    for chunk in chunk_records:
+                        t0 = int(chunk.spad_start_bin)
+                        t1 = int(chunk.spad_end_bin)
+                        raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
+                        raw_chunk = _prepare_raw_chunk_for_spad(raw_chunk, chunk_t=chunk_size, tail_pad_full=False)
+                        if raw_chunk is None:
+                            continue
 
-                    with torch.inference_mode():
-                        video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
-                        raw_preds = spad_model(video_tensor)
-                        preds = _postprocess_pose_predictions(
-                            raw_preds,
-                            conf=args.det_thresh,
-                            iou=args.iou,
-                            nc=len(names),
-                            max_det=args.max_det,
-                            kpt_shape=kpt_shape,
-                        )
-                        preds = _scale_pose_preds_to_native(
-                            preds,
-                            scale_meta=getattr(spad_model, "spad_scale_meta", None),
-                            kpt_shape=kpt_shape,
-                        )
-                        recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
-
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-
-                    results = _results_from_preds(
-                        preds,
-                        recon_frames_bgr,
-                        names,
-                        prefix=f"{sample_name}_cube{video_idx:05d}_t{t0:06d}_{t1:06d}",
-                        kpt_shape=kpt_shape,
-                    )
-
-                    chunk_record: dict[str, Any] = {
-                        "chunk_idx": int(chunk.chunk_index),
-                        "start_bin": int(t0),
-                        "end_bin": int(t1),
-                        "input_bins": int(t1 - t0),
-                        "model_input_bins": int(raw_chunk.shape[0]),
-                        "target_gt_time": chunk.target_gt_time,
-                        "frames": [],
-                    }
-
-                    for result, output_frame_idx, source_bin in _iter_chunk_outputs(
-                        results, gt_aligned=gt_aligned, t0=t0, t1=t1, subsampling=subsampling
-                    ):
+                        spad_model.spad_packed_nch = int(source.packed_nch)
+                        spad_model.spad_cached_confidence_batch = None
                         if tracker is not None:
-                            result = _apply_tracker(result, tracker)
-                        if args.vis != "none":
-                            vis, recon, readrgb = _build_vis_frame(
-                                result,
-                                vis_bg=args.vis_bg,
-                                raw_chunk=raw_chunk,
-                                packed_nch=source.packed_nch,
-                                save_readrgb=bool(args.save_readrgb),
-                            )
-                            if args.vis == "image" and sample_vis_dir is not None:
-                                stem = f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}"
-                                cv2.imwrite(str(sample_vis_dir / f"{stem}.png"), vis)
-                                cv2.imwrite(str(sample_vis_dir / f"{stem}_recon.png"), recon)
-                                if readrgb is not None:
-                                    cv2.imwrite(str(sample_vis_dir / f"{stem}_readrgb.png"), readrgb)
-                            elif args.vis == "video" and video_path is not None:
-                                if video_writer is None:
-                                    h, w = vis.shape[:2]
-                                    video_writer = cv2.VideoWriter(
-                                        str(video_path),
-                                        cv2.VideoWriter_fourcc(*"mp4v"),
-                                        float(args.frame_rate),
-                                        (w, h),
-                                    )
-                                video_writer.write(vis)
-                        chunk_record["frames"].append(
-                            _frame_record_from_result(
-                                result,
-                                names=names,
-                                global_frame_idx=global_frame_idx,
-                                video_idx=video_idx,
-                                chunk_idx=int(chunk.chunk_index),
-                                chunk_start=t0,
-                                chunk_end=t1,
-                                output_frame_idx=output_frame_idx,
-                                source_bin=source_bin,
-                            )
-                        )
-                        global_frame_idx += 1
+                            _set_velocity_field_on_preprocessor(spad_model.preprocessor, tracker)
+                        else:
+                            _maybe_set_velocity_field(spad_model.preprocessor, tracker)
 
-                    if chunk_record["frames"]:
-                        video_record["chunks"].append(chunk_record)
+                        with torch.inference_mode():
+                            video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
+                            raw_preds = spad_model(video_tensor)
+                            preds = _postprocess_pose_predictions(
+                                raw_preds,
+                                conf=args.det_thresh,
+                                iou=args.iou,
+                                nc=len(names),
+                                max_det=args.max_det,
+                                kpt_shape=kpt_shape,
+                            )
+                            preds = _scale_pose_preds_to_native(
+                                preds,
+                                scale_meta=getattr(spad_model, "spad_scale_meta", None),
+                                kpt_shape=kpt_shape,
+                            )
+                            recon_frames_bgr = _recon_frames_bgr(spad_model, batch_index=0)
+
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+
+                        results = _results_from_preds(
+                            preds,
+                            recon_frames_bgr,
+                            names,
+                            prefix=f"{sample_name}_cube{video_idx:05d}_t{t0:06d}_{t1:06d}",
+                            kpt_shape=kpt_shape,
+                        )
+                        if len(results) != 1:
+                            print(
+                                f"Warning: expected 1 pose frame per chunk "
+                                f"[{t0},{t1}) but got {len(results)} "
+                                f"(stream_mode={getattr(spad_model, 'spad_stream_mode', False)})"
+                            )
+
+                        chunk_record: dict[str, Any] = {
+                            "chunk_idx": int(chunk.chunk_index),
+                            "start_bin": int(t0),
+                            "end_bin": int(t1),
+                            "input_bins": int(t1 - t0),
+                            "model_input_bins": int(raw_chunk.shape[0]),
+                            "target_gt_time": chunk.target_gt_time,
+                            "frames": [],
+                        }
+
+                        for result, output_frame_idx, source_bin in _iter_chunk_outputs(
+                            results,
+                            gt_aligned=gt_aligned,
+                            t0=t0,
+                            t1=t1,
+                            subsampling=train_subsampling,
+                        ):
+                            if tracker is not None:
+                                result = _apply_tracker(result, tracker)
+                            if args.vis != "none":
+                                vis, recon, readrgb = _build_vis_frame(
+                                    result,
+                                    vis_bg=args.vis_bg,
+                                    raw_chunk=raw_chunk,
+                                    packed_nch=source.packed_nch,
+                                    save_readrgb=bool(args.save_readrgb),
+                                )
+                                if args.vis == "image" and sample_vis_dir is not None:
+                                    stem = f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}"
+                                    cv2.imwrite(str(sample_vis_dir / f"{stem}.png"), vis)
+                                    cv2.imwrite(str(sample_vis_dir / f"{stem}_recon.png"), recon)
+                                    if readrgb is not None:
+                                        cv2.imwrite(str(sample_vis_dir / f"{stem}_readrgb.png"), readrgb)
+                                elif args.vis == "video" and video_path is not None:
+                                    if video_writer is None:
+                                        h, w = vis.shape[:2]
+                                        video_writer = cv2.VideoWriter(
+                                            str(video_path),
+                                            cv2.VideoWriter_fourcc(*"mp4v"),
+                                            float(args.frame_rate),
+                                            (w, h),
+                                        )
+                                    video_writer.write(vis)
+                            chunk_record["frames"].append(
+                                _frame_record_from_result(
+                                    result,
+                                    names=names,
+                                    global_frame_idx=global_frame_idx,
+                                    video_idx=video_idx,
+                                    chunk_idx=int(chunk.chunk_index),
+                                    chunk_start=t0,
+                                    chunk_end=t1,
+                                    output_frame_idx=output_frame_idx,
+                                    source_bin=source_bin,
+                                )
+                            )
+                            global_frame_idx += 1
+
+                        if chunk_record["frames"]:
+                            video_record["chunks"].append(chunk_record)
+                finally:
+                    if hasattr(spad_model, "spad_end_stream"):
+                        spad_model.spad_end_stream()
 
                 sample_record["videos"].append(video_record)
         else:

@@ -1142,7 +1142,24 @@ class SpadPoseModel(PoseModel):
         return self._spad_maybe_letterbox_for_detector(frames_t_b_c_h_w)
 
     def _spad_process_full_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
-        """Process one full raw SPAD window into reconstructed frames."""
+        """Process one full raw SPAD window into reconstructed frames.
+
+        Streaming inference (``spad_begin_stream``): the fed chunk length is the emit
+        interval — one recon at the end of this forward. Train-time
+        ``spad_subsampling`` is **not** used for emit cadence here.
+        """
+        if photon_cube.ndim != 3:
+            raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
+        t_raw = int(photon_cube.shape[-1])
+
+        # Online / vis streaming: chunk_size bins in → 1 frame out; carry state.
+        if getattr(self, "spad_stream_mode", False):
+            clear = self._spad_take_preprocessor_clear_flag()
+            emit = max(t_raw, 1)
+            return self.preprocessor.process_photon_cube(
+                photon_cube, clear_states=clear, subsampling=emit
+            )
+
         name = str(getattr(self, "preprocessor_name", "")).strip().lower()
         if name in {"stea", "hire"}:
             return self._spad_process_chunked_window(photon_cube)
@@ -1150,10 +1167,9 @@ class SpadPoseModel(PoseModel):
         return self.preprocessor.process_photon_cube(photon_cube, clear_states=clear)
 
     def _spad_process_chunked_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
-        """Replay a full window chunk-by-chunk while carrying causal preprocessor state forward.
+        """Train/val multi-emit window: split by preprocessor ``subsampling`` (e.g. 64).
 
-        Across successive model forwards, enable ``spad_begin_stream()`` so state is
-        not reset between outer video chunks (true streaming).
+        Not used for ``spad_stream_mode`` inference (see ``_spad_process_full_window``).
         """
         if photon_cube.ndim != 3:
             raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
