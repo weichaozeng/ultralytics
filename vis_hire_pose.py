@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Per-chunk HIRE SPAD pose inference → pose overlay PNGs on reconstruction.
 
-Runs a trained ``SpadPoseModel`` (HIRE preprocessor) on packed/raw ``frames.npy``,
-one chunk at a time, and saves pose visualizations on the reconstructed frame.
+Runs a trained ``SpadPoseModel`` (HIRE preprocessor) on packed/raw ``frames.npy``
+in **causal streaming** mode: preprocessor + detector temporal plugins carry state
+across chunks (no mid-video reset). Saves pose visualizations on the recon frame.
 
 Output naming (for ``vis_hire_pose_3d.py``)::
 
@@ -193,9 +194,16 @@ def main() -> None:
     if not sources:
         raise RuntimeError(f"No SPAD sources in {npy_path}")
 
+    if stride < chunk_t:
+        print(
+            f"Warning: chunk_stride={stride} < chunk_size={chunk_t} overlaps bins; "
+            "streaming will double-count overlapping bins. Prefer stride == chunk_size."
+        )
+
     print(
         f"ckpt={args.ckpt} device={device} pre={getattr(spad_model, 'preprocessor_name', '?')} "
-        f"chunk={chunk_t} stride={stride} bins={dsp._video_num_bins(sources[0])}"
+        f"chunk={chunk_t} stride={stride} bins={dsp._video_num_bins(sources[0])} "
+        f"stream=causal (state carries across chunks)"
     )
     print(f"save → {out_dir}")
 
@@ -206,94 +214,107 @@ def main() -> None:
         if tracker is not None:
             tracker.reset()
 
+        # True streaming: HIRE + temporal plugins continue across chunks.
+        if hasattr(spad_model, "spad_begin_stream"):
+            spad_model.spad_begin_stream()
+        else:
+            spad_model.spad_set_online_inference(True)
+            spad_model.spad_clear_plugin_states()
+
         chunk_i = 0
-        for t0 in range(t_begin, total_bins, stride):
-            if int(args.max_chunks) > 0 and chunk_i >= int(args.max_chunks):
-                break
-            t1 = min(total_bins, t0 + chunk_t)
-            raw_chunk = dsp._slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
-            raw_chunk = dsp._prepare_raw_chunk_for_spad(
-                raw_chunk, chunk_t=chunk_t, tail_pad_full=bool(args.tail_pad)
-            )
-            if raw_chunk is None:
-                continue
+        try:
+            for t0 in range(t_begin, total_bins, stride):
+                if int(args.max_chunks) > 0 and chunk_i >= int(args.max_chunks):
+                    break
+                t1 = min(total_bins, t0 + chunk_t)
+                raw_chunk = dsp._slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
+                # Do not pad short tails when streaming — fake repeated bins would pollute state.
+                pad_tail = bool(args.tail_pad) and (t1 >= total_bins)
+                raw_chunk = dsp._prepare_raw_chunk_for_spad(
+                    raw_chunk, chunk_t=chunk_t, tail_pad_full=pad_tail
+                )
+                if raw_chunk is None:
+                    continue
 
-            spad_model.spad_packed_nch = int(source.packed_nch)
-            if tracker is not None:
-                dsp._set_velocity_field_on_preprocessor(spad_model.preprocessor, tracker)
+                spad_model.spad_packed_nch = int(source.packed_nch)
+                if tracker is not None:
+                    dsp._set_velocity_field_on_preprocessor(spad_model.preprocessor, tracker)
 
-            with torch.inference_mode():
-                video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
-                raw_preds = spad_model(video_tensor)
-                preds = dsp._postprocess_pose_predictions(
-                    raw_preds,
-                    conf=args.det_thresh,
-                    iou=args.iou,
-                    nc=len(names),
-                    max_det=args.max_det,
+                with torch.inference_mode():
+                    video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
+                    raw_preds = spad_model(video_tensor)
+                    preds = dsp._postprocess_pose_predictions(
+                        raw_preds,
+                        conf=args.det_thresh,
+                        iou=args.iou,
+                        nc=len(names),
+                        max_det=args.max_det,
+                        kpt_shape=kpt_shape,
+                    )
+                    recon_frames_bgr = dsp._recon_frames_bgr(spad_model, batch_index=0)
+
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+                results = dsp._results_from_preds(
+                    preds,
+                    recon_frames_bgr,
+                    names,
+                    prefix=f"{sample_name}_cube{video_idx:05d}_t{t0:06d}_{t1:06d}",
                     kpt_shape=kpt_shape,
                 )
-                recon_frames_bgr = dsp._recon_frames_bgr(spad_model, batch_index=0)
 
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+                bg_bgr = None
+                if args.vis_bg == "sum":
+                    bg_bgr = dsp._raw_sum_bgr(raw_chunk, packed_nch=source.packed_nch)
 
-            results = dsp._results_from_preds(
-                preds,
-                recon_frames_bgr,
-                names,
-                prefix=f"{sample_name}_cube{video_idx:05d}_t{t0:06d}_{t1:06d}",
-                kpt_shape=kpt_shape,
-            )
+                saved_stem = None
+                for result in results:
+                    if tracker is not None:
+                        result = dsp._apply_tracker(result, tracker)
+                    recon = (
+                        np.ascontiguousarray(result.orig_img.copy())
+                        if getattr(result, "orig_img", None) is not None
+                        else np.zeros((512, 512, 3), dtype=np.uint8)
+                    )
+                    if args.vis_bg == "recon":
+                        vis = recon.copy()
+                    else:
+                        vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(recon)
 
-            bg_bgr = None
-            if args.vis_bg == "sum":
-                bg_bgr = dsp._raw_sum_bgr(raw_chunk, packed_nch=source.packed_nch)
+                    if result.boxes is not None and len(result.boxes):
+                        track_ids = result.boxes.id
+                        if track_ids is None:
+                            track_ids = torch.arange(len(result.boxes), device=result.boxes.data.device)
+                        track_id = track_ids.cpu().numpy()
+                        boxes = result.boxes.xyxy.cpu().numpy()
+                        box_confs = result.boxes.conf.cpu().numpy()
+                        handedness = result.boxes.cls.cpu().numpy()
+                        poses = None
+                        if getattr(result, "keypoints", None) is not None:
+                            poses = result.keypoints.data.cpu().numpy()
 
-            saved_stem = None
-            for result in results:
-                if tracker is not None:
-                    result = dsp._apply_tracker(result, tracker)
-                recon = (
-                    np.ascontiguousarray(result.orig_img.copy())
-                    if getattr(result, "orig_img", None) is not None
-                    else np.zeros((512, 512, 3), dtype=np.uint8)
-                )
-                if args.vis_bg == "recon":
-                    vis = recon.copy()
-                else:
-                    vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(recon)
+                        for j, tid in enumerate(track_id):
+                            box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
+                            vis = dsp.draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
+                            if poses is not None and j < len(poses):
+                                vis = dsp.draw_pose(vis, poses[j], thresh=float(args.kpt_thresh))
 
-                if result.boxes is not None and len(result.boxes):
-                    track_ids = result.boxes.id
-                    if track_ids is None:
-                        track_ids = torch.arange(len(result.boxes), device=result.boxes.data.device)
-                    track_id = track_ids.cpu().numpy()
-                    boxes = result.boxes.xyxy.cpu().numpy()
-                    box_confs = result.boxes.conf.cpu().numpy()
-                    handedness = result.boxes.cls.cpu().numpy()
-                    poses = None
-                    if getattr(result, "keypoints", None) is not None:
-                        poses = result.keypoints.data.cpu().numpy()
+                    saved_stem = f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}"
+                    cv2.imwrite(str(out_dir / f"{saved_stem}.png"), vis)
+                    cv2.imwrite(str(out_dir / f"{saved_stem}_recon.png"), recon)
+                    global_frame_idx += 1
 
-                    for j, tid in enumerate(track_id):
-                        box_xyxyc = np.concatenate([boxes[j], [box_confs[j]]], axis=0)
-                        vis = dsp.draw_bbox(vis, int(tid), box_xyxyc, float(handedness[j]))
-                        if poses is not None and j < len(poses):
-                            vis = dsp.draw_pose(vis, poses[j], thresh=float(args.kpt_thresh))
-
-                saved_stem = f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}"
-                cv2.imwrite(str(out_dir / f"{saved_stem}.png"), vis)
-                cv2.imwrite(str(out_dir / f"{saved_stem}_recon.png"), recon)
-                global_frame_idx += 1
-
-            chunk_i += 1
-            if saved_stem is not None:
-                print(
-                    f"  [{t0:06d},{t1:06d}) → {saved_stem}.png "
-                    f"(chunk {chunk_i}, frames {global_frame_idx})",
-                    flush=True,
-                )
+                chunk_i += 1
+                if saved_stem is not None:
+                    print(
+                        f"  [{t0:06d},{t1:06d}) → {saved_stem}.png "
+                        f"(chunk {chunk_i}, frames {global_frame_idx})",
+                        flush=True,
+                    )
+        finally:
+            if hasattr(spad_model, "spad_end_stream"):
+                spad_model.spad_end_stream()
 
     print(f"Done. Wrote {global_frame_idx} pose frames → {out_dir}")
 

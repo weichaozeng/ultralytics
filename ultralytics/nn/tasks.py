@@ -674,6 +674,9 @@ class SpadPoseModel(PoseModel):
         self.spad_last_recon_frames = None
         self.spad_pending_t_index_ll = None
         self.spad_online_inference = False
+        # Cross-chunk streaming: carry HIRE/STEA + detector plugin state across forwards.
+        self.spad_stream_mode = False
+        self._spad_stream_clear_next = True
         # Detector letterbox size (0 = feed native recon resolution). Native frames kept in spad_last_recon_frames.
         self.spad_detect_imgsz = 0
         self.spad_scale_meta = None
@@ -800,6 +803,39 @@ class SpadPoseModel(PoseModel):
         for plugin in self.plugins_by_layer.values():
             if hasattr(plugin, "clear_temporal_state"):
                 plugin.clear_temporal_state()
+
+    def spad_begin_stream(self) -> None:
+        """Start causal streaming across successive ``forward`` chunk calls.
+
+        Call once per video before the first chunk. Subsequent chunks carry
+        preprocessor (HIRE/STEA/…) and detector temporal-plugin state.
+        """
+        self.spad_stream_mode = True
+        self._spad_stream_clear_next = True
+        self.spad_set_online_inference(True)
+        self.spad_clear_plugin_states()
+        pre = getattr(self, "preprocessor", None)
+        if pre is not None:
+            if hasattr(pre, "clear_states") and callable(pre.clear_states):
+                pre.clear_states()
+            elif hasattr(pre, "reset") and callable(pre.reset):
+                pre.reset()
+
+    def spad_end_stream(self) -> None:
+        """Exit streaming mode (next non-stream forward clears as usual)."""
+        self.spad_stream_mode = False
+        self._spad_stream_clear_next = True
+
+    def _spad_take_preprocessor_clear_flag(self) -> bool:
+        """Whether the next preprocessor call should ``clear_states``.
+
+        In stream mode: ``True`` only for the first chunk after ``spad_begin_stream``.
+        """
+        if not getattr(self, "spad_stream_mode", False):
+            return True
+        clear = bool(getattr(self, "_spad_stream_clear_next", True))
+        self._spad_stream_clear_next = False
+        return clear
 
     def _spad_apply_plugin(self, layer_idx, x, t_index_ll):
         """Apply one detector plugin to a T,B,C,H,W temporal feature sequence.
@@ -1110,10 +1146,15 @@ class SpadPoseModel(PoseModel):
         name = str(getattr(self, "preprocessor_name", "")).strip().lower()
         if name in {"stea", "hire"}:
             return self._spad_process_chunked_window(photon_cube)
-        return self.preprocessor.process_photon_cube(photon_cube, clear_states=True)
+        clear = self._spad_take_preprocessor_clear_flag()
+        return self.preprocessor.process_photon_cube(photon_cube, clear_states=clear)
 
     def _spad_process_chunked_window(self, photon_cube: torch.Tensor) -> torch.Tensor:
-        """Replay a full window chunk-by-chunk while carrying causal preprocessor state forward."""
+        """Replay a full window chunk-by-chunk while carrying causal preprocessor state forward.
+
+        Across successive model forwards, enable ``spad_begin_stream()`` so state is
+        not reset between outer video chunks (true streaming).
+        """
         if photon_cube.ndim != 3:
             raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
 
@@ -1124,7 +1165,7 @@ class SpadPoseModel(PoseModel):
             return photon_cube.new_zeros((h, w, 0), dtype=torch.float32)
 
         recons = []
-        first_chunk = True
+        first_chunk = self._spad_take_preprocessor_clear_flag()
         for t0 in range(0, t_raw, subsampling):
             chunk = photon_cube[..., t0 : min(t_raw, t0 + subsampling)]
             chunk_recons = self.preprocessor.process_photon_cube(chunk, clear_states=first_chunk)
@@ -1372,7 +1413,11 @@ class SpadPoseFrameModel(PoseModel):
                 f"Frame-mode preprocessor {self.preprocessor.__class__.__name__} must implement "
                 "`process_photon_cube_to_frame`."
             )
-        recons, confidence = self.preprocessor.process_photon_cube_to_frame(photon_cube, clear_states=True)
+        clear = True
+        parent_clear = getattr(self, "_spad_take_preprocessor_clear_flag", None)
+        if callable(parent_clear):
+            clear = bool(parent_clear())
+        recons, confidence = self.preprocessor.process_photon_cube_to_frame(photon_cube, clear_states=clear)
         if recons.ndim != 3 or int(recons.shape[-1]) != 1:
             raise ValueError(f"Expected frame-mode reconstruction (H,W,1), got shape={tuple(recons.shape)}")
         if confidence.ndim != 3 or int(confidence.shape[0]) != 1:
