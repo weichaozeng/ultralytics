@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """3D cubes from ``vis_hire_bins.py`` exports (out / s_raw / n_slow).
 
-- ``s_raw`` / ``n_slow``: dense per-bin cube (same layout as ``vis_spad_bins_3d``),
-  colored by map value (turbo), alpha=0.4, no axes / colorbar.
-- ``out``: keep every ``--out_emit``-th bin (default 320), place slices at their
-  true bin index so gaps along ``t`` show the downsampled / lower frame-rate feel.
+Memory-safe: streams frames with a fixed-size reservoir (``--max_points``),
+mmap-loads ``.npy``, and frees each figure before the next channel.
+
+- ``s_raw`` / ``n_slow``: dense per-bin cube, colored by value (turbo).
+- ``out``: every ``--out_emit``-th bin at true ``t`` (gaps show downsample).
+- ``out_dense``: all ``out/`` bins dense along ``t`` (same ``--out_*`` knobs as ``out``).
 
 Examples
 --------
 python ultralytics/vis_hire_bins_3d.py \\
   --in_dir /tmp/hire_bins \\
   --save_dir /tmp/hire_bins_3d \\
-  --no_show
-
-# Only out, with its own alpha / stride / point size
-python ultralytics/vis_hire_bins_3d.py \\
-  --in_dir /tmp/hire_bins \\
-  --save_dir /tmp/hire_bins_3d \\
-  --which out --out_emit 320 \\
-  --out_alpha 0.25 --out_stride_xy 4 --out_point_size 0.5 \\
-  --no_show
+  --which s_raw,n_slow,out,out_dense \\
+  --max_points 300000 --no_show
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import re
 from pathlib import Path
 
@@ -36,80 +32,39 @@ _BIN_RE = re.compile(r"^(?P<prefix>.+?)_(?P<idx>\d+)\.(?P<ext>png|npy)$", re.IGN
 
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="3D cubes for HIRE bin maps (out/s_raw/n_slow)")
-    ap.add_argument(
-        "--in_dir",
-        type=Path,
-        required=True,
-        help="Root from vis_hire_bins.py (contains out/, s_raw/, n_slow/)",
-    )
-    ap.add_argument(
-        "--save_dir",
-        type=Path,
-        default=None,
-        help="Where to write *_3d.png (default: in_dir)",
-    )
+    ap.add_argument("--in_dir", type=Path, required=True)
+    ap.add_argument("--save_dir", type=Path, default=None)
     ap.add_argument(
         "--which",
         type=str,
-        default="s_raw,n_slow,out",
-        help="Comma-separated: s_raw,n_slow,out",
+        default="s_raw,n_slow,out,out_dense",
+        help="Comma-separated: s_raw,n_slow,out,out_dense",
     )
     ap.add_argument(
         "--out_emit",
         type=int,
         default=320,
-        help="Temporal downsample for out: keep bins where index %% emit == first%%emit "
-        "(default 320). Slices stay at true bin t so gaps show lower rate.",
+        help="Temporal downsample for sparse out only (default 320); out_dense ignores this",
     )
+    ap.add_argument("--out_slab", type=int, default=1)
+    ap.add_argument("--out_alpha", type=float, default=0.4)
+    ap.add_argument("--out_stride_xy", type=int, default=0, help="0 = use --stride_xy")
+    ap.add_argument("--out_point_size", type=float, default=0.0, help="0 = use --point_size")
+    ap.add_argument("--out_max_points", type=int, default=0, help="0 = use --max_points")
+    ap.add_argument("--stride_xy", type=int, default=2)
     ap.add_argument(
-        "--out_slab",
+        "--max_points",
         type=int,
-        default=1,
-        help="Thickness of each out slice along t in bin units (default 1)",
+        default=300_000,
+        help="Hard cap on plotted points (reservoir). Always bounded — never loads full volume.",
     )
-    ap.add_argument(
-        "--out_alpha",
-        type=float,
-        default=0.4,
-        help="Marker alpha for out cube only (default 0.4; s_raw/n_slow use --alpha)",
-    )
-    ap.add_argument(
-        "--out_stride_xy",
-        type=int,
-        default=0,
-        help="Spatial stride for out only; 0 = use --stride_xy",
-    )
-    ap.add_argument(
-        "--out_point_size",
-        type=float,
-        default=0.0,
-        help="Point size for out only; 0 = use --point_size",
-    )
-    ap.add_argument(
-        "--out_max_points",
-        type=int,
-        default=0,
-        help="Max points for out only; 0 = use --max_points",
-    )
-    ap.add_argument("--stride_xy", type=int, default=2, help="Spatial stride for s_raw/n_slow (and out if --out_stride_xy 0)")
-    ap.add_argument("--max_points", type=int, default=400_000)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--point_size", type=float, default=0.2, help="Marker size for s_raw/n_slow (and out if --out_point_size 0)")
-    ap.add_argument("--alpha", type=float, default=0.4, help="Marker alpha for s_raw/n_slow (default 0.4)")
-    ap.add_argument("--cmap", type=str, default="turbo", help="Colormap for continuous values")
-    ap.add_argument(
-        "--n_slow_vmax",
-        type=float,
-        default=160.0,
-        help="Color scale max for n_slow (default hire_slow_bins=160)",
-    )
-    ap.add_argument(
-        "--s_raw_percentile",
-        type=float,
-        default=99.5,
-        help="vmax = this percentile of s_raw (0 = use --s_raw_vmax)",
-    )
-    ap.add_argument("--s_raw_vmax", type=float, default=0.0, help="Fixed s_raw vmax if >0")
+    ap.add_argument("--point_size", type=float, default=0.2)
+    ap.add_argument("--alpha", type=float, default=0.4)
+    ap.add_argument("--cmap", type=str, default="turbo")
+    ap.add_argument("--n_slow_vmax", type=float, default=160.0)
+    ap.add_argument("--s_raw_percentile", type=float, default=99.5)
+    ap.add_argument("--s_raw_vmax", type=float, default=0.0)
     ap.add_argument("--out_vmin", type=float, default=0.0)
     ap.add_argument("--out_vmax", type=float, default=1.0)
     ap.add_argument("--bg", type=str, default="none")
@@ -118,11 +73,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--dpi", type=int, default=160)
     ap.add_argument("--figsize", type=float, nargs=2, default=(9.0, 7.0))
     ap.add_argument("--no_show", action="store_true")
-    ap.add_argument(
-        "--t_as_index",
-        action="store_true",
-        help="Use 0..N-1 as t instead of filename bin indices (s_raw/n_slow only)",
-    )
+    ap.add_argument("--t_as_index", action="store_true")
     return ap.parse_args()
 
 
@@ -143,104 +94,168 @@ def _list_bin_files(in_dir: Path) -> list[tuple[int, Path]]:
     return files
 
 
-def _load_hw(path: Path) -> np.ndarray:
-    img = np.load(path)
+def _load_hw_mmap(path: Path) -> np.ndarray:
+    img = np.load(path, mmap_mode="r")
     if img.ndim != 2:
         raise ValueError(f"Expected (H,W), got {path} shape={img.shape}")
-    return img.astype(np.float32, copy=False)
+    return img
 
 
-def _collect_float_voxels(
-    files: list[tuple[int, Path]],
-    *,
-    stride_xy: int,
-    t_as_index: bool,
-    t_override: list[float] | None = None,
-    slab: int = 1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return x, y, t, value for every strided pixel."""
-    if stride_xy < 1:
-        raise ValueError("--stride_xy must be >= 1")
-    if slab < 1:
-        raise ValueError("--out_slab must be >= 1")
-
-    xs: list[np.ndarray] = []
-    ys: list[np.ndarray] = []
-    ts: list[np.ndarray] = []
-    vs: list[np.ndarray] = []
-
-    for i, (bin_idx, path) in enumerate(files):
-        arr = _load_hw(path)
-        if stride_xy > 1:
-            arr = arr[::stride_xy, ::stride_xy]
-        h, w = arr.shape
-        yy, xx = np.mgrid[0:h, 0:w]
-        xx = (xx.ravel().astype(np.float32) * float(stride_xy))
-        yy = (yy.ravel().astype(np.float32) * float(stride_xy))
-        val = arr.ravel().astype(np.float32)
-
-        if t_override is not None:
-            t0 = float(t_override[i])
-        elif t_as_index:
-            t0 = float(i)
-        else:
-            t0 = float(bin_idx)
-
-        if slab == 1:
-            xs.append(xx)
-            ys.append(yy)
-            ts.append(np.full(xx.shape, t0, dtype=np.float32))
-            vs.append(val)
-        else:
-            for dt in range(slab):
-                xs.append(xx)
-                ys.append(yy)
-                ts.append(np.full(xx.shape, t0 + float(dt), dtype=np.float32))
-                vs.append(val)
-
-    if not xs:
-        raise RuntimeError("No voxels collected")
-    return (
-        np.concatenate(xs),
-        np.concatenate(ys),
-        np.concatenate(ts),
-        np.concatenate(vs),
-    )
-
-
-def _subsample(
-    x: np.ndarray,
-    y: np.ndarray,
-    t: np.ndarray,
-    v: np.ndarray,
-    *,
-    max_points: int,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    n = int(x.shape[0])
-    if max_points <= 0 or n <= max_points:
-        return x, y, t, v
-    rng = np.random.default_rng(int(seed))
-    sel = rng.choice(n, size=int(max_points), replace=False)
-    return x[sel], y[sel], t[sel], v[sel]
-
-
-def _select_out_files(
-    files: list[tuple[int, Path]],
-    *,
-    emit: int,
-) -> list[tuple[int, Path]]:
-    """Keep bins on an emit grid (true indices), so gaps remain along t."""
+def _select_out_files(files: list[tuple[int, Path]], *, emit: int) -> list[tuple[int, Path]]:
     if emit < 1:
         raise ValueError("--out_emit must be >= 1")
     if not files:
         return []
     phase = int(files[0][0]) % int(emit)
     selected = [(idx, p) for idx, p in files if int(idx) % int(emit) == phase]
-    if not selected:
-        # Fallback: every emit-th file in sorted order, placed at true indices
-        selected = files[::emit]
-    return selected
+    return selected if selected else files[::emit]
+
+
+class _Reservoir4:
+    """Fixed-capacity reservoir for (x, y, t, v) float32 points."""
+
+    def __init__(self, capacity: int, seed: int) -> None:
+        if capacity < 1:
+            raise ValueError("reservoir capacity must be >= 1")
+        self.k = int(capacity)
+        self.rng = np.random.default_rng(int(seed))
+        self.x = np.empty(self.k, dtype=np.float32)
+        self.y = np.empty(self.k, dtype=np.float32)
+        self.t = np.empty(self.k, dtype=np.float32)
+        self.v = np.empty(self.k, dtype=np.float32)
+        self.filled = 0
+        self.seen = 0
+
+    def add_batch(self, x: np.ndarray, y: np.ndarray, t: np.ndarray, v: np.ndarray) -> None:
+        m = int(x.shape[0])
+        if m == 0:
+            return
+        # Fill phase
+        if self.filled < self.k:
+            take = min(m, self.k - self.filled)
+            sl = slice(self.filled, self.filled + take)
+            self.x[sl] = x[:take]
+            self.y[sl] = y[:take]
+            self.t[sl] = t[:take]
+            self.v[sl] = v[:take]
+            self.filled += take
+            self.seen += take
+            if take == m:
+                return
+            x, y, t, v = x[take:], y[take:], t[take:], v[take:]
+            m = int(x.shape[0])
+
+        # Replacement phase (vectorized per-point)
+        # For i-th new point, seen becomes seen+i+1; replace with p = k/seen.
+        for start in range(0, m, 65536):
+            end = min(start + 65536, m)
+            xb = x[start:end]
+            yb = y[start:end]
+            tb = t[start:end]
+            vb = v[start:end]
+            b = int(xb.shape[0])
+            seen0 = self.seen
+            # indices into reservoir to maybe replace
+            # j ~ U{0..seen_i-1}; keep if j < k
+            seen_i = seen0 + np.arange(1, b + 1, dtype=np.int64)
+            j = self.rng.integers(0, seen_i, endpoint=False, dtype=np.int64)
+            mask = j < self.k
+            if mask.any():
+                slots = j[mask]
+                self.x[slots] = xb[mask]
+                self.y[slots] = yb[mask]
+                self.t[slots] = tb[mask]
+                self.v[slots] = vb[mask]
+            self.seen = int(seen_i[-1])
+
+    def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+        n = self.filled
+        return self.x[:n], self.y[:n], self.t[:n], self.v[:n], self.seen
+
+
+def _xy_grid(h: int, w: int, stride_xy: int) -> tuple[np.ndarray, np.ndarray]:
+    yy, xx = np.mgrid[0:h, 0:w]
+    xx = (xx.astype(np.float32) * float(stride_xy)).ravel()
+    yy = (yy.astype(np.float32) * float(stride_xy)).ravel()
+    return xx, yy
+
+
+def _collect_reservoir(
+    files: list[tuple[int, Path]],
+    *,
+    stride_xy: int,
+    t_as_index: bool,
+    slab: int,
+    max_points: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Stream frames into a reservoir of size ``max_points`` (peak mem ~ O(max_points + H*W/stride²))."""
+    if stride_xy < 1:
+        raise ValueError("--stride_xy must be >= 1")
+    if slab < 1:
+        raise ValueError("--out_slab must be >= 1")
+    if max_points < 1:
+        raise ValueError("--max_points must be >= 1 (memory cap)")
+
+    res = _Reservoir4(max_points, seed)
+    xx_cache: np.ndarray | None = None
+    yy_cache: np.ndarray | None = None
+    cache_hw: tuple[int, int] | None = None
+
+    for i, (bin_idx, path) in enumerate(files):
+        arr = _load_hw_mmap(path)
+        # Copy only the strided view into RAM (small)
+        if stride_xy > 1:
+            view = np.asarray(arr[::stride_xy, ::stride_xy], dtype=np.float32)
+        else:
+            view = np.asarray(arr, dtype=np.float32)
+        h, w = view.shape
+        if cache_hw != (h, w):
+            xx_cache, yy_cache = _xy_grid(h, w, stride_xy)
+            cache_hw = (h, w)
+        assert xx_cache is not None and yy_cache is not None
+        val = view.ravel()
+        t0 = float(i if t_as_index else bin_idx)
+
+        if slab == 1:
+            res.add_batch(xx_cache, yy_cache, np.full(val.shape, t0, dtype=np.float32), val)
+        else:
+            for dt in range(slab):
+                res.add_batch(
+                    xx_cache,
+                    yy_cache,
+                    np.full(val.shape, t0 + float(dt), dtype=np.float32),
+                    val,
+                )
+        # Drop frame ASAP
+        del view, val, arr
+
+    x, y, t, v, seen = res.arrays()
+    if seen == 0:
+        raise RuntimeError("No voxels collected")
+    return x.copy(), y.copy(), t.copy(), v.copy(), seen
+
+
+def _estimate_s_raw_vmax(files: list[tuple[int, Path]], *, stride_xy: int, percentile: float, seed: int) -> float:
+    """Light pass: sample strided pixels from up to 32 frames for vmax."""
+    rng = np.random.default_rng(int(seed) + 1)
+    if not files:
+        return 1.0
+    pick = files if len(files) <= 32 else [files[i] for i in rng.choice(len(files), size=32, replace=False)]
+    samples: list[np.ndarray] = []
+    budget = 200_000
+    per = max(1, budget // max(len(pick), 1))
+    for _, path in pick:
+        arr = _load_hw_mmap(path)
+        view = np.asarray(arr[::stride_xy, ::stride_xy], dtype=np.float32).ravel()
+        if view.size > per:
+            view = view[rng.choice(view.size, size=per, replace=False)]
+        samples.append(view)
+        del arr
+    if not samples:
+        return 1.0
+    cat = np.concatenate(samples)
+    return float(max(np.nanpercentile(cat, float(percentile)), 1e-6))
 
 
 def _process_channel(
@@ -252,65 +267,71 @@ def _process_channel(
     t_as_index = bool(args.t_as_index)
     slab = 1
     use_files = files
+    is_out_family = name in {"out", "out_dense"}
 
-    if name == "out":
-        use_files = _select_out_files(files, emit=int(args.out_emit))
+    if is_out_family:
         slab = int(args.out_slab)
-        t_as_index = False  # keep true bin indices → empty gaps along t
+        t_as_index = False
         stride_xy = int(args.out_stride_xy) if int(args.out_stride_xy) > 0 else int(args.stride_xy)
         point_size = float(args.out_point_size) if float(args.out_point_size) > 0 else float(args.point_size)
         alpha = float(args.out_alpha)
         max_points = int(args.out_max_points) if int(args.out_max_points) > 0 else int(args.max_points)
-        print(
-            f"[{name}] emit={args.out_emit}: {len(files)} bins → {len(use_files)} slices "
-            f"(t gaps show {args.out_emit}× downsample) "
-            f"alpha={alpha:g} stride_xy={stride_xy} point_size={point_size:g}"
-        )
-        if use_files:
-            print(f"[{name}] slice indices: {use_files[0][0]} … {use_files[-1][0]}")
+        if name == "out":
+            use_files = _select_out_files(files, emit=int(args.out_emit))
+            print(
+                f"[{name}] sparse emit={args.out_emit}: {len(files)} → {len(use_files)} slices | "
+                f"alpha={alpha:g} stride_xy={stride_xy} point_size={point_size:g} max_points={max_points}"
+            )
+        else:
+            print(
+                f"[{name}] dense: {len(use_files)} bins | "
+                f"alpha={alpha:g} stride_xy={stride_xy} point_size={point_size:g} max_points={max_points}"
+            )
     else:
         stride_xy = int(args.stride_xy)
         point_size = float(args.point_size)
         alpha = float(args.alpha)
         max_points = int(args.max_points)
         print(
-            f"[{name}] {len(use_files)} bins, dense along t "
-            f"alpha={alpha:g} stride_xy={stride_xy} point_size={point_size:g}"
+            f"[{name}] {len(use_files)} bins | "
+            f"alpha={alpha:g} stride_xy={stride_xy} point_size={point_size:g} max_points={max_points}"
         )
 
     if not use_files:
         print(f"[{name}] skip (no frames)")
         return
 
-    x, y, t, v = _collect_float_voxels(
-        use_files,
-        stride_xy=stride_xy,
-        t_as_index=t_as_index,
-        slab=slab,
-    )
-    n_all = int(x.shape[0])
-    x, y, t, v = _subsample(
-        x, y, t, v, max_points=max_points, seed=int(args.seed)
-    )
-    print(f"[{name}] voxels {n_all:,} → plot {int(x.shape[0]):,}")
-
+    # Resolve vmax before building the big scatter (s_raw needs a light pass).
     if name == "n_slow":
         vmin, vmax = 0.0, float(args.n_slow_vmax)
     elif name == "s_raw":
         if float(args.s_raw_vmax) > 0:
             vmax = float(args.s_raw_vmax)
         else:
-            vmax = float(np.nanpercentile(v, float(args.s_raw_percentile)))
-        vmin, vmax = 0.0, max(vmax, 1e-6)
-    else:  # out
+            vmax = _estimate_s_raw_vmax(
+                use_files,
+                stride_xy=stride_xy,
+                percentile=float(args.s_raw_percentile),
+                seed=int(args.seed),
+            )
+        vmin = 0.0
+    else:
         vmin, vmax = float(args.out_vmin), float(args.out_vmax)
-        # If values look unnormalized, stretch by percentile for display
-        if float(np.nanmax(v)) > 1.5 and vmax <= 1.0 + 1e-6:
-            vmax = float(np.nanpercentile(v, 99.5))
-            vmin = 0.0
 
-    # Match overall t extent of dense cube when rendering out with gaps:
-    # set t limits from full file list if available.
+    x, y, t, v, seen = _collect_reservoir(
+        use_files,
+        stride_xy=stride_xy,
+        t_as_index=t_as_index,
+        slab=slab,
+        max_points=max_points,
+        seed=int(args.seed),
+    )
+    print(f"[{name}] scanned ~{seen:,} voxels → plot {int(x.shape[0]):,} (cap={max_points})")
+
+    if is_out_family and float(np.nanmax(v)) > 1.5 and vmax <= 1.0 + 1e-6:
+        vmax = float(np.nanpercentile(v, 99.5))
+        vmin = 0.0
+
     t_lim = None
     if name == "out" and len(files) >= 2 and not args.t_as_index:
         t_lim = (float(files[0][0]), float(files[-1][0]))
@@ -360,27 +381,44 @@ def _process_channel(
         transparent=(face == "none"),
     )
     print(f"saved {out_path}  vmin/vmax={vmin:g}/{vmax:g}")
+
     if not args.no_show:
+        import matplotlib.pyplot as plt
+
         plt.show()
-    else:
-        plt.close(fig)
+
+    # Release plot + point buffers before next channel
+    plt.close(fig)
+    plt.close("all")
+    del fig, ax, x, y, t, v
+    gc.collect()
 
 
 def main() -> None:
     args = _parse_args()
+    if int(args.max_points) < 1:
+        raise ValueError("--max_points must be >= 1")
     in_root = args.in_dir
     save_dir = args.save_dir if args.save_dir is not None else in_root
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    # Agg backend for the whole run when --no_show (set once)
+    if args.no_show:
+        import matplotlib
+
+        matplotlib.use("Agg")
+
     which = [w.strip() for w in str(args.which).split(",") if w.strip()]
     for name in which:
-        if name not in {"out", "s_raw", "n_slow"}:
-            raise ValueError(f"Unknown channel {name!r}; expected out/s_raw/n_slow")
-        sub = in_root / name
+        if name not in {"out", "out_dense", "s_raw", "n_slow"}:
+            raise ValueError(f"Unknown channel {name!r}; expected out/out_dense/s_raw/n_slow")
+        # out_dense reads the same maps as out/
+        sub = in_root / ("out" if name == "out_dense" else name)
         files = _list_bin_files(sub)
         print(f"\n=== {name} ===")
         print(f"found {len(files)} maps in {sub}  bins {files[0][0]}…{files[-1][0]}")
         _process_channel(name, files, args, save_dir)
+        gc.collect()
 
     print(f"\nDone → {save_dir}")
 
