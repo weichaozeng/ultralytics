@@ -21,7 +21,7 @@ python ultralytics/vis_hire_pose.py \\
   --ckpt /path/to/last.pt \\
   --save_dir /tmp/hire_pose \\
   --chunk_size 320 \\
-  --start_frame 960
+  --start_bin 960
 """
 
 from __future__ import annotations
@@ -133,18 +133,10 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--chunk_stride", type=int, default=0, help="0 = chunk_size (non-overlapping)")
     ap.add_argument("--max_chunks", type=int, default=0, help="0 = all chunks from start")
     ap.add_argument(
-        "--start_frame",
-        type=int,
-        default=0,
-        help="Start from this emit-frame index (0-based). "
-        "Sets start bin to start_frame * chunk_stride (e.g. 960 → skip first 960 chunks).",
-    )
-    ap.add_argument(
         "--start_bin",
         type=int,
         default=0,
-        help="Start from this raw bin index. If both --start_frame and --start_bin > 0, "
-        "--start_bin wins for the bin cursor; filename frame index still uses --start_frame.",
+        help="Start streaming from this raw SPAD bin index (e.g. 960).",
     )
     ap.add_argument("--tail_pad", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument(
@@ -263,11 +255,7 @@ def main() -> None:
         chunk_t = max(subsampling, 320)
     stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else chunk_t
 
-    start_frame = max(0, int(args.start_frame))
-    if int(args.start_bin) > 0:
-        t_begin = max(0, int(args.start_bin))
-    else:
-        t_begin = start_frame * stride
+    t_begin = max(0, int(args.start_bin))
 
     tracker = None
     if args.tracker != "none":
@@ -286,11 +274,11 @@ def main() -> None:
     print(
         f"ckpt={args.ckpt} device={device} pre={getattr(spad_model, 'preprocessor_name', '?')} "
         f"chunk={chunk_t} stride={stride} bins={dsp._video_num_bins(sources[0])} "
-        f"start_frame={start_frame} start_bin={t_begin} | pose-only, 1 color / ID"
+        f"start_bin={t_begin} | pose-only, 1 color / ID"
     )
     print(f"save → {out_dir}")
 
-    global_frame_idx = start_frame
+    global_frame_idx = 0
     for video_idx, source in enumerate(sources):
         total_bins = dsp._video_num_bins(source)
         if tracker is not None:
@@ -403,8 +391,7 @@ def main() -> None:
             if hasattr(spad_model, "spad_end_stream"):
                 spad_model.spad_end_stream()
 
-    n_saved = global_frame_idx - start_frame
-    print(f"Done. Wrote {n_saved} pose frames → {out_dir}")
+    print(f"Done. Wrote {global_frame_idx} pose frames → {out_dir}")
 
 
 if __name__ == "__main__":
