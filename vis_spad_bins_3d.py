@@ -5,22 +5,17 @@ Loads ``bin_XXXXXXX.png`` / ``.npy`` (0/1 or 0/255) and draws a 3D scatter.
 
 Modes
 -----
-- ``full`` (default): plot **both** 0 (black) and 1 (white) voxels → black/white cube
+- ``full`` (default): both 0 (blue) and 1 (red) voxels; xy plane upright, t along floor
 - ``hits``: only photon hits (value>0), colored by time
 
 Full Bayer volumes are huge (H×W×T); use ``--stride_xy`` / ``--max_points``.
 
 Examples
 --------
-# Black/white binary cube (recommended for Bayer)
 python ultralytics/vis_spad_bins_3d.py \\
   --in_dir /tmp/spad_bins_bayer \\
   --mode full --stride_xy 4 \\
-  --alpha 0.08 --point_size 0.2 \\
   --save /tmp/spad_cube.png --no_show
-
-# Hits only (sparse photons)
-python ultralytics/vis_spad_bins_3d.py --in_dir /tmp/spad_bins --mode hits
 """
 
 from __future__ import annotations
@@ -50,7 +45,7 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="full",
         choices=["full", "hits"],
-        help="full=black+white voxels; hits=only value>0 (colored by t)",
+        help="full=0/1 as blue/red; hits=only value>0 (colored by t)",
     )
     ap.add_argument(
         "--stride_xy",
@@ -87,11 +82,33 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--bg",
         type=str,
-        default="#2a2a2a",
-        help="Axes background (full mode needs a mid/dark bg so black+white both show)",
+        default="none",
+        help="Figure / axes background; 'none' = transparent (default)",
     )
-    ap.add_argument("--elev", type=float, default=25.0)
-    ap.add_argument("--azim", type=float, default=-60.0)
+    ap.add_argument(
+        "--elev",
+        type=float,
+        default=18.0,
+        help="View elevation; xy stands upright with default mapping",
+    )
+    ap.add_argument(
+        "--azim",
+        type=float,
+        default=-70.0,
+        help="View azimuth; t runs along the floor / depth",
+    )
+    ap.add_argument(
+        "--color0",
+        type=str,
+        default="#3b82f6",
+        help="Color for binary 0 (default blue)",
+    )
+    ap.add_argument(
+        "--color1",
+        type=str,
+        default="#ef4444",
+        help="Color for binary 1 / photon (default red)",
+    )
     ap.add_argument("--save", type=Path, default=None)
     ap.add_argument("--no_show", action="store_true")
     ap.add_argument("--dpi", type=int, default=160)
@@ -241,16 +258,19 @@ def main() -> None:
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
 
-    fig = plt.figure(figsize=tuple(args.figsize), facecolor=args.bg)
-    ax = fig.add_subplot(111, projection="3d", facecolor=args.bg)
+    face = "none" if str(args.bg).lower() in {"none", "transparent"} else args.bg
+    fig = plt.figure(figsize=tuple(args.figsize), facecolor=face)
+    ax = fig.add_subplot(111, projection="3d", facecolor=face)
+
+    # Orientation: xy image plane upright (Z=y up, X=x), t along floor depth (Y=t).
+    px, py, pz = x, t, y
 
     if args.mode == "full":
-        # 0 → black, 1 → white (need non-white figure bg)
-        cmap = ListedColormap(["#000000", "#ffffff"])
+        cmap = ListedColormap([args.color0, args.color1])
         sc = ax.scatter(
-            x,
-            y,
-            t,
+            px,
+            py,
+            pz,
             c=v,
             cmap=cmap,
             vmin=0,
@@ -260,38 +280,60 @@ def main() -> None:
             linewidths=0,
         )
         cbar = fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.08, ticks=[0, 1])
-        cbar.ax.set_yticklabels(["0 (black)", "1 (white)"])
+        cbar.ax.set_yticklabels(["0", "1"])
     else:
         sc = ax.scatter(
-            x,
-            y,
-            t,
+            px,
+            py,
+            pz,
             c=t,
             cmap=args.cmap,
             s=float(args.point_size),
             alpha=float(args.alpha),
             linewidths=0,
         )
-        fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.08, label="t")
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.08, label="t")
 
-    ax.set_xlabel("x (col)")
-    ax.set_ylabel("y (row)")
-    ax.set_zlabel("t (bin)")
+    ax.set_xlabel("x")
+    ax.set_ylabel("t")
+    ax.set_zlabel("y")
     ax.view_init(elev=float(args.elev), azim=float(args.azim))
-    ax.invert_yaxis()
-    # Tone down pane colors so black/white points read clearly
-    ax.xaxis.pane.fill = False
-    ax.yaxis.pane.fill = False
-    ax.zaxis.pane.fill = False
-    ax.tick_params(colors="#dddddd")
-    ax.xaxis.label.set_color("#dddddd")
-    ax.yaxis.label.set_color("#dddddd")
-    ax.zaxis.label.set_color("#dddddd")
+    # Image row increases downward → flip vertical axis for natural upright view.
+    ax.invert_zaxis()
+
+    ax.grid(False)
+    ax.set_axisbelow(False)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis._axinfo["grid"]["linewidth"] = 0.0
+        axis.pane.fill = False
+        axis.pane.set_edgecolor((1, 1, 1, 0.15))
+        axis.pane.set_alpha(0.0)
+
+    # Dark labels read on light slides; light labels if user sets a dark --bg.
+    label_color = "#222222" if face == "none" else "#eeeeee"
+    ax.tick_params(colors=label_color, labelsize=9)
+    ax.xaxis.label.set_color(label_color)
+    ax.yaxis.label.set_color(label_color)
+    ax.zaxis.label.set_color(label_color)
+    if args.mode == "full":
+        cbar.ax.yaxis.set_tick_params(color=label_color)
+        plt.setp(cbar.ax.yaxis.get_ticklabels(), color=label_color)
+    elif args.mode == "hits":
+        cbar.ax.yaxis.label.set_color(label_color)
+        plt.setp(cbar.ax.yaxis.get_ticklabels(), color=label_color)
     fig.tight_layout()
 
     if args.save is not None:
         args.save.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(args.save, dpi=int(args.dpi), bbox_inches="tight", facecolor=fig.get_facecolor())
+        # Transparent PNG needs facecolor/edgecolor='none' + transparent=True
+        fig.savefig(
+            args.save,
+            dpi=int(args.dpi),
+            bbox_inches="tight",
+            facecolor=face,
+            edgecolor="none",
+            transparent=(face == "none"),
+        )
         print(f"saved {args.save}")
 
     if not args.no_show:
