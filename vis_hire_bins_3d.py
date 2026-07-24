@@ -13,11 +13,13 @@ python ultralytics/vis_hire_bins_3d.py \\
   --save_dir /tmp/hire_bins_3d \\
   --no_show
 
-# Only out cube, emit every 320 bins
+# Only out, with its own alpha / stride / point size
 python ultralytics/vis_hire_bins_3d.py \\
   --in_dir /tmp/hire_bins \\
   --save_dir /tmp/hire_bins_3d \\
-  --which out --out_emit 320 --no_show
+  --which out --out_emit 320 \\
+  --out_alpha 0.25 --out_stride_xy 4 --out_point_size 0.5 \\
+  --no_show
 """
 
 from __future__ import annotations
@@ -65,11 +67,35 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Thickness of each out slice along t in bin units (default 1)",
     )
-    ap.add_argument("--stride_xy", type=int, default=2)
+    ap.add_argument(
+        "--out_alpha",
+        type=float,
+        default=0.4,
+        help="Marker alpha for out cube only (default 0.4; s_raw/n_slow use --alpha)",
+    )
+    ap.add_argument(
+        "--out_stride_xy",
+        type=int,
+        default=0,
+        help="Spatial stride for out only; 0 = use --stride_xy",
+    )
+    ap.add_argument(
+        "--out_point_size",
+        type=float,
+        default=0.0,
+        help="Point size for out only; 0 = use --point_size",
+    )
+    ap.add_argument(
+        "--out_max_points",
+        type=int,
+        default=0,
+        help="Max points for out only; 0 = use --max_points",
+    )
+    ap.add_argument("--stride_xy", type=int, default=2, help="Spatial stride for s_raw/n_slow (and out if --out_stride_xy 0)")
     ap.add_argument("--max_points", type=int, default=400_000)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--point_size", type=float, default=0.2)
-    ap.add_argument("--alpha", type=float, default=0.4, help="Marker alpha (default 0.4)")
+    ap.add_argument("--point_size", type=float, default=0.2, help="Marker size for s_raw/n_slow (and out if --out_point_size 0)")
+    ap.add_argument("--alpha", type=float, default=0.4, help="Marker alpha for s_raw/n_slow (default 0.4)")
     ap.add_argument("--cmap", type=str, default="turbo", help="Colormap for continuous values")
     ap.add_argument(
         "--n_slow_vmax",
@@ -231,14 +257,26 @@ def _process_channel(
         use_files = _select_out_files(files, emit=int(args.out_emit))
         slab = int(args.out_slab)
         t_as_index = False  # keep true bin indices → empty gaps along t
+        stride_xy = int(args.out_stride_xy) if int(args.out_stride_xy) > 0 else int(args.stride_xy)
+        point_size = float(args.out_point_size) if float(args.out_point_size) > 0 else float(args.point_size)
+        alpha = float(args.out_alpha)
+        max_points = int(args.out_max_points) if int(args.out_max_points) > 0 else int(args.max_points)
         print(
             f"[{name}] emit={args.out_emit}: {len(files)} bins → {len(use_files)} slices "
-            f"(t gaps show {args.out_emit}× downsample)"
+            f"(t gaps show {args.out_emit}× downsample) "
+            f"alpha={alpha:g} stride_xy={stride_xy} point_size={point_size:g}"
         )
         if use_files:
             print(f"[{name}] slice indices: {use_files[0][0]} … {use_files[-1][0]}")
     else:
-        print(f"[{name}] {len(use_files)} bins, dense along t")
+        stride_xy = int(args.stride_xy)
+        point_size = float(args.point_size)
+        alpha = float(args.alpha)
+        max_points = int(args.max_points)
+        print(
+            f"[{name}] {len(use_files)} bins, dense along t "
+            f"alpha={alpha:g} stride_xy={stride_xy} point_size={point_size:g}"
+        )
 
     if not use_files:
         print(f"[{name}] skip (no frames)")
@@ -246,13 +284,13 @@ def _process_channel(
 
     x, y, t, v = _collect_float_voxels(
         use_files,
-        stride_xy=int(args.stride_xy),
+        stride_xy=stride_xy,
         t_as_index=t_as_index,
         slab=slab,
     )
     n_all = int(x.shape[0])
     x, y, t, v = _subsample(
-        x, y, t, v, max_points=int(args.max_points), seed=int(args.seed)
+        x, y, t, v, max_points=max_points, seed=int(args.seed)
     )
     print(f"[{name}] voxels {n_all:,} → plot {int(x.shape[0]):,}")
 
@@ -294,8 +332,8 @@ def _process_channel(
         cmap=args.cmap,
         vmin=vmin,
         vmax=vmax,
-        s=float(args.point_size),
-        alpha=float(args.alpha),
+        s=float(point_size),
+        alpha=float(alpha),
         linewidths=0,
     )
     if t_lim is not None:
