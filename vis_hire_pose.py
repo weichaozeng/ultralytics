@@ -8,7 +8,8 @@ across chunks (no mid-video reset).
 Inference emit cadence follows ``--chunk_size`` only (one recon + one pose per chunk).
 Train-time ``spad_subsampling`` is not used for how often frames are emitted.
 
-Visualization: skeleton only (no bbox). Each track/detection ID uses one bone color.
+Visualization: neon skeleton + bbox (no ID/conf text). Each track/detection ID
+shares one fluorescent color for bones and box.
 
 Output naming (for ``vis_hire_pose_3d.py``)::
 
@@ -52,23 +53,37 @@ def _load_det_spad_pose():
 
 dsp = _load_det_spad_pose()
 
-# Distinct BGR colors per hand ID (all bones of one hand share one color).
-_ID_COLORS_BGR = [
-    (0, 0, 255),  # red
-    (255, 0, 0),  # blue
-    (0, 200, 0),  # green
-    (0, 220, 255),  # yellow
-    (255, 0, 255),  # magenta
-    (0, 140, 255),  # orange
-    (255, 180, 0),  # cyan-ish
-    (180, 0, 180),  # purple
-    (0, 255, 180),  # spring
-    (80, 80, 255),  # light red
+# Neon / fluorescent BGR palette (high-sat, high-value) — one color per hand ID.
+_NEON_COLORS_BGR = [
+    (0, 255, 255),  # neon yellow
+    (255, 0, 255),  # neon magenta / hot pink
+    (0, 255, 80),  # neon lime
+    (255, 255, 0),  # neon cyan
+    (0, 128, 255),  # neon orange
+    (255, 0, 180),  # electric violet
+    (60, 255, 0),  # chartreuse
+    (255, 80, 80),  # neon blue
+    (0, 60, 255),  # fluorescent red-orange
+    (180, 255, 0),  # aqua-lime
 ]
 
 
 def _id_color_bgr(track_id: int) -> tuple[int, int, int]:
-    return _ID_COLORS_BGR[int(track_id) % len(_ID_COLORS_BGR)]
+    return _NEON_COLORS_BGR[int(track_id) % len(_NEON_COLORS_BGR)]
+
+
+def _draw_bbox_neon(
+    img_bgr: np.ndarray,
+    box_xyxy: np.ndarray,
+    color: tuple[int, int, int],
+    *,
+    thickness: int = 3,
+) -> np.ndarray:
+    """Draw bbox only (no ID / conf text), with dark outline for contrast."""
+    x1, y1, x2, y2 = map(int, box_xyxy[:4])
+    cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 0, 0), thickness + 2, lineType=cv2.LINE_AA)
+    cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, thickness, lineType=cv2.LINE_AA)
+    return img_bgr
 
 
 def _draw_pose_id(
@@ -78,29 +93,29 @@ def _draw_pose_id(
     color: tuple[int, int, int],
     thresh: float = 0.5,
     k: int = 21,
-    thickness: int = 3,
+    thickness: int = 4,
 ) -> np.ndarray:
-    """Draw one hand skeleton with a single color for all bones/joints."""
+    """Draw one hand skeleton in a single neon color (dark outline + bright fill)."""
     if pose_kpts.shape != (k, 3):
         raise ValueError(f"Pose shape must be ({k}, 3), but got {pose_kpts.shape}")
 
+    outline = (0, 0, 0)
     for s, e in dsp.BONE_CONNECTIONS:
         ks = pose_kpts[s]
         ke = pose_kpts[e]
         if ks[2] > thresh and ke[2] > thresh:
-            cv2.line(
-                img_bgr,
-                (int(ks[0]), int(ks[1])),
-                (int(ke[0]), int(ke[1])),
-                color,
-                thickness,
-            )
+            p0 = (int(ks[0]), int(ks[1]))
+            p1 = (int(ke[0]), int(ke[1]))
+            cv2.line(img_bgr, p0, p1, outline, thickness + 3, lineType=cv2.LINE_AA)
+            cv2.line(img_bgr, p0, p1, color, thickness, lineType=cv2.LINE_AA)
 
     for i in range(k):
         kk = pose_kpts[i]
         if kk[2] > thresh:
-            radius = 6 if i == 0 else 4
-            cv2.circle(img_bgr, (int(kk[0]), int(kk[1])), radius, color, -1)
+            center = (int(kk[0]), int(kk[1]))
+            r = 7 if i == 0 else 5
+            cv2.circle(img_bgr, center, r + 2, outline, -1, lineType=cv2.LINE_AA)
+            cv2.circle(img_bgr, center, r, color, -1, lineType=cv2.LINE_AA)
 
     return img_bgr
 
@@ -360,15 +375,16 @@ def main() -> None:
                         if track_ids is None:
                             track_ids = torch.arange(len(result.boxes), device=result.boxes.data.device)
                         track_id = track_ids.cpu().numpy()
+                        boxes = result.boxes.xyxy.cpu().numpy()
                         poses = None
                         if getattr(result, "keypoints", None) is not None:
                             poses = result.keypoints.data.cpu().numpy()
 
-                        if poses is not None:
-                            for j, tid in enumerate(track_id):
-                                if j >= len(poses):
-                                    break
-                                color = _id_color_bgr(int(tid))
+                        for j, tid in enumerate(track_id):
+                            color = _id_color_bgr(int(tid))
+                            if j < len(boxes):
+                                vis = _draw_bbox_neon(vis, boxes[j], color)
+                            if poses is not None and j < len(poses):
                                 vis = _draw_pose_id(
                                     vis,
                                     poses[j],
