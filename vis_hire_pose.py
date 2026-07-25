@@ -18,7 +18,8 @@ Output naming (for ``vis_hire_pose_3d.py``)::
 Trail composite (``--trail_composite``)::
     one transparent RGBA PNG over ``[--start_bin, --end_bin)``; pose only (no
     boxes). Color lightness is pre-scheduled from light→dark by bin range /
-    chunk_size; stroke alpha is always 1.
+    chunk_size; stroke alpha is always 1. Use ``--trail_poses N`` to keep only
+    N uniformly spaced poses from the full trail (less overlap).
 
 Examples
 --------
@@ -107,8 +108,9 @@ def _draw_pose_id(
     thresh: float = 0.5,
     k: int = 21,
     thickness: int = 4,
+    draw_outline: bool = True,
 ) -> np.ndarray:
-    """Draw one hand skeleton in a single neon color (dark outline + bright fill)."""
+    """Draw one hand skeleton in a single neon color (optional dark outline)."""
     if pose_kpts.shape != (k, 3):
         raise ValueError(f"Pose shape must be ({k}, 3), but got {pose_kpts.shape}")
 
@@ -119,7 +121,8 @@ def _draw_pose_id(
         if ks[2] > thresh and ke[2] > thresh:
             p0 = (int(ks[0]), int(ks[1]))
             p1 = (int(ke[0]), int(ke[1]))
-            cv2.line(img_bgr, p0, p1, outline, thickness + 3, lineType=cv2.LINE_AA)
+            if draw_outline:
+                cv2.line(img_bgr, p0, p1, outline, thickness + 3, lineType=cv2.LINE_AA)
             cv2.line(img_bgr, p0, p1, color, thickness, lineType=cv2.LINE_AA)
 
     for i in range(k):
@@ -127,7 +130,8 @@ def _draw_pose_id(
         if kk[2] > thresh:
             center = (int(kk[0]), int(kk[1]))
             r = 7 if i == 0 else 5
-            cv2.circle(img_bgr, center, r + 2, outline, -1, lineType=cv2.LINE_AA)
+            if draw_outline:
+                cv2.circle(img_bgr, center, r + 2, outline, -1, lineType=cv2.LINE_AA)
             cv2.circle(img_bgr, center, r, color, -1, lineType=cv2.LINE_AA)
 
     return img_bgr
@@ -139,6 +143,8 @@ def _draw_result_poses(
     *,
     kpt_thresh: float,
     draw_boxes: bool = True,
+    draw_outline: bool = True,
+    bone_thickness: int = 4,
     color_for_id=None,
 ) -> np.ndarray:
     """Draw skeletons (and optional boxes) from one Ultralytics result onto ``img_bgr``.
@@ -168,6 +174,8 @@ def _draw_result_poses(
                 poses[j],
                 color=color,
                 thresh=float(kpt_thresh),
+                thickness=int(bone_thickness),
+                draw_outline=bool(draw_outline),
             )
     return img_bgr
 
@@ -175,17 +183,21 @@ def _draw_result_poses(
 def _composite_layer_rgba(
     canvas_rgba: np.ndarray,
     layer_bgr: np.ndarray,
+    layer_alpha: np.ndarray | None = None,
     *,
     opacity: float = 1.0,
 ) -> None:
-    """Alpha-composite a BGR drawing layer onto float RGBA canvas in-place.
-
-    Coverage is inferred from drawn intensity so anti-aliased strokes keep soft edges.
-    """
+    """Alpha-composite a BGR(+optional A) drawing layer onto float RGBA canvas in-place."""
     opacity = float(np.clip(opacity, 0.0, 1.0))
     if opacity <= 0.0:
         return
-    cov = layer_bgr.max(axis=2).astype(np.float32) / 255.0
+    if layer_alpha is not None:
+        cov = np.clip(layer_alpha.astype(np.float32) / 255.0, 0.0, 1.0)
+    else:
+        # Prefer explicit coverage; fall back to any-channel intensity (not max-only,
+        # so dark-but-nonzero strokes still survive).
+        cov = np.clip(layer_bgr.astype(np.float32).sum(axis=2) / (3.0 * 255.0), 0.0, 1.0)
+        cov = np.where(layer_bgr.max(axis=2) > 0, np.maximum(cov, 1.0), 0.0)
     if float(cov.max()) <= 0.0:
         return
     src_a = cov * opacity
@@ -199,6 +211,34 @@ def _composite_layer_rgba(
             0.0,
         )
     canvas_rgba[:, :, 3] = out_a
+
+
+def _draw_trail_pose_layer(
+    result,
+    *,
+    hw: tuple[int, int],
+    kpt_thresh: float,
+    color_for_id,
+    bone_thickness: int = 5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Render pose-only (no boxes/outline) to BGR + binary-ish alpha coverage."""
+    h, w = hw
+    layer = np.zeros((h, w, 3), dtype=np.uint8)
+    layer = _draw_result_poses(
+        layer,
+        result,
+        kpt_thresh=float(kpt_thresh),
+        draw_boxes=False,
+        draw_outline=False,
+        bone_thickness=int(bone_thickness),
+        color_for_id=color_for_id,
+    )
+    alpha = np.where(layer.max(axis=2) > 0, 255, 0).astype(np.uint8)
+    # Soften AA: keep fractional coverage from color intensity on drawn pixels.
+    soft = layer.max(axis=2).astype(np.float32)
+    soft = np.clip(soft / np.maximum(soft.max(), 1.0) * 255.0, 0, 255)
+    alpha = np.maximum(alpha, soft.astype(np.uint8))
+    return layer, alpha
 
 
 def _planned_trail_steps(
@@ -241,6 +281,33 @@ def _shade_bgr(
     dark = base * deep
     color = (1.0 - shade) * light + shade * dark
     return tuple(int(np.clip(round(v), 0, 255)) for v in color)
+
+
+def _uniform_sample_indices(n_total: int, n_keep: int) -> list[int]:
+    """Evenly spaced indices in ``[0, n_total)``, always preferring endpoints when possible."""
+    n_total = int(n_total)
+    n_keep = int(n_keep)
+    if n_total <= 0:
+        return []
+    if n_keep <= 0 or n_keep >= n_total:
+        return list(range(n_total))
+    if n_keep == 1:
+        return [n_total - 1]
+    raw = np.linspace(0, n_total - 1, num=n_keep)
+    idxs = [int(round(float(x))) for x in raw]
+    out: list[int] = []
+    for i in idxs:
+        i = int(np.clip(i, 0, n_total - 1))
+        if not out or i != out[-1]:
+            out.append(i)
+    # If rounding collapsed duplicates, fall back to floor spacing including endpoints.
+    if len(out) < n_keep:
+        out = [
+            int(round(i * (n_total - 1) / float(n_keep - 1)))
+            for i in range(n_keep)
+        ]
+        out = sorted(set(out))
+    return out
 
 
 def _parse_args() -> argparse.Namespace:
@@ -314,6 +381,13 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.40,
         help="Brightness scale of the latest trail pose relative to neon base (0–1).",
+    )
+    ap.add_argument(
+        "--trail_poses",
+        type=int,
+        default=0,
+        help="Uniformly keep this many poses from the full trail for drawing "
+        "(0 = keep all). Inference still runs on every chunk for streaming state.",
     )
     ap.add_argument(
         "--trail_name",
@@ -458,7 +532,8 @@ def main() -> None:
         )
 
     mode_desc = (
-        f"trail_composite pose-only light→dark (pale={trail_pale:g}, deep={trail_deep:g}, alpha=1)"
+        f"trail_composite pose-only light→dark (pale={trail_pale:g}, deep={trail_deep:g}, "
+        f"alpha=1, trail_poses={int(args.trail_poses) or 'all'})"
         if trail_mode
         else "pose-only per-frame, 1 color / ID"
     )
@@ -590,15 +665,14 @@ def main() -> None:
                         raise ValueError(
                             f"Trail frame size changed from {trail_hw} to {(h, w)} at bins [{t0},{t1})"
                         )
-                    layer = np.zeros((h, w, 3), dtype=np.uint8)
-                    layer = _draw_result_poses(
-                        layer,
+                    layer, layer_a = _draw_trail_pose_layer(
                         result,
+                        hw=(h, w),
                         kpt_thresh=float(args.kpt_thresh),
-                        draw_boxes=False,
                         color_for_id=_trail_color_for_id,
+                        bone_thickness=5,
                     )
-                    trail_layers.append(layer)
+                    trail_layers.append((layer, layer_a))
                     global_frame_idx += 1
                     chunk_i += 1
                     print(
@@ -645,10 +719,14 @@ def main() -> None:
             if not trail_layers or trail_hw is None:
                 print(f"Warning: video {video_idx}: no trail layers in [{t_begin},{t_end})")
                 continue
+            n_all = len(trail_layers)
+            keep_n = int(args.trail_poses)
+            keep_idxs = _uniform_sample_indices(n_all, keep_n)
+            selected = [trail_layers[i] for i in keep_idxs]
             h, w = trail_hw
             canvas = np.zeros((h, w, 4), dtype=np.float32)
-            for layer in trail_layers:
-                _composite_layer_rgba(canvas, layer, opacity=1.0)
+            for layer, layer_a in selected:
+                _composite_layer_rgba(canvas, layer, layer_a, opacity=1.0)
             out_u8 = np.clip(np.round(canvas * 255.0), 0, 255).astype(np.uint8)
             if str(args.trail_name).strip():
                 trail_name = str(args.trail_name).strip()
@@ -661,7 +739,8 @@ def main() -> None:
             trail_path = out_dir / trail_name
             cv2.imwrite(str(trail_path), out_u8)
             print(
-                f"  trail → {trail_path} ({len(trail_layers)} poses, RGBA, alpha=1)",
+                f"  trail → {trail_path} "
+                f"(drew {len(selected)}/{n_all} poses, idxs={keep_idxs}, RGBA, alpha=1)",
                 flush=True,
             )
 
