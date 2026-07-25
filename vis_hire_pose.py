@@ -15,6 +15,10 @@ Output naming (for ``vis_hire_pose_3d.py``)::
 
     {save_dir}/{sample}/cubeXXXXX_tTTTTTT_TTTTTT_frameFFFFFFF.png
 
+Trail composite (``--trail_composite``)::
+    one transparent RGBA PNG over ``[--start_bin, --end_bin)``; earlier poses are
+    more transparent, later poses more opaque (fade trail).
+
 Examples
 --------
 python ultralytics/vis_hire_pose.py \\
@@ -23,6 +27,14 @@ python ultralytics/vis_hire_pose.py \\
   --save_dir /tmp/hire_pose \\
   --chunk_size 320 \\
   --start_bin 960
+
+python ultralytics/vis_hire_pose.py \\
+  --in_path /path/to/frames.npy \\
+  --ckpt /path/to/last.pt \\
+  --save_dir /tmp/hire_pose \\
+  --trail_composite \\
+  --start_bin 960 --end_bin 3200 \\
+  --chunk_size 320
 """
 
 from __future__ import annotations
@@ -120,6 +132,75 @@ def _draw_pose_id(
     return img_bgr
 
 
+def _draw_result_poses(
+    img_bgr: np.ndarray,
+    result,
+    *,
+    kpt_thresh: float,
+) -> np.ndarray:
+    """Draw all boxes + skeletons from one Ultralytics result onto ``img_bgr``."""
+    if result.boxes is None or len(result.boxes) == 0:
+        return img_bgr
+    track_ids = result.boxes.id
+    if track_ids is None:
+        track_ids = torch.arange(len(result.boxes), device=result.boxes.data.device)
+    track_id = track_ids.cpu().numpy()
+    boxes = result.boxes.xyxy.cpu().numpy()
+    poses = None
+    if getattr(result, "keypoints", None) is not None:
+        poses = result.keypoints.data.cpu().numpy()
+    for j, tid in enumerate(track_id):
+        color = _id_color_bgr(int(tid))
+        if j < len(boxes):
+            img_bgr = _draw_bbox_neon(img_bgr, boxes[j], color)
+        if poses is not None and j < len(poses):
+            img_bgr = _draw_pose_id(
+                img_bgr,
+                poses[j],
+                color=color,
+                thresh=float(kpt_thresh),
+            )
+    return img_bgr
+
+
+def _composite_layer_rgba(
+    canvas_rgba: np.ndarray,
+    layer_bgr: np.ndarray,
+    *,
+    opacity: float,
+) -> None:
+    """Alpha-composite a BGR drawing layer onto float RGBA canvas in-place.
+
+    Coverage is inferred from drawn intensity so anti-aliased strokes fade smoothly.
+    ``opacity`` in [0, 1]: early frames should use smaller values (more transparent).
+    """
+    opacity = float(np.clip(opacity, 0.0, 1.0))
+    if opacity <= 0.0:
+        return
+    cov = layer_bgr.max(axis=2).astype(np.float32) / 255.0
+    if float(cov.max()) <= 0.0:
+        return
+    src_a = cov * opacity
+    src_rgb = layer_bgr.astype(np.float32) / 255.0
+    dst_a = canvas_rgba[:, :, 3]
+    out_a = src_a + dst_a * (1.0 - src_a)
+    for c in range(3):
+        canvas_rgba[:, :, c] = np.where(
+            out_a > 1e-8,
+            (src_rgb[:, :, c] * src_a + canvas_rgba[:, :, c] * dst_a * (1.0 - src_a)) / np.maximum(out_a, 1e-8),
+            0.0,
+        )
+    canvas_rgba[:, :, 3] = out_a
+
+
+def _trail_opacity(frame_i: int, n_frames: int, alpha_min: float, alpha_max: float) -> float:
+    """Earlier ``t`` → lower opacity (higher transparency); later ``t`` → higher opacity."""
+    if n_frames <= 1:
+        return float(alpha_max)
+    t = float(frame_i) / float(n_frames - 1)
+    return float(alpha_min + (alpha_max - alpha_min) * t)
+
+
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="HIRE chunk pose-only viz (one color per hand ID)")
     ap.add_argument("--in_path", type=Path, required=True, help="frames.npy or dir with frames.npy")
@@ -153,13 +234,43 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Start streaming from this raw SPAD bin index (e.g. 960).",
     )
+    ap.add_argument(
+        "--end_bin",
+        type=int,
+        default=0,
+        help="Stop before this raw bin (exclusive). 0 = end of video. Used by --trail_composite.",
+    )
     ap.add_argument("--tail_pad", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument(
         "--vis_bg",
         type=str,
         default="recon",
         choices=["sum", "recon", "black"],
-        help="Background under the skeleton (default recon)",
+        help="Background under the skeleton (default recon). Ignored by --trail_composite.",
+    )
+    ap.add_argument(
+        "--trail_composite",
+        action="store_true",
+        help="Composite poses in [--start_bin,--end_bin) onto one transparent RGBA PNG "
+        "(no per-frame outputs). Opacity rises with t (early more transparent).",
+    )
+    ap.add_argument(
+        "--trail_alpha_min",
+        type=float,
+        default=0.12,
+        help="Opacity of the earliest pose in trail mode (0–1).",
+    )
+    ap.add_argument(
+        "--trail_alpha_max",
+        type=float,
+        default=1.0,
+        help="Opacity of the latest pose in trail mode (0–1).",
+    )
+    ap.add_argument(
+        "--trail_name",
+        type=str,
+        default="",
+        help="Optional output filename under sample dir (default: trail_tSTART_END.png).",
     )
     ap.add_argument("--kpt_thresh", type=float, default=0.5)
     ap.add_argument(
@@ -271,6 +382,15 @@ def main() -> None:
     stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else chunk_t
 
     t_begin = max(0, int(args.start_bin))
+    t_end_arg = int(args.end_bin)
+    trail_mode = bool(args.trail_composite)
+    alpha_min = float(args.trail_alpha_min)
+    alpha_max = float(args.trail_alpha_max)
+    if trail_mode and not (0.0 <= alpha_min <= alpha_max <= 1.0):
+        raise ValueError(
+            f"Need 0 <= trail_alpha_min <= trail_alpha_max <= 1, "
+            f"got min={alpha_min}, max={alpha_max}"
+        )
 
     tracker = None
     if args.tracker != "none":
@@ -286,16 +406,24 @@ def main() -> None:
             "streaming will double-count overlapping bins. Prefer stride == chunk_size."
         )
 
+    mode_desc = (
+        f"trail_composite RGBA opacity[{alpha_min:g}→{alpha_max:g}]"
+        if trail_mode
+        else "pose-only per-frame, 1 color / ID"
+    )
     print(
         f"ckpt={args.ckpt} device={device} pre={getattr(spad_model, 'preprocessor_name', '?')} "
         f"chunk={chunk_t} stride={stride} bins={dsp._video_num_bins(sources[0])} "
-        f"start_bin={t_begin} | pose-only, 1 color / ID"
+        f"start_bin={t_begin} end_bin={t_end_arg or 'EOF'} | {mode_desc}"
     )
     print(f"save → {out_dir}")
 
     global_frame_idx = 0
     for video_idx, source in enumerate(sources):
         total_bins = dsp._video_num_bins(source)
+        t_end = total_bins if t_end_arg <= 0 else min(total_bins, t_end_arg)
+        if t_begin >= t_end:
+            raise ValueError(f"Empty bin range: start_bin={t_begin} end_bin={t_end}")
         if tracker is not None:
             tracker.reset()
 
@@ -306,12 +434,16 @@ def main() -> None:
             spad_model.spad_set_online_inference(True)
             spad_model.spad_clear_plugin_states()
 
+        trail_layers: list[np.ndarray] = []
+        trail_hw: tuple[int, int] | None = None
         chunk_i = 0
         try:
-            for t0 in range(t_begin, total_bins, stride):
+            for t0 in range(t_begin, t_end, stride):
                 if int(args.max_chunks) > 0 and chunk_i >= int(args.max_chunks):
                     break
-                t1 = min(total_bins, t0 + chunk_t)
+                t1 = min(t_end, t0 + chunk_t)
+                if t1 <= t0:
+                    break
                 raw_chunk = dsp._slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
                 # Do not pad short tails when streaming — fake repeated bins would pollute state.
                 pad_tail = bool(args.tail_pad) and (t1 >= total_bins)
@@ -350,7 +482,7 @@ def main() -> None:
                 )
 
                 bg_bgr = None
-                if args.vis_bg == "sum":
+                if (not trail_mode) and args.vis_bg == "sum":
                     bg_bgr = dsp._raw_sum_bgr(raw_chunk, packed_nch=source.packed_nch)
 
                 saved_stem = None
@@ -363,6 +495,21 @@ def main() -> None:
                         if getattr(result, "orig_img", None) is not None
                         else np.zeros((512, 512, 3), dtype=np.uint8)
                     )
+                    h, w = recon.shape[:2]
+                    if trail_mode:
+                        if trail_hw is None:
+                            trail_hw = (h, w)
+                        elif trail_hw != (h, w):
+                            raise ValueError(
+                                f"Trail frame size changed from {trail_hw} to {(h, w)} at bins [{t0},{t1})"
+                            )
+                        layer = np.zeros((h, w, 3), dtype=np.uint8)
+                        layer = _draw_result_poses(layer, result, kpt_thresh=float(args.kpt_thresh))
+                        trail_layers.append(layer)
+                        global_frame_idx += 1
+                        saved_stem = f"trail_accum_t{t0:06d}_{t1:06d}"
+                        continue
+
                     if args.vis_bg == "black":
                         vis = np.zeros_like(recon)
                     elif args.vis_bg == "recon":
@@ -370,27 +517,7 @@ def main() -> None:
                     else:
                         vis = bg_bgr.copy() if bg_bgr is not None else np.zeros_like(recon)
 
-                    if result.boxes is not None and len(result.boxes):
-                        track_ids = result.boxes.id
-                        if track_ids is None:
-                            track_ids = torch.arange(len(result.boxes), device=result.boxes.data.device)
-                        track_id = track_ids.cpu().numpy()
-                        boxes = result.boxes.xyxy.cpu().numpy()
-                        poses = None
-                        if getattr(result, "keypoints", None) is not None:
-                            poses = result.keypoints.data.cpu().numpy()
-
-                        for j, tid in enumerate(track_id):
-                            color = _id_color_bgr(int(tid))
-                            if j < len(boxes):
-                                vis = _draw_bbox_neon(vis, boxes[j], color)
-                            if poses is not None and j < len(poses):
-                                vis = _draw_pose_id(
-                                    vis,
-                                    poses[j],
-                                    color=color,
-                                    thresh=float(args.kpt_thresh),
-                                )
+                    vis = _draw_result_poses(vis, result, kpt_thresh=float(args.kpt_thresh))
 
                     saved_stem = f"cube{video_idx:05d}_t{t0:06d}_{t1:06d}_frame{global_frame_idx:07d}"
                     cv2.imwrite(str(out_dir / f"{saved_stem}.png"), vis)
@@ -398,16 +525,49 @@ def main() -> None:
 
                 chunk_i += 1
                 if saved_stem is not None:
-                    print(
-                        f"  [{t0:06d},{t1:06d}) → {saved_stem}.png "
-                        f"(chunk {chunk_i}, frame {global_frame_idx - 1})",
-                        flush=True,
-                    )
+                    if trail_mode:
+                        print(
+                            f"  [{t0:06d},{t1:06d}) → trail layer {len(trail_layers)} "
+                            f"(chunk {chunk_i})",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"  [{t0:06d},{t1:06d}) → {saved_stem}.png "
+                            f"(chunk {chunk_i}, frame {global_frame_idx - 1})",
+                            flush=True,
+                        )
         finally:
             if hasattr(spad_model, "spad_end_stream"):
                 spad_model.spad_end_stream()
 
-    print(f"Done. Wrote {global_frame_idx} pose frames → {out_dir}")
+        if trail_mode:
+            if not trail_layers or trail_hw is None:
+                print(f"Warning: video {video_idx}: no trail layers in [{t_begin},{t_end})")
+                continue
+            h, w = trail_hw
+            canvas = np.zeros((h, w, 4), dtype=np.float32)
+            n = len(trail_layers)
+            for i, layer in enumerate(trail_layers):
+                opacity = _trail_opacity(i, n, alpha_min, alpha_max)
+                _composite_layer_rgba(canvas, layer, opacity=opacity)
+            out_u8 = np.clip(np.round(canvas * 255.0), 0, 255).astype(np.uint8)
+            if str(args.trail_name).strip():
+                trail_name = str(args.trail_name).strip()
+                if not trail_name.lower().endswith(".png"):
+                    trail_name = f"{trail_name}.png"
+            else:
+                trail_name = f"trail_t{t_begin:06d}_{t_end:06d}.png"
+            if len(sources) > 1:
+                trail_name = f"cube{video_idx:05d}_{trail_name}"
+            trail_path = out_dir / trail_name
+            cv2.imwrite(str(trail_path), out_u8)
+            print(f"  trail → {trail_path} ({n} poses, RGBA)", flush=True)
+
+    if trail_mode:
+        print(f"Done. Trail composite from {global_frame_idx} poses → {out_dir}")
+    else:
+        print(f"Done. Wrote {global_frame_idx} pose frames → {out_dir}")
 
 
 if __name__ == "__main__":
