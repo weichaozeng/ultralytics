@@ -249,6 +249,13 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--save_dir", type=Path, required=True)
     ap.add_argument("--ckpt", type=Path, required=True, help="Trained SpadPoseModel .pt")
     ap.add_argument("--device", type=str, default="")
+    ap.add_argument(
+        "--imgsz",
+        type=int,
+        default=512,
+        help="Letterbox recon frames to this square size for the detector (matches train). "
+        "0 = native resolution (may break FPN if H/W not divisible by stride).",
+    )
     ap.add_argument("--det_thresh", type=float, default=0.4)
     ap.add_argument("--iou", type=float, default=0.7)
     ap.add_argument("--max_det", type=int, default=20)
@@ -401,6 +408,9 @@ def main() -> None:
     spad_model.to(device)
     spad_model.eval()
     dsp._configure_model_spad_bin_rate(spad_model, current_bin_rate_hz=float(args.spad_bin_rate_hz))
+    spad_model.spad_detect_imgsz = int(args.imgsz)
+    if int(args.imgsz) > 0:
+        print(f"Detector letterbox imgsz={int(args.imgsz)} (preds scaled back to native recon)")
 
     names = yolo.names
     kpt_shape = getattr(spad_model, "kpt_shape", (21, 3))
@@ -522,6 +532,11 @@ def main() -> None:
                         iou=args.iou,
                         nc=len(names),
                         max_det=args.max_det,
+                        kpt_shape=kpt_shape,
+                    )
+                    preds = dsp._scale_pose_preds_to_native(
+                        preds,
+                        scale_meta=getattr(spad_model, "spad_scale_meta", None),
                         kpt_shape=kpt_shape,
                     )
                     recon_frames_bgr = dsp._recon_frames_bgr(spad_model, batch_index=0)
