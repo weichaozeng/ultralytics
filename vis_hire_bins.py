@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export per-bin HIRE maps (i_out, s_raw, n_slow) from ``frames.npy``.
+"""Export per-bin HIRE maps (i_out, i_fast, i_slow, s_raw, n_slow) from ``frames.npy``.
 
 Runs HIRE causally with ``subsampling=1`` (one update per SPAD bin) and writes
 ``--num`` bins starting at ``--start`` (optional ``--stride``).
@@ -7,6 +7,8 @@ Runs HIRE causally with ``subsampling=1`` (one update per SPAD bin) and writes
 Layout
 ------
 ``{save_dir}/out/bin_XXXXXXX.npy``
+``{save_dir}/i_fast/bin_XXXXXXX.npy``
+``{save_dir}/i_slow/bin_XXXXXXX.npy``
 ``{save_dir}/s_raw/bin_XXXXXXX.npy``
 ``{save_dir}/n_slow/bin_XXXXXXX.npy``
 
@@ -45,7 +47,7 @@ from ultralytics.quanta_hire_networks.integrator import HIRE
 
 
 def _parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Save per-bin HIRE out / s_raw / n_slow maps")
+    ap = argparse.ArgumentParser(description="Save per-bin HIRE out / i_fast / i_slow / s_raw / n_slow maps")
     ap.add_argument("--in_path", type=Path, required=True, help="frames.npy or dir containing it")
     ap.add_argument("--save_dir", type=Path, required=True)
     ap.add_argument("--num", type=int, required=True, help="Number of bins to save")
@@ -64,7 +66,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--png",
         action="store_true",
-        help="Also write PNG previews (out: gray; s_raw/n_slow: turbo)",
+        help="Also write PNG previews (out/i_fast/i_slow: gray; s_raw/n_slow: turbo)",
     )
     ap.add_argument("--prefix", type=str, default="bin")
 
@@ -198,7 +200,7 @@ def _save_map(
     np.save(out_dir / f"{stem}.npy", arr.astype(np.float32, copy=False))
     if not write_png:
         return
-    if kind == "out":
+    if kind in {"out", "i_fast", "i_slow"}:
         vis = np.clip(arr, 0.0, 1.0)
         peak = float(np.nanmax(vis)) if vis.size else 0.0
         if peak > 1.5:
@@ -255,6 +257,8 @@ def _run_bins(
 
     dirs = {
         "out": save_dir / "out",
+        "i_fast": save_dir / "i_fast",
+        "i_slow": save_dir / "i_slow",
         "s_raw": save_dir / "s_raw",
         "n_slow": save_dir / "n_slow",
     }
@@ -312,10 +316,18 @@ def _run_bins(
             )
 
         if abs_t in save_abs:
-            assert i_out is not None and s_raw is not None and n_slow is not None
+            assert (
+                i_out is not None
+                and i_fast is not None
+                and i_slow is not None
+                and s_raw is not None
+                and n_slow is not None
+            )
             stem = f"{prefix}_{abs_t:07d}"
             cap = float(hire.slow_bins)
             _save_map(dirs["out"], stem, _to_npy(i_out), write_png=write_png, kind="out", n_slow_cap=cap)
+            _save_map(dirs["i_fast"], stem, _to_npy(i_fast), write_png=write_png, kind="i_fast", n_slow_cap=cap)
+            _save_map(dirs["i_slow"], stem, _to_npy(i_slow), write_png=write_png, kind="i_slow", n_slow_cap=cap)
             _save_map(dirs["s_raw"], stem, _to_npy(s_raw), write_png=write_png, kind="s_raw", n_slow_cap=cap)
             _save_map(dirs["n_slow"], stem, _to_npy(n_slow), write_png=write_png, kind="n_slow", n_slow_cap=cap)
             n_saved += 1
@@ -397,7 +409,7 @@ def main() -> None:
         t = t1
         print(f"  … processed through bin {t1 - 1} (saved {n_saved}/{len(save_indices)})", flush=True)
 
-    print(f"Done. Wrote {n_saved} × {{out,s_raw,n_slow}} → {args.save_dir}")
+    print(f"Done. Wrote {n_saved} × {{out,i_fast,i_slow,s_raw,n_slow}} → {args.save_dir}")
 
 
 if __name__ == "__main__":
