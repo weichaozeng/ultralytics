@@ -100,6 +100,31 @@ def _draw_bbox_neon(
     return img_bgr
 
 
+def _pose_draw_scales(
+    pose_kpts: np.ndarray,
+    *,
+    thresh: float,
+    trail_style: bool,
+) -> tuple[int, int, int]:
+    """Return ``(bone_thickness, wrist_radius, joint_radius)`` from hand extent."""
+    vis = pose_kpts[:, 2] > float(thresh)
+    if not np.any(vis):
+        return (2, 3, 2) if trail_style else (4, 7, 5)
+    pts = pose_kpts[vis, :2].astype(np.float32)
+    span = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+    span = max(span, 1.0)
+    if trail_style:
+        # Thin stick figure so stacked trail poses stay readable.
+        bone = int(np.clip(round(span * 0.035), 1, 3))
+        joint = int(np.clip(round(span * 0.025), 1, 2))
+        wrist = max(joint + 1, 2)
+        return bone, wrist, joint
+    bone = int(np.clip(round(span * 0.06), 2, 6))
+    joint = int(np.clip(round(span * 0.045), 3, 6))
+    wrist = joint + 2
+    return bone, wrist, joint
+
+
 def _draw_pose_id(
     img_bgr: np.ndarray,
     pose_kpts: np.ndarray,
@@ -107,12 +132,17 @@ def _draw_pose_id(
     color: tuple[int, int, int],
     thresh: float = 0.5,
     k: int = 21,
-    thickness: int = 4,
+    thickness: int | None = None,
     draw_outline: bool = True,
+    trail_style: bool = False,
 ) -> np.ndarray:
     """Draw one hand skeleton in a single neon color (optional dark outline)."""
     if pose_kpts.shape != (k, 3):
         raise ValueError(f"Pose shape must be ({k}, 3), but got {pose_kpts.shape}")
+
+    bone_th, wrist_r, joint_r = _pose_draw_scales(pose_kpts, thresh=thresh, trail_style=trail_style)
+    if thickness is not None:
+        bone_th = int(thickness)
 
     outline = (0, 0, 0)
     for s, e in dsp.BONE_CONNECTIONS:
@@ -122,16 +152,16 @@ def _draw_pose_id(
             p0 = (int(ks[0]), int(ks[1]))
             p1 = (int(ke[0]), int(ke[1]))
             if draw_outline:
-                cv2.line(img_bgr, p0, p1, outline, thickness + 3, lineType=cv2.LINE_AA)
-            cv2.line(img_bgr, p0, p1, color, thickness, lineType=cv2.LINE_AA)
+                cv2.line(img_bgr, p0, p1, outline, bone_th + 2, lineType=cv2.LINE_AA)
+            cv2.line(img_bgr, p0, p1, color, bone_th, lineType=cv2.LINE_AA)
 
     for i in range(k):
         kk = pose_kpts[i]
         if kk[2] > thresh:
             center = (int(kk[0]), int(kk[1]))
-            r = 7 if i == 0 else 5
+            r = wrist_r if i == 0 else joint_r
             if draw_outline:
-                cv2.circle(img_bgr, center, r + 2, outline, -1, lineType=cv2.LINE_AA)
+                cv2.circle(img_bgr, center, r + 1, outline, -1, lineType=cv2.LINE_AA)
             cv2.circle(img_bgr, center, r, color, -1, lineType=cv2.LINE_AA)
 
     return img_bgr
@@ -144,7 +174,8 @@ def _draw_result_poses(
     kpt_thresh: float,
     draw_boxes: bool = True,
     draw_outline: bool = True,
-    bone_thickness: int = 4,
+    bone_thickness: int | None = None,
+    trail_style: bool = False,
     color_for_id=None,
 ) -> np.ndarray:
     """Draw skeletons (and optional boxes) from one Ultralytics result onto ``img_bgr``.
@@ -174,8 +205,9 @@ def _draw_result_poses(
                 poses[j],
                 color=color,
                 thresh=float(kpt_thresh),
-                thickness=int(bone_thickness),
+                thickness=bone_thickness,
                 draw_outline=bool(draw_outline),
+                trail_style=bool(trail_style),
             )
     return img_bgr
 
@@ -219,9 +251,8 @@ def _draw_trail_pose_layer(
     hw: tuple[int, int],
     kpt_thresh: float,
     color_for_id,
-    bone_thickness: int = 5,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Render pose-only (no boxes/outline) to BGR + binary-ish alpha coverage."""
+    """Render thin pose-only stick figures (no boxes/outline) for trail compositing."""
     h, w = hw
     layer = np.zeros((h, w, 3), dtype=np.uint8)
     layer = _draw_result_poses(
@@ -230,14 +261,11 @@ def _draw_trail_pose_layer(
         kpt_thresh=float(kpt_thresh),
         draw_boxes=False,
         draw_outline=False,
-        bone_thickness=int(bone_thickness),
+        bone_thickness=None,
+        trail_style=True,
         color_for_id=color_for_id,
     )
     alpha = np.where(layer.max(axis=2) > 0, 255, 0).astype(np.uint8)
-    # Soften AA: keep fractional coverage from color intensity on drawn pixels.
-    soft = layer.max(axis=2).astype(np.float32)
-    soft = np.clip(soft / np.maximum(soft.max(), 1.0) * 255.0, 0, 255)
-    alpha = np.maximum(alpha, soft.astype(np.uint8))
     return layer, alpha
 
 
@@ -670,7 +698,6 @@ def main() -> None:
                         hw=(h, w),
                         kpt_thresh=float(args.kpt_thresh),
                         color_for_id=_trail_color_for_id,
-                        bone_thickness=5,
                     )
                     trail_layers.append((layer, layer_a))
                     global_frame_idx += 1
