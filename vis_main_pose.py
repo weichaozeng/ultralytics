@@ -23,7 +23,9 @@ python ultralytics/vis_main_pose.py \\
   --save_dir /tmp/main_pose \\
   --detector_ckpt /path/detector.pt \\
   --qnn_ckpt /path/qnn_ssd.pt \\
-  --hire_ckpt /path/hire_ssd.pt
+  --hire_ckpt /path/hire_ssd.pt \\
+  --qnn_pre_override ppb --ppb_bocpd_gamma 0.001 \\
+  --hire_pre_override hire --hire_fast_bins 24 --hire_slow_bins 160
 """
 
 from __future__ import annotations
@@ -46,7 +48,10 @@ from ultralytics.data.spad_packed import (
     raw_hwt_to_rgb_float,
     raw_plane_to_photon_cube,
 )
-from ultralytics.models.yolo.pose.spad_preprocessors import build_spad_frame_preprocessor
+from ultralytics.models.yolo.pose.spad_preprocessors import (
+    build_spad_frame_preprocessor,
+    build_spad_preprocessor,
+)
 
 
 _DSP_MOD = None
@@ -107,6 +112,20 @@ def _parse_args() -> argparse.Namespace:
         choices=["sum", "ema", "ppb", "stea", "hire"],
         help="External preprocessor for pure detector (rgb track)",
     )
+    ap.add_argument(
+        "--qnn_pre_override",
+        type=str,
+        default="none",
+        choices=["none", "ppb", "ema", "sum", "stea", "hire"],
+        help="Rebuild QNN sequence preprocessor from CLI knobs (none = keep ckpt)",
+    )
+    ap.add_argument(
+        "--hire_pre_override",
+        type=str,
+        default="none",
+        choices=["none", "hire", "ppb", "ema", "sum", "stea"],
+        help="Rebuild HIRE sequence preprocessor from CLI knobs (none = keep ckpt)",
+    )
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--spad_bin_rate_hz", type=float, default=8000.0)
     ap.add_argument("--spad_bins_per_gt", type=int, default=64, help="GT@125Hz → bins (8000/125=64)")
@@ -121,7 +140,45 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--kpt_thresh", type=float, default=0.5)
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument("--input_gamma", type=float, default=2.2)
+    # EMA
     ap.add_argument("--ema_alpha", type=float, default=0.01)
+    ap.add_argument("--ema_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--ema_quantile", type=float, default=1.0)
+    # PPB (QNN)
+    ap.add_argument("--ppb_bocpd_gamma", type=float, default=0.001)
+    ap.add_argument("--ppb_memory_size", type=int, default=10)
+    ap.add_argument("--ppb_quantile", type=float, default=1.0)
+    ap.add_argument("--ppb_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--ppb_min_filter_size", type=int, default=5)
+    # HIRE (defaults match sequence_hire_*_8kHz / vis_hire_pose)
+    ap.add_argument("--hire_fast_bins", type=int, default=24)
+    ap.add_argument("--hire_slow_bins", type=int, default=160)
+    ap.add_argument("--hire_surprise_bins", type=int, default=4)
+    ap.add_argument("--hire_mix_hold_bins", type=int, default=80)
+    ap.add_argument("--hire_mix_bins", type=float, default=12.0)
+    ap.add_argument("--hire_mix_theta", type=float, default=0.06)
+    ap.add_argument("--hire_mix_floor", type=float, default=-1.0)
+    ap.add_argument("--hire_theta_on", type=float, default=0.08)
+    ap.add_argument("--hire_theta_off", type=float, default=0.02)
+    ap.add_argument("--hire_theta_grow", type=float, default=-1.0)
+    ap.add_argument("--hire_confirm_bins", type=int, default=4)
+    ap.add_argument("--hire_cooldown_bins", type=int, default=0)
+    ap.add_argument("--hire_spatial_kernel", type=int, default=5)
+    ap.add_argument("--hire_gate_pool", type=str, default="max", choices=["max", "avg"])
+    ap.add_argument("--hire_reset_open", type=int, default=15)
+    ap.add_argument("--hire_reset_grow", type=int, default=6)
+    ap.add_argument("--hire_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--hire_quantile", type=float, default=1.0)
+    # STEA (optional for detector_pre / overrides)
+    ap.add_argument("--stea_fast_window", type=int, default=8)
+    ap.add_argument("--stea_slow_window", type=int, default=64)
+    ap.add_argument("--stea_temporal_window", type=int, default=16)
+    ap.add_argument("--stea_fast_tau", type=float, default=0.2)
+    ap.add_argument("--stea_motion_sharpness", type=float, default=8.0)
+    ap.add_argument("--stea_motion_threshold", type=float, default=0.05)
+    ap.add_argument("--stea_stable_prior", type=float, default=0.7)
+    ap.add_argument("--stea_normalize", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--stea_quantile", type=float, default=1.0)
     ap.add_argument("--no_vis", action="store_true", help="Skip PNG overlays (npy + meta only)")
     ap.add_argument("--methods", type=str, default="gt,rgb,qnn,hire", help="Comma subset to run")
     return ap.parse_args()
@@ -466,62 +523,80 @@ def _save_method(
         cv2.imwrite(str(vis_dir / f"frame_{fi:07d}.png"), overlay)
 
 
-def _detector_pre_kwargs(name: str, *, chunk_size: int, args: argparse.Namespace) -> dict[str, Any]:
-    # Frame preprocessor emits one frame per chunk → subsampling = chunk_size.
-    kwargs: dict[str, Any] = {"subsampling": int(chunk_size)}
+def _pre_kwargs(name: str, *, subsampling: int, args: argparse.Namespace) -> dict[str, Any]:
+    """Build preprocessor kwargs from CLI (shared by detector frame-pre and sequence override)."""
+    name = str(name).strip().lower()
+    kwargs: dict[str, Any] = {"subsampling": int(subsampling)}
+    if name == "sum":
+        return kwargs
     if name == "ema":
-        kwargs["ema_alpha"] = float(args.ema_alpha)
-        kwargs["normalize"] = True
-        kwargs["quantile"] = 1.0
-    elif name == "ppb":
         kwargs.update(
             {
-                "bocpd_gamma": 0.001,
-                "memory_size": 10,
-                "normalize": True,
-                "quantile": 1.0,
-                "min_filter_size": 5,
+                "ema_alpha": float(args.ema_alpha),
+                "normalize": bool(args.ema_normalize),
+                "quantile": float(args.ema_quantile),
             }
         )
-    elif name == "stea":
+        return kwargs
+    if name == "ppb":
         kwargs.update(
             {
-                "fast_window": 8,
-                "slow_window": 64,
-                "temporal_window": 16,
-                "fast_tau": 0.2,
-                "motion_sharpness": 8.0,
-                "motion_threshold": 0.05,
-                "stable_prior": 0.7,
-                "normalize": True,
-                "quantile": 1.0,
+                "bocpd_gamma": float(args.ppb_bocpd_gamma),
+                "memory_size": int(args.ppb_memory_size),
+                "normalize": bool(args.ppb_normalize),
+                "quantile": float(args.ppb_quantile),
+                "min_filter_size": int(args.ppb_min_filter_size),
             }
         )
-    elif name == "hire":
+        return kwargs
+    if name == "stea":
+        kwargs.update(
+            {
+                "fast_window": int(args.stea_fast_window),
+                "slow_window": int(args.stea_slow_window),
+                "temporal_window": int(args.stea_temporal_window),
+                "fast_tau": float(args.stea_fast_tau),
+                "motion_sharpness": float(args.stea_motion_sharpness),
+                "motion_threshold": float(args.stea_motion_threshold),
+                "stable_prior": float(args.stea_stable_prior),
+                "normalize": bool(args.stea_normalize),
+                "quantile": float(args.stea_quantile),
+            }
+        )
+        return kwargs
+    if name == "hire":
         kwargs.update(
             {
                 "sample_rate_hz": float(args.spad_bin_rate_hz),
-                "fast_bins": 24,
-                "slow_bins": 160,
-                "surprise_bins": 4,
-                "mix_hold_bins": 80,
-                "mix_bins": 12.0,
-                "mix_theta": 0.06,
-                "mix_floor": -1.0,
-                "theta_on": 0.08,
-                "theta_off": 0.02,
-                "theta_grow": -1.0,
-                "confirm_bins": 4,
-                "cooldown_bins": 0,
-                "spatial_kernel": 5,
-                "gate_pool": "max",
-                "reset_open": 15,
-                "reset_grow": 6,
-                "normalize": True,
-                "quantile": 1.0,
+                "fast_bins": int(args.hire_fast_bins),
+                "slow_bins": int(args.hire_slow_bins),
+                "surprise_bins": int(args.hire_surprise_bins),
+                "mix_hold_bins": int(args.hire_mix_hold_bins),
+                "mix_bins": float(args.hire_mix_bins),
+                "mix_theta": float(args.hire_mix_theta),
+                "mix_floor": float(args.hire_mix_floor),
+                "theta_on": float(args.hire_theta_on),
+                "theta_off": float(args.hire_theta_off),
+                "theta_grow": float(args.hire_theta_grow),
+                "confirm_bins": int(args.hire_confirm_bins),
+                "cooldown_bins": int(args.hire_cooldown_bins),
+                "spatial_kernel": int(args.hire_spatial_kernel),
+                "gate_pool": str(args.hire_gate_pool),
+                "reset_open": int(args.hire_reset_open),
+                "reset_grow": int(args.hire_reset_grow),
+                "normalize": bool(args.hire_normalize),
+                "quantile": float(args.hire_quantile),
             }
         )
-    return kwargs
+        return kwargs
+    raise ValueError(f"Unsupported preprocessor name for kwargs: {name!r}")
+
+
+def _pre_kwargs_for_meta(name: str, *, subsampling: int, args: argparse.Namespace) -> dict[str, Any] | None:
+    name = str(name).strip().lower()
+    if name in {"", "none", "?"}:
+        return None
+    return _pre_kwargs(name, subsampling=subsampling, args=args)
 
 
 def _run_detector(
@@ -540,9 +615,9 @@ def _run_detector(
     yolo.model.eval()
     names = yolo.names
     pre_name = str(args.detector_pre)
-    preprocessor = build_spad_frame_preprocessor(
-        pre_name, kwargs=_detector_pre_kwargs(pre_name, chunk_size=chunk_size, args=args)
-    ).to(device)
+    pre_kw = _pre_kwargs(pre_name, subsampling=chunk_size, args=args)
+    print(f"  rgb/detector: pre={pre_name} kwargs={pre_kw}", flush=True)
+    preprocessor = build_spad_frame_preprocessor(pre_name, kwargs=pre_kw).to(device)
     preprocessor.eval()
 
     frames_out: list[dict[str, Any]] = []
@@ -633,10 +708,26 @@ def _run_sequence(
     spad_model.spad_detect_imgsz = int(args.imgsz)
     if hasattr(spad_model, "spad_cache_mode"):
         spad_model.spad_cache_mode = "raw"
+
+    override = "none"
+    if label == "qnn":
+        override = str(args.qnn_pre_override).strip().lower()
+    elif label == "hire":
+        override = str(args.hire_pre_override).strip().lower()
+    if override not in {"", "none"}:
+        pre_kw = _pre_kwargs(override, subsampling=chunk_size, args=args)
+        spad_model.preprocessor = build_spad_preprocessor(override, kwargs=pre_kw).to(device)
+        spad_model.preprocessor_name = override
+        print(f"  {label}: preprocessor override → {override} kwargs={pre_kw}", flush=True)
+    else:
+        print(
+            f"  {label}: pre={getattr(spad_model, 'preprocessor_name', '?')} "
+            f"(ckpt) cache_mode=raw chunk={chunk_size}",
+            flush=True,
+        )
+
     names = yolo.names
     kpt_shape = getattr(spad_model, "kpt_shape", (21, 3))
-    pre_name = getattr(spad_model, "preprocessor_name", "?")
-    print(f"  {label}: pre={pre_name} plugin≈SSD cache_mode=raw chunk={chunk_size}", flush=True)
 
     frames_out: list[dict[str, Any]] = []
     frame_idx = 0
@@ -864,6 +955,17 @@ def main() -> None:
         "qnn_ckpt": str(args.qnn_ckpt),
         "hire_ckpt": str(args.hire_ckpt),
         "detector_pre": str(args.detector_pre),
+        "detector_pre_kwargs": _pre_kwargs_for_meta(
+            str(args.detector_pre), subsampling=chunk_size, args=args
+        ),
+        "qnn_pre_override": str(args.qnn_pre_override),
+        "qnn_pre_kwargs": _pre_kwargs_for_meta(
+            str(args.qnn_pre_override), subsampling=chunk_size, args=args
+        ),
+        "hire_pre_override": str(args.hire_pre_override),
+        "hire_pre_kwargs": _pre_kwargs_for_meta(
+            str(args.hire_pre_override), subsampling=chunk_size, args=args
+        ),
         "chunk_size": int(chunk_size),
         "spad_bin_rate_hz": float(args.spad_bin_rate_hz),
         "spad_bins_per_gt": int(bins_per_gt),
