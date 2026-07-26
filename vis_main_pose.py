@@ -134,7 +134,25 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--spad_bin_rate_hz", type=float, default=8000.0)
     ap.add_argument("--spad_bins_per_gt", type=int, default=64, help="GT@125Hz → bins (8000/125=64)")
-    ap.add_argument("--gt_image_size", type=int, default=512, help="Pixel space of GT JSON coords")
+    ap.add_argument(
+        "--gt_image_size",
+        type=int,
+        default=-1,
+        help=(
+            "Square source size of GT JSON coords. "
+            "-1=auto (HamNoSys/native RGB vs VisionSIM 512), "
+            "0=already in RGB pixels (no rescale), "
+            ">0=square e.g. 512 for VisionSIM"
+        ),
+    )
+    ap.add_argument(
+        "--gt_hw",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("H", "W"),
+        help="Explicit non-square GT coord space (overrides --gt_image_size)",
+    )
     ap.add_argument("--start_bin", type=int, default=0)
     ap.add_argument("--end_bin", type=int, default=0, help="Exclusive; 0 = EOF")
     ap.add_argument("--device", type=str, default="")
@@ -467,18 +485,89 @@ def _hands_from_result(result, *, conf_min: float = 0.0) -> list[dict[str, Any]]
     return hands
 
 
+def _gt_coord_extent(ann: dict[str, Any]) -> tuple[float, float]:
+    """Max x/y seen in GT bboxes + keypoints (pixel coords as stored in JSON)."""
+    max_x = 0.0
+    max_y = 0.0
+    for frame in ann.values():
+        if not isinstance(frame, dict):
+            continue
+        for hand_name in HAND_TO_CLASS:
+            hand = frame.get(hand_name)
+            if not isinstance(hand, dict):
+                continue
+            if "bbox" in hand:
+                bbox = np.asarray(hand["bbox"], dtype=np.float32).reshape(-1)
+                if bbox.size >= 4:
+                    max_x = max(max_x, float(bbox[0]), float(bbox[2]))
+                    max_y = max(max_y, float(bbox[1]), float(bbox[3]))
+            if "keypoints_2d" in hand:
+                kpts = np.asarray(hand["keypoints_2d"], dtype=np.float32)
+                if kpts.ndim == 2 and kpts.shape[1] >= 2 and kpts.size:
+                    max_x = max(max_x, float(np.nanmax(kpts[:, 0])))
+                    max_y = max(max_y, float(np.nanmax(kpts[:, 1])))
+    return max_x, max_y
+
+
+def _infer_gt_from_hw(
+    ann: dict[str, Any],
+    *,
+    target_hw: tuple[int, int],
+    gt_image_size: int,
+    gt_hw: tuple[int, int] | None,
+) -> tuple[int, int]:
+    """Resolve GT JSON coordinate space → scale source ``(H, W)``.
+
+    HamNoSys ``hand_ann.json`` is already in RGB/crop pixels; VisionSIM is usually
+    square 512. Wrong square assumption (512→RGB) stretches GT vs model preds.
+    """
+    if gt_hw is not None:
+        h, w = int(gt_hw[0]), int(gt_hw[1])
+        if h <= 0 or w <= 0:
+            raise ValueError(f"--gt_hw must be positive, got {(h, w)}")
+        return h, w
+
+    th, tw = int(target_hw[0]), int(target_hw[1])
+    if int(gt_image_size) == 0:
+        return th, tw
+    if int(gt_image_size) > 0:
+        s = int(gt_image_size)
+        return s, s
+
+    # auto
+    max_x, max_y = _gt_coord_extent(ann)
+    fits_rgb = max_x <= tw * 1.05 + 1.0 and max_y <= th * 1.05 + 1.0
+    fits_512 = max_x <= 512 * 1.05 + 1.0 and max_y <= 512 * 1.05 + 1.0
+    if fits_rgb and (th, tw) != (512, 512):
+        # Non-square / non-512 RGB with coords inside it → HamNoSys-style native.
+        return th, tw
+    if fits_rgb and fits_512:
+        # Ambiguous 512 RGB: identity either way.
+        return th, tw
+    if fits_512 and not fits_rgb:
+        return 512, 512
+    if fits_rgb:
+        return th, tw
+    # Fallback: treat JSON coords as already in RGB (no extra square warp).
+    print(
+        f"Warning: GT extent (max_x={max_x:.1f}, max_y={max_y:.1f}) outside RGB "
+        f"{tw}x{th} and 512; assuming native RGB coords",
+        flush=True,
+    )
+    return th, tw
+
+
 def _gt_hands_at_index(
     ann: dict[str, Any],
     gt_idx: int,
     *,
-    gt_image_size: int,
+    from_hw: tuple[int, int],
     target_hw: tuple[int, int],
 ) -> list[dict[str, Any]]:
     key = f"frame_{int(gt_idx):06d}.png"
     frame = ann.get(key, {})
     if not isinstance(frame, dict):
         return []
-    from_hw = (int(gt_image_size), int(gt_image_size))
     hands = []
     for hand_name, cls_id in HAND_TO_CLASS.items():
         hand = frame.get(hand_name)
@@ -847,7 +936,7 @@ def _build_gt_frames(
     chunk_size: int,
     bins_per_gt: int,
     t_begin: int,
-    gt_image_size: int,
+    from_hw: tuple[int, int],
     target_hw: tuple[int, int],
 ) -> list[dict[str, Any]]:
     frames = []
@@ -863,7 +952,7 @@ def _build_gt_frames(
             image_shape=target_hw,
         )
         fr["hands"] = _gt_hands_at_index(
-            ann, gt_idx, gt_image_size=gt_image_size, target_hw=target_hw
+            ann, gt_idx, from_hw=from_hw, target_hw=target_hw
         )
         frames.append(fr)
     return frames
@@ -889,6 +978,18 @@ def main() -> None:
     ann = _load_gt_ann(args.gt_path)
     n_gt = _gt_max_index(ann) + 1
     target_hw = rgb_frames[0].shape[:2]
+    gt_from_hw = _infer_gt_from_hw(
+        ann,
+        target_hw=target_hw,
+        gt_image_size=int(args.gt_image_size),
+        gt_hw=tuple(args.gt_hw) if args.gt_hw is not None else None,
+    )
+    print(
+        f"coord spaces: RGB/target={target_hw[1]}x{target_hw[0]}  "
+        f"GT_from={gt_from_hw[1]}x{gt_from_hw[0]}  "
+        f"(preds: model-native → RGB; GT: JSON → RGB)",
+        flush=True,
+    )
 
     device = _dsp()._resolve_device(args.device)
     sources = list(_dsp()._iter_raw_video_sources_from_sample_path(npy_path))
@@ -979,7 +1080,7 @@ def main() -> None:
             chunk_size=chunk_size,
             bins_per_gt=bins_per_gt,
             t_begin=t_begin,
-            gt_image_size=int(args.gt_image_size),
+            from_hw=gt_from_hw,
             target_hw=target_hw,
         )
 
@@ -1012,6 +1113,7 @@ def main() -> None:
         "n_frames": int(n_frames),
         "image_shape": [int(target_hw[0]), int(target_hw[1])],
         "gt_image_size": int(args.gt_image_size),
+        "gt_from_hw": [int(gt_from_hw[0]), int(gt_from_hw[1])],
         "gt_align": "end",
         "gt_index_formula": "(frame_idx + 1) * (chunk_size / spad_bins_per_gt)",
         "cache_mode": "raw",
