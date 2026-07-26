@@ -294,13 +294,83 @@ def _draw_skeleton(
         )
 
 
-def _style_axes_simple(ax) -> None:
+def _resolve_times_font():
+    """Return ``(FontProperties, font_path_or_name)`` for Times New Roman.
+
+    Reasons the previous ``fontname=...`` often looked unchanged:
+    1. Linux servers usually lack Times New Roman → silent fallback to DejaVu.
+    2. mplot3d rebuilds tick/axis text after ``view_init`` / ``tight_layout`` /
+       ``savefig(bbox_inches='tight')``, wiping per-label font settings.
+
+    We bind an explicit TTF path when possible and re-apply after draw.
+    """
+    from matplotlib import font_manager as fm
+    from matplotlib.font_manager import FontProperties
+
+    preferred_names = ("Times New Roman", "TimesNewRoman", "Times")
+    # Common install locations (Linux msttcorefonts / macOS Supplemental).
+    preferred_files = [
+        "/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/times.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+        "/Library/Fonts/Times New Roman.ttf",
+    ]
+    for path in preferred_files:
+        p = Path(path)
+        if p.is_file():
+            try:
+                fm.fontManager.addfont(str(p))
+            except (ValueError, RuntimeError):
+                pass
+            return FontProperties(fname=str(p), size=10), str(p)
+
+    for name in preferred_names:
+        try:
+            path = fm.findfont(FontProperties(family=name), fallback_to_default=False)
+        except (ValueError, RuntimeError):
+            continue
+        # findfont may still return DejaVu when fallback is allowed; reject that.
+        if path and "dejavu" not in Path(path).name.lower():
+            return FontProperties(fname=path, size=10), path
+
+    # Last resort: Liberation Serif / STIX (Times-like metrics), else DejaVu Serif.
+    for name in ("Liberation Serif", "STIXGeneral", "DejaVu Serif"):
+        path = fm.findfont(FontProperties(family=name))
+        print(
+            f"Warning: Times New Roman not found; using {name} ({path}). "
+            "On Linux install fonts with: sudo apt-get install ttf-mscorefonts-installer",
+            flush=True,
+        )
+        return FontProperties(fname=path, size=10), path
+
+    fp = FontProperties(family="serif", size=10)
+    return fp, "serif"
+
+
+def _apply_font_to_3d_ax(ax, font_prop) -> None:
+    """Force font on 3D axis labels + ticks (call after draw / tight_layout)."""
+    tick_prop = font_prop.copy()
+    tick_prop.set_size(8)
+    label_prop = font_prop.copy()
+    label_prop.set_size(10)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.label.set_fontproperties(label_prop)
+        for t in axis.get_ticklabels():
+            t.set_fontproperties(tick_prop)
+
+
+def _style_axes_simple(ax, font_prop=None) -> None:
     """Keep axis lines + labels; hide grid and pane fill."""
     ax.grid(False)
-    label_kw = {"fontname": "Times New Roman", "fontsize": 10}
-    ax.set_xlabel("x (px)", **label_kw)
-    ax.set_ylabel("t (ms)", **label_kw)
-    ax.set_zlabel("y (px)", **label_kw)
+    if font_prop is not None:
+        ax.set_xlabel("x (px)", fontproperties=font_prop)
+        ax.set_ylabel("t (ms)", fontproperties=font_prop)
+        ax.set_zlabel("y (px)", fontproperties=font_prop)
+    else:
+        ax.set_xlabel("x (px)")
+        ax.set_ylabel("t (ms)")
+        ax.set_zlabel("y (px)")
     ax.tick_params(labelsize=8)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis._axinfo["grid"]["linewidth"] = 0.0
@@ -308,9 +378,8 @@ def _style_axes_simple(ax) -> None:
         axis.pane.set_edgecolor((0.75, 0.75, 0.75, 0.35))
         axis.pane.set_alpha(0.0)
         axis.line.set_color((0.25, 0.25, 0.25, 1.0))
-    # Tick labels → Times New Roman when available.
-    for lbl in list(ax.get_xticklabels()) + list(ax.get_yticklabels()) + list(ax.get_zticklabels()):
-        lbl.set_fontname("Times New Roman")
+    if font_prop is not None:
+        _apply_font_to_3d_ax(ax, font_prop)
 
 
 def _draw_one_method(
@@ -535,15 +604,18 @@ def main() -> None:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # Times New Roman for axis labels / ticks (fallback if font missing).
+    font_prop, font_id = _resolve_times_font()
     plt.rcParams.update(
         {
-            "font.family": "serif",
-            "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+            "font.family": font_prop.get_name(),
             "mathtext.fontset": "stix",
             "axes.unicode_minus": False,
+            # Embed TrueType in vector outputs; avoids bitmap fallbacks looking "wrong".
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
         }
     )
+    print(f"font: {font_prop.get_name()} ← {font_id}", flush=True)
 
     face = "none" if str(args.bg).lower() in {"none", "transparent"} else args.bg
 
@@ -571,14 +643,18 @@ def main() -> None:
         ax.set_zlim(ymin, ymax)
         ax.view_init(elev=float(args.elev), azim=float(args.azim))
         ax.invert_zaxis()
-        _style_axes_simple(ax)
+        _style_axes_simple(ax, font_prop)
         fig.tight_layout(pad=0.4)
+        # mplot3d regenerates text during draw; re-apply font immediately before save.
+        fig.canvas.draw()
+        _apply_font_to_3d_ax(ax, font_prop)
 
         out_path = save_dir / f"{method}_traj3d.png"
         fig.savefig(
             out_path,
             dpi=int(args.dpi),
             bbox_inches="tight",
+            pad_inches=0.15,
             facecolor=face,
             edgecolor="none",
             transparent=(face == "none"),
