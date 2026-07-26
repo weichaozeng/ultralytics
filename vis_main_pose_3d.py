@@ -146,20 +146,21 @@ def _parse_args() -> argparse.Namespace:
         "--rgb_alpha_start",
         type=float,
         default=0.7,
-        help="RGB plane opacity at first slice (default 0.7)",
+        help="RGB opacity at 2nd plane (start of interior start→mid→end); "
+        "first/last planes are fixed at 0.9",
     )
     ap.add_argument(
         "--rgb_alpha_mid",
         type=float,
         default=0.2,
-        help="RGB plane opacity at middle slice (default 0.2)",
+        help="RGB opacity at middle of interior planes (default 0.2)",
     )
     ap.add_argument(
         "--rgb_alpha_end",
         type=float,
         default=0.7,
-        help="RGB opacity at second-to-last via start→mid→end blend; "
-        "the final slice is always 1.0",
+        help="RGB opacity at 2nd-to-last plane (end of interior start→mid→end); "
+        "first/last planes are fixed at 0.9",
     )
     ap.add_argument(
         "--save",
@@ -767,18 +768,22 @@ def _rgb_slice_alpha(
 ) -> float:
     """Opacity for slice ``i`` in ``[0, n)``.
 
-    Slices ``[0, n-2]`` blend start → mid → end (piecewise linear);
-    the **last** slice is always fully opaque (1.0).
+    First and last planes are fixed at 0.9. Planes ``[1, n-2]`` use
+    piecewise-linear ``alpha_start → alpha_mid → alpha_end``.
     """
+    fixed = 0.9
     a0 = float(np.clip(alpha_start, 0.0, 1.0))
     a1 = float(np.clip(alpha_mid, 0.0, 1.0))
     a2 = float(np.clip(alpha_end, 0.0, 1.0))
     if n <= 1:
-        return 1.0
-    if i >= n - 1:
-        return 1.0
-    # Map first .. second-to-last onto [0, 1] for start→mid→end.
-    t = float(i) / float(max(n - 2, 1))
+        return fixed
+    if i <= 0 or i >= n - 1:
+        return fixed
+    # Interior indices 1 .. n-2 → t in [0, 1]
+    n_int = n - 2
+    if n_int <= 1:
+        return a1
+    t = float(i - 1) / float(n_int - 1)
     if t <= 0.5:
         u = t / 0.5
         return float(a0 + (a1 - a0) * u)
@@ -819,7 +824,7 @@ def _render_rgb_cube(
     print(
         f"RGB cube: {rgb_path} frames={n_planes} "
         f"stride_xy={stride_xy} stride_t={stride_t} "
-        f"alpha_start={alpha_start:g} mid={alpha_mid:g} end={alpha_end:g}",
+        f"alpha_ends=0.9 interior={alpha_start:g}/{alpha_mid:g}/{alpha_end:g}",
         flush=True,
     )
 
