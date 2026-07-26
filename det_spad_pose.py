@@ -748,7 +748,10 @@ def main():
                     _set_velocity_field_on_preprocessor(spad_model.preprocessor, tracker)
 
                     with torch.inference_mode():
-                        video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
+                        video_tensor = torch.from_numpy(np.ascontiguousarray(raw_chunk)).unsqueeze(0).to(device)
+                        if getattr(spad_model, "spad_stream_mode", False):
+                            spad_model.spad_stream_bin_offset = int(t0)
+                            spad_model.spad_pending_t_index_ll = [int(t1)]
                         raw_preds = spad_model(video_tensor)
                         preds = _postprocess_pose_predictions(
                             raw_preds,

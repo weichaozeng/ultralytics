@@ -1227,7 +1227,12 @@ def main():
                             _maybe_set_velocity_field(spad_model.preprocessor, tracker)
 
                         with torch.inference_mode():
-                            video_tensor = torch.from_numpy(raw_chunk).unsqueeze(0).to(device)
+                            video_tensor = torch.from_numpy(np.ascontiguousarray(raw_chunk)).unsqueeze(0).to(device)
+                            # Absolute end-bin times so temporal plugins see advancing Δt across chunks.
+                            # (Relative recon_t_indices alone repeat 64/320 every chunk → frozen state.)
+                            if getattr(spad_model, "spad_stream_mode", False):
+                                spad_model.spad_stream_bin_offset = int(t0)
+                                spad_model.spad_pending_t_index_ll = [int(t1)]
                             raw_preds = spad_model(video_tensor)
                             preds = _postprocess_pose_predictions(
                                 raw_preds,

@@ -346,8 +346,10 @@ class SpatialTemporalPlugin(nn.Module):
                 f"Unsupported temporal_core={temporal_core!r}; "
                 f"expected one of: ssd, {', '.join(sorted(ATTN_TEMPORAL_CORES))}."
             )
+        self.online_mode = False
 
     def set_online_mode(self, enabled: bool) -> None:
+        self.online_mode = bool(enabled)
         self.temporal.set_online_mode(enabled)
 
     def clear_temporal_state(self) -> None:

@@ -677,6 +677,9 @@ class SpadPoseModel(PoseModel):
         # Cross-chunk streaming: carry HIRE/STEA + detector plugin state across forwards.
         self.spad_stream_mode = False
         self._spad_stream_clear_next = True
+        # Absolute raw-bin offset of the current stream chunk (start bin). Used when
+        # ``spad_pending_t_index_ll`` is not set, so plugin Δt advances across chunks.
+        self.spad_stream_bin_offset = 0
         # Detector letterbox size (0 = feed native recon resolution). Native frames kept in spad_last_recon_frames.
         self.spad_detect_imgsz = 0
         self.spad_scale_meta = None
@@ -812,6 +815,8 @@ class SpadPoseModel(PoseModel):
         """
         self.spad_stream_mode = True
         self._spad_stream_clear_next = True
+        self.spad_stream_bin_offset = 0
+        self.spad_pending_t_index_ll = None
         self.spad_set_online_inference(True)
         self.spad_clear_plugin_states()
         pre = getattr(self, "preprocessor", None)
@@ -825,6 +830,8 @@ class SpadPoseModel(PoseModel):
         """Exit streaming mode (next non-stream forward clears as usual)."""
         self.spad_stream_mode = False
         self._spad_stream_clear_next = True
+        self.spad_stream_bin_offset = 0
+        self.spad_pending_t_index_ll = None
 
     def _spad_take_preprocessor_clear_flag(self) -> bool:
         """Whether the next preprocessor call should ``clear_states``.
@@ -1116,19 +1123,39 @@ class SpadPoseModel(PoseModel):
         packed_nch = int(getattr(self, "spad_packed_nch", 3) or 3)
         frame_ll = []
         t_index_ll = None
+        pending = getattr(self, "spad_pending_t_index_ll", None)
+        stream_mode = bool(getattr(self, "spad_stream_mode", False))
+        stream_offset = int(getattr(self, "spad_stream_bin_offset", 0) or 0)
         for b in range(bsz):
             photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
+            t_raw = int(photon_cube.shape[2])
             recons = self._spad_process_full_window(photon_cube)
             frames = self._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
             frames = self._spad_apply_input_gamma(frames, self.spad_input_gamma)
             frame_ll.append(frames)
 
             if t_index_ll is None:
-                if hasattr(self.preprocessor, "recon_t_indices"):
-                    t_index_ll = list(self.preprocessor.recon_t_indices(int(photon_cube.shape[2]), int(frames.shape[0])))
+                n_frames = int(frames.shape[0])
+                # Prefer caller-provided absolute times (rendered path / raw stream).
+                if pending is not None and len(pending) == n_frames:
+                    t_index_ll = [int(v) for v in pending]
+                elif stream_mode:
+                    # Emit cadence = fed chunk length → usually 1 frame at chunk end.
+                    # Do NOT use train-time preprocessor.subsampling here (restored after
+                    # process_photon_cube), or every chunk would reuse the same relative
+                    # index (e.g. 64/320) and temporal plugins see Δt=0.
+                    if n_frames <= 0:
+                        t_index_ll = []
+                    elif n_frames == 1:
+                        t_index_ll = [stream_offset + t_raw]
+                    else:
+                        step = max(t_raw // n_frames, 1)
+                        t_index_ll = [stream_offset + min((i + 1) * step, t_raw) for i in range(n_frames)]
+                elif hasattr(self.preprocessor, "recon_t_indices"):
+                    t_index_ll = list(self.preprocessor.recon_t_indices(t_raw, n_frames))
                 else:
                     subsampling = int(getattr(self.preprocessor, "subsampling", 1) or 1)
-                    t_index_ll = self._spad_recon_t_indices(int(photon_cube.shape[2]), subsampling, int(frames.shape[0]))
+                    t_index_ll = self._spad_recon_t_indices(t_raw, subsampling, n_frames)
 
         frame_counts = {frames.shape[0] for frames in frame_ll}
         if len(frame_counts) != 1:
@@ -1138,6 +1165,7 @@ class SpadPoseModel(PoseModel):
         self.spad_batch_size = int(bsz)
         self.spad_num_frame = int(frames_t_b_c_h_w.shape[0])
         self.spad_t_index_ll = t_index_ll or []
+        self.spad_pending_t_index_ll = None
         self.spad_last_recon_frames = frames_t_b_c_h_w.detach()
         return self._spad_maybe_letterbox_for_detector(frames_t_b_c_h_w)
 
