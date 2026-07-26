@@ -158,7 +158,8 @@ def _parse_args() -> argparse.Namespace:
         "--rgb_alpha_end",
         type=float,
         default=0.7,
-        help="RGB plane opacity at last slice (default 0.7); linear blend start→mid→end",
+        help="RGB opacity at second-to-last via start→mid→end blend; "
+        "the final slice is always 1.0",
     )
     ap.add_argument(
         "--save",
@@ -764,18 +765,23 @@ def _rgb_slice_alpha(
     alpha_mid: float,
     alpha_end: float,
 ) -> float:
-    """Opacity for slice ``i`` in ``[0, n)``: start → mid → end (piecewise linear)."""
+    """Opacity for slice ``i`` in ``[0, n)``.
+
+    Slices ``[0, n-2]`` blend start → mid → end (piecewise linear);
+    the **last** slice is always fully opaque (1.0).
+    """
     a0 = float(np.clip(alpha_start, 0.0, 1.0))
     a1 = float(np.clip(alpha_mid, 0.0, 1.0))
     a2 = float(np.clip(alpha_end, 0.0, 1.0))
     if n <= 1:
-        return a0
-    t = float(i) / float(n - 1)  # 0 at first, 1 at last
+        return 1.0
+    if i >= n - 1:
+        return 1.0
+    # Map first .. second-to-last onto [0, 1] for start→mid→end.
+    t = float(i) / float(max(n - 2, 1))
     if t <= 0.5:
-        # 0 → 0.5 maps a0 → a1
         u = t / 0.5
         return float(a0 + (a1 - a0) * u)
-    # 0.5 → 1 maps a1 → a2
     u = (t - 0.5) / 0.5
     return float(a1 + (a2 - a1) * u)
 
