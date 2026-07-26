@@ -6,8 +6,9 @@ Loads ``{gt,rgb,qnn,hire}/poses.npy`` and draws **one figure per method**:
 - bbox-center polylines over ``[start_frame, end_frame)``
 
 Camera matches ``vis_spad_bins_3d.py``:
-  plot (X, Y, Z) = (x_img, t, y_img), elev=18, azim=-70, invert_zaxis.
-Simple axis lines/labels (no grid). No image planes.
+  plot (X, Y, Z) = (x_img, t_ms, y_img), elev=18, azim=-70, invert_zaxis.
+Time axis is milliseconds: ``t_ms = frame_idx * (1000 / fps)`` (fps from meta,
+default 25 → 40 ms/frame). Simple axis lines/labels (no grid). No image planes.
 
 Also saves RGB first / mid / last frames in the same window via ``--rgb_path``
 (``frames.npy`` dir or file, same as ``vis_main_pose`` / ``test_rgb_pose``).
@@ -208,9 +209,27 @@ def _pick_hand(frame: dict[str, Any], cls_id: int) -> dict[str, Any] | None:
     return max(cands, key=lambda h: float(h.get("score", 0.0)))
 
 
+def _frame_ms_per_frame(meta: dict[str, Any], *, default_fps: float = 25.0) -> float:
+    """Milliseconds per 25 fps emit frame from meta (or default)."""
+    fps = meta.get("frame_rate", None)
+    if fps is not None and float(fps) > 0:
+        return 1000.0 / float(fps)
+    chunk = meta.get("chunk_size", None)
+    rate = meta.get("spad_bin_rate_hz", None)
+    if chunk is not None and rate is not None and float(rate) > 0:
+        return 1000.0 * float(chunk) / float(rate)
+    return 1000.0 / float(default_fps)
+
+
+def _frame_to_ms(frame_idx: int | float, ms_per_frame: float) -> float:
+    return float(frame_idx) * float(ms_per_frame)
+
+
 def _trajectory(
     frames: list[dict[str, Any]],
     cls_id: int,
+    *,
+    ms_per_frame: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     xs, ys, ts = [], [], []
     for fr in frames:
@@ -220,7 +239,7 @@ def _trajectory(
         c = hand["bbox_center"]
         xs.append(float(c[0]))
         ys.append(float(c[1]))
-        ts.append(float(fr["frame_idx"]))
+        ts.append(_frame_to_ms(fr["frame_idx"], ms_per_frame))
     if not xs:
         return (
             np.zeros((0,), dtype=np.float64),
@@ -278,9 +297,9 @@ def _draw_skeleton(
 def _style_axes_simple(ax) -> None:
     """Keep axis lines + labels; hide grid and pane fill."""
     ax.grid(False)
-    ax.set_xlabel("x")
-    ax.set_ylabel("t")
-    ax.set_zlabel("y")
+    ax.set_xlabel("x (px)")
+    ax.set_ylabel("t (ms)")
+    ax.set_zlabel("y (px)")
     ax.tick_params(labelsize=8)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis._axinfo["grid"]["linewidth"] = 0.0
@@ -303,6 +322,7 @@ def _draw_one_method(
     joint_size: float,
     pale: float,
     deep: float,
+    ms_per_frame: float,
 ) -> None:
     base = METHOD_COLORS.get(method, (0.5, 0.5, 0.5))
     n_pose = max(len(pose_local_idxs), 1)
@@ -314,7 +334,7 @@ def _draw_one_method(
         cls_ids.append(1)
 
     for cls_id in cls_ids:
-        xs, ys, ts = _trajectory(frames, cls_id)
+        xs, ys, ts = _trajectory(frames, cls_id, ms_per_frame=ms_per_frame)
         if xs.size >= 2:
             ax.plot(
                 xs,
@@ -332,7 +352,7 @@ def _draw_one_method(
         if local_i < 0 or local_i >= len(frames):
             continue
         fr = frames[local_i]
-        t = float(fr["frame_idx"])
+        t = _frame_to_ms(fr["frame_idx"], ms_per_frame)
         shade = 0.0 if n_pose <= 1 else float(pi) / float(n_pose - 1)
         color = _shade_rgb(base, shade, pale=pale, deep=deep)
         for hand in fr["hands"]:
@@ -349,10 +369,14 @@ def _draw_one_method(
             )
 
 
-def _axis_limits(frames: list[dict[str, Any]]) -> tuple[float, float, float, float, float, float]:
+def _axis_limits(
+    frames: list[dict[str, Any]],
+    *,
+    ms_per_frame: float,
+) -> tuple[float, float, float, float, float, float]:
     xs, ys, ts = [], [], []
     for fr in frames:
-        ts.append(float(fr["frame_idx"]))
+        ts.append(_frame_to_ms(fr["frame_idx"], ms_per_frame))
         for hand in fr["hands"]:
             k = np.asarray(hand["keypoints"], dtype=np.float64)
             if k.size == 0:
@@ -366,7 +390,7 @@ def _axis_limits(frames: list[dict[str, Any]]) -> tuple[float, float, float, flo
         return 0.0, 1.0, 0.0, 1.0, 0.0, 1.0
     pad_x = max((max(xs) - min(xs)) * 0.05, 1.0)
     pad_y = max((max(ys) - min(ys)) * 0.05, 1.0)
-    pad_t = max((max(ts) - min(ts)) * 0.05, 0.5)
+    pad_t = max((max(ts) - min(ts)) * 0.05, float(ms_per_frame) * 0.5)
     return (
         min(xs) - pad_x,
         max(xs) + pad_x,
@@ -472,10 +496,17 @@ def main() -> None:
     n_poses = int(np.clip(int(args.n_poses), 6, 8))
     pose_local_idxs = _uniform_sample_indices(n_window, n_poses)
     first_i, mid_i, last_i = _first_mid_last_indices(start, end)
+    ms_per_frame = _frame_ms_per_frame(meta)
+    t0_ms = _frame_to_ms(start, ms_per_frame)
+    t1_ms = _frame_to_ms(end - 1, ms_per_frame)
 
     print(
         f"in_dir={in_dir} frames=[{start},{end}) n={n_window} n_poses={n_poses} "
         f"idxs={pose_local_idxs} methods={methods} hand={args.hand}",
+        flush=True,
+    )
+    print(
+        f"t axis: {ms_per_frame:g} ms/frame → [{t0_ms:g}, {t1_ms:g}] ms",
         flush=True,
     )
     print(f"rgb keyframes: first={first_i} mid={mid_i} last={last_i}", flush=True)
@@ -518,8 +549,9 @@ def main() -> None:
             joint_size=float(args.joint_size),
             pale=float(args.pale),
             deep=float(args.deep),
+            ms_per_frame=ms_per_frame,
         )
-        xmin, xmax, tmin, tmax, ymin, ymax = _axis_limits(frames)
+        xmin, xmax, tmin, tmax, ymin, ymax = _axis_limits(frames, ms_per_frame=ms_per_frame)
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(tmin, tmax)
         ax.set_zlim(ymin, ymax)
