@@ -95,12 +95,36 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--kpt_thresh", type=float, default=0.5)
     ap.add_argument("--pale", type=float, default=0.55)
     ap.add_argument("--deep", type=float, default=0.55)
-    # SPAD cube
-    ap.add_argument("--spad_stride_xy", type=int, default=4, help="Spatial stride for SPAD voxels")
+    # SPAD cube — defaults match vis_spad_bins_3d (full = black/white 0/1 photons)
+    ap.add_argument(
+        "--spad_stride_xy",
+        type=int,
+        default=2,
+        help="Spatial stride (same default as vis_spad_bins_3d)",
+    )
     ap.add_argument("--spad_stride_t", type=int, default=8, help="Temporal bin stride for SPAD cube")
-    ap.add_argument("--spad_alpha", type=float, default=0.12, help="SPAD scatter alpha")
-    ap.add_argument("--spad_point_size", type=float, default=0.25, help="SPAD scatter marker size")
-    ap.add_argument("--spad_mode", type=str, default="hits", choices=["hits", "full"])
+    ap.add_argument(
+        "--spad_alpha",
+        type=float,
+        default=0.08,
+        help="Marker alpha (vis_spad_bins_3d default 0.08)",
+    )
+    ap.add_argument(
+        "--spad_point_size",
+        type=float,
+        default=0.2,
+        help="Scatter marker size (vis_spad_bins_3d default 0.2)",
+    )
+    ap.add_argument(
+        "--spad_mode",
+        type=str,
+        default="full",
+        choices=["full", "hits"],
+        help="full=0/1 black/white (default, same as vis_spad_bins_3d); hits=photons only colored by t",
+    )
+    ap.add_argument("--spad_color0", type=str, default="#000000", help="Color for binary 0 (no photon)")
+    ap.add_argument("--spad_color1", type=str, default="#ffffff", help="Color for binary 1 (photon)")
+    ap.add_argument("--spad_cmap", type=str, default="viridis", help="hits-mode colormap by t")
     ap.add_argument("--spad_max_points", type=int, default=400_000)
     ap.add_argument(
         "--spad_channel",
@@ -680,7 +704,8 @@ def _render_spad_cube(
     px, py, pz = x, t, y  # (X,Y,Z)=(x,t,y)
 
     if args.spad_mode == "full":
-        cmap = ListedColormap(["#000000", "#ffffff"])
+        # Same as vis_spad_bins_3d: binary 0 → black, 1 → white.
+        cmap = ListedColormap([str(args.spad_color0), str(args.spad_color1)])
         ax.scatter(
             px,
             py,
@@ -699,7 +724,7 @@ def _render_spad_cube(
             py,
             pz,
             c=t,
-            cmap="viridis",
+            cmap=str(args.spad_cmap),
             s=float(args.spad_point_size),
             alpha=float(args.spad_alpha),
             linewidths=0,
