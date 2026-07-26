@@ -143,16 +143,22 @@ def _parse_args() -> argparse.Namespace:
         help="Keep every Nth RGB frame in the window for the cube",
     )
     ap.add_argument(
-        "--rgb_alpha_ends",
+        "--rgb_alpha_start",
         type=float,
         default=0.7,
-        help="RGB plane opacity at first/last slice (default 0.7)",
+        help="RGB plane opacity at first slice (default 0.7)",
     )
     ap.add_argument(
         "--rgb_alpha_mid",
         type=float,
         default=0.2,
-        help="RGB plane opacity at middle slice (default 0.2); linear blend ends→mid→ends",
+        help="RGB plane opacity at middle slice (default 0.2)",
+    )
+    ap.add_argument(
+        "--rgb_alpha_end",
+        type=float,
+        default=0.7,
+        help="RGB plane opacity at last slice (default 0.7); linear blend start→mid→end",
     )
     ap.add_argument(
         "--save",
@@ -750,16 +756,28 @@ def _render_spad_cube(
     plt.close(fig)
 
 
-def _rgb_slice_alpha(i: int, n: int, *, alpha_ends: float, alpha_mid: float) -> float:
-    """Opacity for slice ``i`` in ``[0, n)``: ends → mid → ends (linear)."""
-    a0 = float(np.clip(alpha_ends, 0.0, 1.0))
+def _rgb_slice_alpha(
+    i: int,
+    n: int,
+    *,
+    alpha_start: float,
+    alpha_mid: float,
+    alpha_end: float,
+) -> float:
+    """Opacity for slice ``i`` in ``[0, n)``: start → mid → end (piecewise linear)."""
+    a0 = float(np.clip(alpha_start, 0.0, 1.0))
     a1 = float(np.clip(alpha_mid, 0.0, 1.0))
+    a2 = float(np.clip(alpha_end, 0.0, 1.0))
     if n <= 1:
         return a0
-    # t=0 at first, 1 at last; dist_to_mid in [0,1] with 0 at ends and 1 at center.
-    t = float(i) / float(n - 1)
-    dist_to_mid = min(t, 1.0 - t) / 0.5
-    return float(a0 + (a1 - a0) * dist_to_mid)
+    t = float(i) / float(n - 1)  # 0 at first, 1 at last
+    if t <= 0.5:
+        # 0 → 0.5 maps a0 → a1
+        u = t / 0.5
+        return float(a0 + (a1 - a0) * u)
+    # 0.5 → 1 maps a1 → a2
+    u = (t - 0.5) / 0.5
+    return float(a1 + (a2 - a1) * u)
 
 
 def _render_rgb_cube(
@@ -784,8 +802,9 @@ def _render_rgb_cube(
     stride_t = int(args.rgb_stride_t)
     if stride_xy < 1 or stride_t < 1:
         raise ValueError("rgb strides must be >= 1")
-    alpha_ends = float(args.rgb_alpha_ends)
+    alpha_start = float(args.rgb_alpha_start)
     alpha_mid = float(args.rgb_alpha_mid)
+    alpha_end = float(args.rgb_alpha_end)
 
     frame_idxs = list(range(int(start), int(end), stride_t))
     if not frame_idxs:
@@ -794,7 +813,7 @@ def _render_rgb_cube(
     print(
         f"RGB cube: {rgb_path} frames={n_planes} "
         f"stride_xy={stride_xy} stride_t={stride_t} "
-        f"alpha_ends={alpha_ends:g} alpha_mid={alpha_mid:g}",
+        f"alpha_start={alpha_start:g} mid={alpha_mid:g} end={alpha_end:g}",
         flush=True,
     )
 
@@ -810,7 +829,11 @@ def _render_rgb_cube(
         h, w, _ = rgb.shape
         t_ms = _frame_to_ms(fi, ms_per_frame)
         alpha = _rgb_slice_alpha(
-            plane_i, n_planes, alpha_ends=alpha_ends, alpha_mid=alpha_mid
+            plane_i,
+            n_planes,
+            alpha_start=alpha_start,
+            alpha_mid=alpha_mid,
+            alpha_end=alpha_end,
         )
 
         # Map strided plane back to original pixel units (match pose coords).
