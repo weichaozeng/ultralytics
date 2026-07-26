@@ -26,6 +26,9 @@ python ultralytics/vis_main_pose.py \\
   --hire_ckpt /path/hire_ssd.pt \\
   --qnn_pre_override ppb --ppb_bocpd_gamma 0.001 \\
   --hire_pre_override hire --hire_fast_bins 24 --hire_slow_bins 160
+
+# HamNoSys (GT @ 50 Hz, not VisionSIM 125 Hz):
+python ultralytics/vis_main_pose.py ... --gt_fps 50
 """
 
 from __future__ import annotations
@@ -133,7 +136,19 @@ def _parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--chunk_size", type=int, default=320)
     ap.add_argument("--spad_bin_rate_hz", type=float, default=8000.0)
-    ap.add_argument("--spad_bins_per_gt", type=int, default=64, help="GT@125Hz → bins (8000/125=64)")
+    ap.add_argument(
+        "--gt_fps",
+        type=float,
+        default=125.0,
+        help="GT annotation rate (VisionSIM=125, HamNoSys=50). Used for end-align + bins_per_gt",
+    )
+    ap.add_argument(
+        "--spad_bins_per_gt",
+        type=int,
+        default=0,
+        help="Bins per GT frame; 0=auto round(spad_bin_rate_hz/gt_fps) "
+        "(125Hz→64, 50Hz→160 at 8kHz)",
+    )
     ap.add_argument(
         "--gt_image_size",
         type=int,
@@ -581,14 +596,13 @@ def _gt_hands_at_index(
 
 
 def _select_rgb_index(n_rgb: int, n_gt: int, frame_idx: int, gt_idx: int) -> int:
-    """Map 25 fps frame to an RGB frame.
+    """Map 25 fps emit frame to an RGB frame.
 
-    Prefer 1:1 with 25 fps count; if RGB length matches GT@125Hz, use end-aligned gt_idx.
+    Prefer 1:1 with 25 fps count; if RGB length matches the GT timeline
+    (e.g. 125Hz VisionSIM or 50Hz HamNoSys), use end-aligned ``gt_idx``.
     """
     if n_rgb <= 0:
         raise ValueError("Empty RGB sequence")
-    # Exact / near match to emitted 25 fps length handled by caller via clamp.
-    # If RGB appears to be the 125 Hz GT timeline, index by gt_idx.
     if n_gt > 0 and n_rgb >= max(n_gt - 2, 1) and abs(n_rgb - n_gt) <= max(2, n_gt // 50):
         return int(np.clip(gt_idx, 0, n_rgb - 1))
     return int(np.clip(frame_idx, 0, n_rgb - 1))
@@ -969,9 +983,22 @@ def main() -> None:
         raise ValueError("No methods selected")
 
     chunk_size = int(args.chunk_size)
-    bins_per_gt = int(args.spad_bins_per_gt)
-    if chunk_size <= 0 or bins_per_gt <= 0:
-        raise ValueError("chunk_size and spad_bins_per_gt must be positive")
+    gt_fps = float(args.gt_fps)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if gt_fps <= 0:
+        raise ValueError("gt_fps must be positive")
+    if int(args.spad_bins_per_gt) > 0:
+        bins_per_gt = int(args.spad_bins_per_gt)
+    else:
+        bins_per_gt = int(round(float(args.spad_bin_rate_hz) / gt_fps))
+    if bins_per_gt <= 0:
+        raise ValueError(
+            f"spad_bins_per_gt must be positive, got {bins_per_gt} "
+            f"(rate={args.spad_bin_rate_hz}, gt_fps={gt_fps})"
+        )
+    pred_fps = float(args.spad_bin_rate_hz) / float(chunk_size)
+    gt_step = float(chunk_size) / float(bins_per_gt)  # GT frames per emit (= gt_fps/pred_fps)
 
     npy_path = _resolve_in_npy(args.in_path)
     rgb_frames = _load_rgb_frames(args.rgb_path)
@@ -1008,7 +1035,8 @@ def main() -> None:
     n_chunks = (t_end - t_begin) // chunk_size
     print(
         f"in={npy_path} bins=[{t_begin},{t_end}) chunk={chunk_size} → {n_chunks} frames @ "
-        f"{float(args.spad_bin_rate_hz) / chunk_size:.3g} fps | rgb={target_hw} gt_frames~{n_gt} "
+        f"{pred_fps:.3g} fps | rgb={target_hw} gt_frames~{n_gt} gt_fps={gt_fps:g} "
+        f"bins_per_gt={bins_per_gt} (end-align step={gt_step:g} GT frames/emit) "
         f"device={device} methods={sorted(methods)}",
         flush=True,
     )
@@ -1107,7 +1135,8 @@ def main() -> None:
         "chunk_size": int(chunk_size),
         "spad_bin_rate_hz": float(args.spad_bin_rate_hz),
         "spad_bins_per_gt": int(bins_per_gt),
-        "frame_rate": float(args.spad_bin_rate_hz) / float(chunk_size),
+        "gt_fps": float(gt_fps),
+        "frame_rate": float(pred_fps),
         "start_bin": int(t_begin),
         "end_bin": int(t_end),
         "n_frames": int(n_frames),
@@ -1115,7 +1144,8 @@ def main() -> None:
         "gt_image_size": int(args.gt_image_size),
         "gt_from_hw": [int(gt_from_hw[0]), int(gt_from_hw[1])],
         "gt_align": "end",
-        "gt_index_formula": "(frame_idx + 1) * (chunk_size / spad_bins_per_gt)",
+        "gt_index_formula": "(frame_idx + 1) * (chunk_size / spad_bins_per_gt)  # = (i+1)*(gt_fps/pred_fps)",
+        "gt_step_frames": float(gt_step),
         "cache_mode": "raw",
         "methods": sorted(results.keys()),
         "names": {0: "left_hand", 1: "right_hand"},
