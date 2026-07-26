@@ -99,7 +99,12 @@ def _parse_args() -> argparse.Namespace:
         description="Dump 25 fps GT / detector(rgb) / QNN / HIRE poses as npy + RGB overlays"
     )
     ap.add_argument("--in_path", type=Path, required=True, help="frames.npy or sample dir")
-    ap.add_argument("--rgb_path", type=Path, required=True, help="RGB image dir, video, or .npy")
+    ap.add_argument(
+        "--rgb_path",
+        type=Path,
+        required=True,
+        help="RGB dir with frames.npy (VisionSIM rgb25fps), frames.npy path, image dir, or video",
+    )
     ap.add_argument("--gt_path", type=Path, required=True, help="GT hand annotation JSON")
     ap.add_argument("--save_dir", type=Path, required=True)
     ap.add_argument("--detector_ckpt", type=Path, required=True, help="Frozen YOLO pose detector .pt")
@@ -243,36 +248,64 @@ def _render_raw_chunk_to_bgr(
     return _tensor_frame_to_bgr(rgb)
 
 
+def _frames_npy_to_bgr_list(frames: np.ndarray, *, src: Path) -> list[np.ndarray]:
+    """Convert RGB ``frames.npy`` (NHWC or NCHW) to contiguous BGR uint8 list.
+
+    Same layout rules as ``test_rgb_pose._frames_to_bgr_list``.
+    """
+    arr = np.asarray(frames)
+    if arr.ndim == 3 and arr.shape[-1] == 3:
+        arr = arr[None, ...]
+    if arr.ndim != 4:
+        raise ValueError(f"Expected 4D RGB frames in {src}, got shape={arr.shape}")
+
+    # NHWC RGB (VisionSIM renders-rgb25fps*/frames.npy)
+    if arr.shape[-1] == 3:
+        if arr.dtype != np.uint8:
+            if np.issubdtype(arr.dtype, np.floating):
+                arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+            else:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+        frames_bgr = arr[..., ::-1]
+        return [np.ascontiguousarray(frames_bgr[i]) for i in range(frames_bgr.shape[0])]
+
+    # NCHW RGB (offline sum/ema/... style caches)
+    if arr.shape[1] == 3:
+        out = []
+        for i in range(arr.shape[0]):
+            chw = arr[i]
+            if np.issubdtype(chw.dtype, np.floating):
+                rgb = np.clip(chw * 255.0, 0, 255).astype(np.uint8)
+            else:
+                rgb = np.clip(chw, 0, 255).astype(np.uint8)
+            bgr = np.transpose(rgb, (1, 2, 0))[..., ::-1]
+            out.append(np.ascontiguousarray(bgr))
+        return out
+
+    raise ValueError(f"Unsupported frames layout {arr.shape} in {src}; expected NHWC or NCHW RGB")
+
+
 def _load_rgb_frames(rgb_path: Path) -> list[np.ndarray]:
-    """Load RGB frames as BGR uint8 list (OpenCV convention)."""
+    """Load RGB frames as BGR uint8 list (OpenCV convention).
+
+    Prefer ``frames.npy`` (dir or file) like ``det_rgb._load_rgb_frames`` /
+    ``test_rgb_pose``; fall back to image directory or video.
+    """
     if not rgb_path.exists():
         raise FileNotFoundError(rgb_path)
 
-    if rgb_path.is_file() and rgb_path.suffix.lower() == ".npy":
-        arr = np.load(rgb_path)
-        if arr.ndim == 3:
-            arr = arr[None, ...]
-        if arr.ndim != 4:
-            raise ValueError(f"RGB npy must be (T,H,W,C) or (H,W,C), got {arr.shape}")
-        frames = []
-        for i in range(arr.shape[0]):
-            fr = arr[i]
-            if fr.dtype != np.uint8:
-                fr = np.clip(fr * 255.0 if np.issubdtype(fr.dtype, np.floating) else fr, 0, 255).astype(
-                    np.uint8
-                )
-            if fr.shape[-1] == 3:
-                # assume RGB in npy
-                fr = fr[..., ::-1]
-            frames.append(np.ascontiguousarray(fr))
-        return frames
-
+    # Directory with frames.npy (VisionSIM rgb25fps layout)
     if rgb_path.is_dir():
+        npy = rgb_path / "frames.npy"
+        if npy.is_file():
+            return _frames_npy_to_bgr_list(np.load(npy), src=npy)
         paths = sorted(
             p for p in rgb_path.iterdir() if p.is_file() and p.suffix.lower() in _IMG_EXTS
         )
         if not paths:
-            raise FileNotFoundError(f"No images under {rgb_path}")
+            raise FileNotFoundError(
+                f"Directory input requires frames.npy (or images), not found under {rgb_path}"
+            )
         frames = []
         for p in paths:
             img = cv2.imread(str(p), cv2.IMREAD_COLOR)
@@ -281,7 +314,11 @@ def _load_rgb_frames(rgb_path: Path) -> list[np.ndarray]:
             frames.append(img)
         return frames
 
-    # video file
+    # Direct .npy path
+    if rgb_path.is_file() and rgb_path.suffix.lower() == ".npy":
+        return _frames_npy_to_bgr_list(np.load(rgb_path), src=rgb_path)
+
+    # Video file
     cap = cv2.VideoCapture(str(rgb_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open RGB video/path: {rgb_path}")
