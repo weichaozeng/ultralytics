@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
 """3D spatiotemporal pose + bbox-center trajectories from ``vis_main_pose.py``.
 
-Loads ``{gt,rgb,qnn,hire}/poses.npy`` and draws:
+Loads ``{gt,rgb,qnn,hire}/poses.npy`` and draws **one figure per method**:
 - hand skeletons at ~6–8 uniformly spaced frames
-- bbox-center polylines over the full ``[start_frame, end_frame)`` window
+- bbox-center polylines over ``[start_frame, end_frame)``
 
-Camera / axes match ``vis_spad_bins_3d.py``:
-  plot (X, Y, Z) = (x_img, t, y_img), elev=18, azim=-70, invert_zaxis, axes off.
-No image planes or SPAD voxels — pose sticks + trajectories only.
+Camera matches ``vis_spad_bins_3d.py``:
+  plot (X, Y, Z) = (x_img, t, y_img), elev=18, azim=-70, invert_zaxis.
+Simple axis lines/labels (no grid). No image planes.
+
+Also saves RGB first / mid / last frames in the same window via ``--rgb_path``
+(``frames.npy`` dir or file, same as ``vis_main_pose`` / ``test_rgb_pose``).
 
 Examples
 --------
 python ultralytics/vis_main_pose_3d.py \\
   --in_dir /tmp/main_pose \\
+  --rgb_path /path/to/renders-rgb25fps-8kHz/sample \\
   --start_frame 0 --end_frame 40 \\
   --n_poses 7 \\
-  --save /tmp/pose_traj_3d.png --no_show
+  --save /tmp/pose_traj_3d --no_show
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 
 
@@ -36,12 +43,11 @@ BONE_CONNECTIONS = [
     (0, 17), (17, 18), (18, 19), (19, 20),
 ]
 
-# Distinct RGB colors per method (matplotlib)
 METHOD_COLORS = {
-    "gt": (0.15, 0.15, 0.15),       # near-black
-    "rgb": (0.20, 0.45, 0.95),      # blue (pure detector)
-    "qnn": (0.90, 0.45, 0.10),      # orange
-    "hire": (0.15, 0.70, 0.35),     # green
+    "gt": (0.15, 0.15, 0.15),
+    "rgb": (0.20, 0.45, 0.95),
+    "qnn": (0.90, 0.45, 0.10),
+    "hire": (0.15, 0.70, 0.35),
 }
 
 METHOD_ORDER = ("gt", "rgb", "qnn", "hire")
@@ -49,9 +55,15 @@ METHOD_ORDER = ("gt", "rgb", "qnn", "hire")
 
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="3D pose skeletons + bbox-center trajectories from vis_main_pose output"
+        description="Per-method 3D pose trajectories from vis_main_pose + RGB keyframes"
     )
     ap.add_argument("--in_dir", type=Path, required=True, help="Output dir from vis_main_pose.py")
+    ap.add_argument(
+        "--rgb_path",
+        type=Path,
+        required=True,
+        help="RGB dir with frames.npy, frames.npy path, image dir, or video",
+    )
     ap.add_argument("--start_frame", type=int, default=0)
     ap.add_argument("--end_frame", type=int, default=-1, help="Exclusive; <0 = until end")
     ap.add_argument(
@@ -77,18 +89,33 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--azim", type=float, default=-70.0)
     ap.add_argument("--figsize", type=float, nargs=2, default=[10.0, 8.0])
     ap.add_argument("--dpi", type=int, default=200)
-    ap.add_argument("--bg", type=str, default="none", help="Figure facecolor; 'none' = transparent")
+    ap.add_argument("--bg", type=str, default="white", help="Figure facecolor; 'none' = transparent")
     ap.add_argument("--bone_lw", type=float, default=1.6)
     ap.add_argument("--traj_lw", type=float, default=2.0)
     ap.add_argument("--joint_size", type=float, default=8.0)
     ap.add_argument("--kpt_thresh", type=float, default=0.5)
     ap.add_argument("--pale", type=float, default=0.55, help="Early-pose mix toward white")
     ap.add_argument("--deep", type=float, default=0.55, help="Late-pose brightness scale")
-    ap.add_argument("--legend", action="store_true", help="Show method legend")
-    ap.add_argument("--per_method", action="store_true", help="Also save one PNG per method")
-    ap.add_argument("--save", type=Path, default=None, help="Output PNG path")
+    ap.add_argument(
+        "--save",
+        type=Path,
+        required=True,
+        help="Output folder for per-method traj PNGs + RGB first/mid/last frames",
+    )
     ap.add_argument("--no_show", action="store_true")
     return ap.parse_args()
+
+
+def _load_vis_main_pose_rgb():
+    path = Path(__file__).resolve().parent / "vis_main_pose.py"
+    spec = importlib.util.spec_from_file_location("vis_main_pose", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    # Avoid colliding with a package named vis_main_pose if imported elsewhere.
+    sys.modules["vis_main_pose_for_3d"] = mod
+    spec.loader.exec_module(mod)
+    return mod._load_rgb_frames
 
 
 def _uniform_sample_indices(n_total: int, n_keep: int) -> list[int]:
@@ -139,7 +166,6 @@ def _load_poses(method_dir: Path) -> list[dict[str, Any]]:
     frames = list(arr)
     if not frames:
         return []
-    # Normalize numpy arrays inside
     out = []
     for fr in frames:
         hands = []
@@ -179,7 +205,6 @@ def _pick_hand(frame: dict[str, Any], cls_id: int) -> dict[str, Any] | None:
     cands = [h for h in frame["hands"] if int(h["cls"]) == int(cls_id)]
     if not cands:
         return None
-    # highest score
     return max(cands, key=lambda h: float(h.get("score", 0.0)))
 
 
@@ -229,7 +254,6 @@ def _draw_skeleton(
         ks = kpts[s]
         ke = kpts[e]
         if ks[2] > kpt_thresh and ke[2] > kpt_thresh:
-            # (X,Y,Z) = (x, t, y)
             ax.plot(
                 [ks[0], ke[0]],
                 [t, t],
@@ -251,20 +275,25 @@ def _draw_skeleton(
         )
 
 
-def _style_axes(ax, face: str) -> None:
-    ax.set_axis_off()
+def _style_axes_simple(ax) -> None:
+    """Keep axis lines + labels; hide grid and pane fill."""
     ax.grid(False)
+    ax.set_xlabel("x")
+    ax.set_ylabel("t")
+    ax.set_zlabel("y")
+    ax.tick_params(labelsize=8)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis._axinfo["grid"]["linewidth"] = 0.0
         axis.pane.fill = False
-        axis.pane.set_edgecolor((1, 1, 1, 0.0))
+        axis.pane.set_edgecolor((0.75, 0.75, 0.75, 0.35))
         axis.pane.set_alpha(0.0)
-        axis.line.set_color((1, 1, 1, 0.0))
+        axis.line.set_color((0.25, 0.25, 0.25, 1.0))
 
 
-def _draw_methods(
+def _draw_one_method(
     ax,
-    method_frames: dict[str, list[dict[str, Any]]],
+    method: str,
+    frames: list[dict[str, Any]],
     *,
     pose_local_idxs: list[int],
     hand_mode: str,
@@ -274,76 +303,65 @@ def _draw_methods(
     joint_size: float,
     pale: float,
     deep: float,
-    legend: bool,
 ) -> None:
-    from matplotlib.lines import Line2D
-
-    legend_handles = []
+    base = METHOD_COLORS.get(method, (0.5, 0.5, 0.5))
     n_pose = max(len(pose_local_idxs), 1)
 
-    for method, frames in method_frames.items():
-        base = METHOD_COLORS.get(method, (0.5, 0.5, 0.5))
-        legend_handles.append(Line2D([0], [0], color=base, lw=2.5, label=method))
+    cls_ids = []
+    if hand_mode in {"both", "left"}:
+        cls_ids.append(0)
+    if hand_mode in {"both", "right"}:
+        cls_ids.append(1)
 
-        cls_ids = []
-        if hand_mode in {"both", "left"}:
-            cls_ids.append(0)
-        if hand_mode in {"both", "right"}:
-            cls_ids.append(1)
+    for cls_id in cls_ids:
+        xs, ys, ts = _trajectory(frames, cls_id)
+        if xs.size >= 2:
+            ax.plot(
+                xs,
+                ts,
+                ys,
+                color=base,
+                linewidth=float(traj_lw),
+                alpha=0.9,
+                solid_capstyle="round",
+            )
+        elif xs.size == 1:
+            ax.scatter([xs[0]], [ts[0]], [ys[0]], c=[base], s=20, depthshade=False)
 
-        for cls_id in cls_ids:
-            xs, ys, ts = _trajectory(frames, cls_id)
-            if xs.size >= 2:
-                ax.plot(
-                    xs,
-                    ts,
-                    ys,
-                    color=base,
-                    linewidth=float(traj_lw),
-                    alpha=0.9,
-                    solid_capstyle="round",
-                )
-            elif xs.size == 1:
-                ax.scatter([xs[0]], [ts[0]], [ys[0]], c=[base], s=20, depthshade=False)
-
-        for pi, local_i in enumerate(pose_local_idxs):
-            if local_i < 0 or local_i >= len(frames):
+    for pi, local_i in enumerate(pose_local_idxs):
+        if local_i < 0 or local_i >= len(frames):
+            continue
+        fr = frames[local_i]
+        t = float(fr["frame_idx"])
+        shade = 0.0 if n_pose <= 1 else float(pi) / float(n_pose - 1)
+        color = _shade_rgb(base, shade, pale=pale, deep=deep)
+        for hand in fr["hands"]:
+            if not _hand_allowed(int(hand["cls"]), hand_mode):
                 continue
-            fr = frames[local_i]
-            t = float(fr["frame_idx"])
-            shade = 0.0 if n_pose <= 1 else float(pi) / float(n_pose - 1)
-            color = _shade_rgb(base, shade, pale=pale, deep=deep)
-            for hand in fr["hands"]:
-                if not _hand_allowed(int(hand["cls"]), hand_mode):
-                    continue
-                _draw_skeleton(
-                    ax,
-                    hand,
-                    t,
-                    color,
-                    kpt_thresh=kpt_thresh,
-                    bone_lw=bone_lw,
-                    joint_size=joint_size,
-                )
-
-    if legend and legend_handles:
-        ax.legend(handles=legend_handles, loc="upper left", frameon=False)
+            _draw_skeleton(
+                ax,
+                hand,
+                t,
+                color,
+                kpt_thresh=kpt_thresh,
+                bone_lw=bone_lw,
+                joint_size=joint_size,
+            )
 
 
-def _axis_limits(method_frames: dict[str, list[dict[str, Any]]]) -> tuple[float, float, float, float, float, float]:
+def _axis_limits(frames: list[dict[str, Any]]) -> tuple[float, float, float, float, float, float]:
     xs, ys, ts = [], [], []
-    for frames in method_frames.values():
-        for fr in frames:
-            ts.append(float(fr["frame_idx"]))
-            for hand in fr["hands"]:
-                k = np.asarray(hand["keypoints"], dtype=np.float64)
-                if k.size == 0:
-                    continue
-                xs.extend(k[:, 0].tolist())
-                ys.extend(k[:, 1].tolist())
-                c = hand["bbox_center"]
-                xs.append(float(c[0]))
-                ys.append(float(c[1]))
+    for fr in frames:
+        ts.append(float(fr["frame_idx"]))
+        for hand in fr["hands"]:
+            k = np.asarray(hand["keypoints"], dtype=np.float64)
+            if k.size == 0:
+                continue
+            xs.extend(k[:, 0].tolist())
+            ys.extend(k[:, 1].tolist())
+            c = hand["bbox_center"]
+            xs.append(float(c[0]))
+            ys.append(float(c[1]))
     if not xs:
         return 0.0, 1.0, 0.0, 1.0, 0.0, 1.0
     pad_x = max((max(xs) - min(xs)) * 0.05, 1.0)
@@ -359,17 +377,62 @@ def _axis_limits(method_frames: dict[str, list[dict[str, Any]]]) -> tuple[float,
     )
 
 
+def _first_mid_last_indices(start: int, end: int) -> tuple[int, int, int]:
+    """Inclusive frame indices for first / mid / last in ``[start, end)``."""
+    if end <= start:
+        raise ValueError(f"Empty range [{start}, {end})")
+    first = int(start)
+    last = int(end - 1)
+    mid = int(start + (end - start - 1) // 2)
+    return first, mid, last
+
+
+def _save_rgb_keyframes(
+    *,
+    rgb_path: Path,
+    save_dir: Path,
+    start: int,
+    end: int,
+) -> list[Path]:
+    load_rgb = _load_vis_main_pose_rgb()
+    frames = load_rgb(rgb_path)
+    n_rgb = len(frames)
+    if n_rgb <= 0:
+        raise RuntimeError(f"No RGB frames loaded from {rgb_path}")
+
+    first, mid, last = _first_mid_last_indices(start, end)
+    # Map 25 fps indices into RGB length (1:1 when RGB is already 25 fps).
+    picks = {
+        "first": int(np.clip(first, 0, n_rgb - 1)),
+        "mid": int(np.clip(mid, 0, n_rgb - 1)),
+        "last": int(np.clip(last, 0, n_rgb - 1)),
+    }
+    saved = []
+    for tag, idx in picks.items():
+        out = save_dir / f"rgb_{tag}_frame{idx:07d}.png"
+        ok = cv2.imwrite(str(out), frames[idx])
+        if not ok:
+            raise RuntimeError(f"Failed to write {out}")
+        saved.append(out)
+        print(f"saved {out} (rgb idx={idx})", flush=True)
+    return saved
+
+
 def main() -> None:
     args = _parse_args()
     in_dir = args.in_dir
     if not in_dir.is_dir():
         raise FileNotFoundError(in_dir)
 
+    save_dir = args.save
+    if save_dir.suffix.lower() in {".png", ".jpg", ".jpeg", ".pdf", ".svg"}:
+        raise ValueError(f"--save must be a folder path, got file-like {save_dir}")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
     methods = [m.strip().lower() for m in str(args.methods).split(",") if m.strip()]
     for m in methods:
         if m not in METHOD_COLORS:
             raise ValueError(f"Unknown method {m!r}; expected one of {list(METHOD_COLORS)}")
-    # stable order
     methods = [m for m in METHOD_ORDER if m in methods]
 
     meta_path = in_dir / "meta.json"
@@ -382,7 +445,6 @@ def main() -> None:
     for m in methods:
         loaded[m] = _load_poses(in_dir / m)
 
-    # Common length
     lengths = [len(v) for v in loaded.values() if v]
     if not lengths:
         raise RuntimeError(f"No poses.npy found under {in_dir} for methods {methods}")
@@ -398,8 +460,10 @@ def main() -> None:
     if start >= end:
         raise ValueError(f"Empty frame range [{start}, {end}) with n_frames={n_all}")
 
-    windowed = {m: [fr for fr in frames if start <= int(fr["frame_idx"]) < end] for m, frames in loaded.items()}
-    # Ensure contiguous local list; re-index not needed — keep original frame_idx for t axis
+    windowed = {
+        m: [fr for fr in frames if start <= int(fr["frame_idx"]) < end]
+        for m, frames in loaded.items()
+    }
     for m, frames in windowed.items():
         if not frames:
             raise RuntimeError(f"Method {m}: no frames in [{start}, {end})")
@@ -407,12 +471,14 @@ def main() -> None:
     n_window = len(next(iter(windowed.values())))
     n_poses = int(np.clip(int(args.n_poses), 6, 8))
     pose_local_idxs = _uniform_sample_indices(n_window, n_poses)
+    first_i, mid_i, last_i = _first_mid_last_indices(start, end)
 
     print(
         f"in_dir={in_dir} frames=[{start},{end}) n={n_window} n_poses={n_poses} "
         f"idxs={pose_local_idxs} methods={methods} hand={args.hand}",
         flush=True,
     )
+    print(f"rgb keyframes: first={first_i} mid={mid_i} last={last_i}", flush=True)
     if meta:
         print(
             f"meta: chunk={meta.get('chunk_size')} rate={meta.get('spad_bin_rate_hz')} "
@@ -420,20 +486,30 @@ def main() -> None:
             flush=True,
         )
 
+    # RGB first / mid / last
+    _save_rgb_keyframes(
+        rgb_path=args.rgb_path,
+        save_dir=save_dir,
+        start=start,
+        end=end,
+    )
+
     import matplotlib
 
-    if args.save is not None and args.no_show:
+    if args.no_show:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     face = "none" if str(args.bg).lower() in {"none", "transparent"} else args.bg
 
-    def _make_fig(method_subset: dict[str, list[dict[str, Any]]]):
+    shown = None
+    for method, frames in windowed.items():
         fig = plt.figure(figsize=tuple(args.figsize), facecolor=face)
         ax = fig.add_subplot(111, projection="3d", facecolor=face)
-        _draw_methods(
+        _draw_one_method(
             ax,
-            method_subset,
+            method,
+            frames,
             pose_local_idxs=pose_local_idxs,
             hand_mode=str(args.hand),
             kpt_thresh=float(args.kpt_thresh),
@@ -442,51 +518,41 @@ def main() -> None:
             joint_size=float(args.joint_size),
             pale=float(args.pale),
             deep=float(args.deep),
-            legend=bool(args.legend),
         )
-        xmin, xmax, tmin, tmax, ymin, ymax = _axis_limits(method_subset)
+        xmin, xmax, tmin, tmax, ymin, ymax = _axis_limits(frames)
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(tmin, tmax)
         ax.set_zlim(ymin, ymax)
         ax.view_init(elev=float(args.elev), azim=float(args.azim))
         ax.invert_zaxis()
-        _style_axes(ax, face)
-        fig.tight_layout(pad=0)
-        return fig
+        _style_axes_simple(ax)
+        ax.set_title(method, fontsize=11, pad=2)
+        fig.tight_layout(pad=0.4)
 
-    fig = _make_fig(windowed)
-    if args.save is not None:
-        args.save.parent.mkdir(parents=True, exist_ok=True)
+        out_path = save_dir / f"{method}_traj3d.png"
         fig.savefig(
-            args.save,
+            out_path,
             dpi=int(args.dpi),
             bbox_inches="tight",
             facecolor=face,
             edgecolor="none",
             transparent=(face == "none"),
         )
-        print(f"saved {args.save}", flush=True)
+        print(f"saved {out_path}", flush=True)
 
-    if args.per_method:
-        base = args.save if args.save is not None else in_dir / "pose_traj_3d.png"
-        for m, frames in windowed.items():
-            fig_m = _make_fig({m: frames})
-            out_m = base.with_name(f"{base.stem}_{m}{base.suffix}")
-            fig_m.savefig(
-                out_m,
-                dpi=int(args.dpi),
-                bbox_inches="tight",
-                facecolor=face,
-                edgecolor="none",
-                transparent=(face == "none"),
-            )
-            print(f"saved {out_m}", flush=True)
-            plt.close(fig_m)
+        if not args.no_show:
+            if shown is not None:
+                plt.close(shown)
+            shown = fig
+        else:
+            plt.close(fig)
 
     if not args.no_show:
         plt.show()
-    else:
-        plt.close(fig)
+    elif shown is not None:
+        plt.close(shown)
+
+    print(f"Done → {save_dir}", flush=True)
 
 
 if __name__ == "__main__":
