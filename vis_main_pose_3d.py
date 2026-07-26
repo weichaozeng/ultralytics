@@ -143,11 +143,22 @@ def _parse_args() -> argparse.Namespace:
         help="Keep every Nth RGB frame in the window for the cube",
     )
     ap.add_argument(
+        "--rgb_alpha_first",
+        type=float,
+        default=0.6,
+        help="Fixed RGB opacity for the first plane (default 0.6)",
+    )
+    ap.add_argument(
+        "--rgb_alpha_last",
+        type=float,
+        default=0.9,
+        help="Fixed RGB opacity for the last plane (default 0.9)",
+    )
+    ap.add_argument(
         "--rgb_alpha_start",
         type=float,
         default=0.7,
-        help="RGB opacity at 2nd plane (start of interior start→mid→end); "
-        "first/last planes are fixed at 0.9",
+        help="RGB opacity at 2nd plane (start of interior start→mid→end)",
     )
     ap.add_argument(
         "--rgb_alpha_mid",
@@ -159,8 +170,7 @@ def _parse_args() -> argparse.Namespace:
         "--rgb_alpha_end",
         type=float,
         default=0.7,
-        help="RGB opacity at 2nd-to-last plane (end of interior start→mid→end); "
-        "first/last planes are fixed at 0.9",
+        help="RGB opacity at 2nd-to-last plane (end of interior start→mid→end)",
     )
     ap.add_argument(
         "--save",
@@ -762,23 +772,29 @@ def _rgb_slice_alpha(
     i: int,
     n: int,
     *,
+    alpha_first: float,
+    alpha_last: float,
     alpha_start: float,
     alpha_mid: float,
     alpha_end: float,
 ) -> float:
     """Opacity for slice ``i`` in ``[0, n)``.
 
-    First and last planes are fixed at 0.9. Planes ``[1, n-2]`` use
-    piecewise-linear ``alpha_start → alpha_mid → alpha_end``.
+    First/last planes use fixed ``alpha_first`` / ``alpha_last``.
+    Planes ``[1, n-2]`` use piecewise-linear
+    ``alpha_start → alpha_mid → alpha_end``.
     """
-    fixed = 0.9
+    a_first = float(np.clip(alpha_first, 0.0, 1.0))
+    a_last = float(np.clip(alpha_last, 0.0, 1.0))
     a0 = float(np.clip(alpha_start, 0.0, 1.0))
     a1 = float(np.clip(alpha_mid, 0.0, 1.0))
     a2 = float(np.clip(alpha_end, 0.0, 1.0))
     if n <= 1:
-        return fixed
-    if i <= 0 or i >= n - 1:
-        return fixed
+        return a_first
+    if i <= 0:
+        return a_first
+    if i >= n - 1:
+        return a_last
     # Interior indices 1 .. n-2 → t in [0, 1]
     n_int = n - 2
     if n_int <= 1:
@@ -813,6 +829,8 @@ def _render_rgb_cube(
     stride_t = int(args.rgb_stride_t)
     if stride_xy < 1 or stride_t < 1:
         raise ValueError("rgb strides must be >= 1")
+    alpha_first = float(args.rgb_alpha_first)
+    alpha_last = float(args.rgb_alpha_last)
     alpha_start = float(args.rgb_alpha_start)
     alpha_mid = float(args.rgb_alpha_mid)
     alpha_end = float(args.rgb_alpha_end)
@@ -824,7 +842,8 @@ def _render_rgb_cube(
     print(
         f"RGB cube: {rgb_path} frames={n_planes} "
         f"stride_xy={stride_xy} stride_t={stride_t} "
-        f"alpha_ends=0.9 interior={alpha_start:g}/{alpha_mid:g}/{alpha_end:g}",
+        f"alpha_first/last={alpha_first:g}/{alpha_last:g} "
+        f"interior={alpha_start:g}/{alpha_mid:g}/{alpha_end:g}",
         flush=True,
     )
 
@@ -842,6 +861,8 @@ def _render_rgb_cube(
         alpha = _rgb_slice_alpha(
             plane_i,
             n_planes,
+            alpha_first=alpha_first,
+            alpha_last=alpha_last,
             alpha_start=alpha_start,
             alpha_mid=alpha_mid,
             alpha_end=alpha_end,
