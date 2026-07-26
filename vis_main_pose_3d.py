@@ -297,9 +297,10 @@ def _draw_skeleton(
 def _style_axes_simple(ax) -> None:
     """Keep axis lines + labels; hide grid and pane fill."""
     ax.grid(False)
-    ax.set_xlabel("x (px)")
-    ax.set_ylabel("t (ms)")
-    ax.set_zlabel("y (px)")
+    label_kw = {"fontname": "Times New Roman", "fontsize": 10}
+    ax.set_xlabel("x (px)", **label_kw)
+    ax.set_ylabel("t (ms)", **label_kw)
+    ax.set_zlabel("y (px)", **label_kw)
     ax.tick_params(labelsize=8)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis._axinfo["grid"]["linewidth"] = 0.0
@@ -307,6 +308,9 @@ def _style_axes_simple(ax) -> None:
         axis.pane.set_edgecolor((0.75, 0.75, 0.75, 0.35))
         axis.pane.set_alpha(0.0)
         axis.line.set_color((0.25, 0.25, 0.25, 1.0))
+    # Tick labels → Times New Roman when available.
+    for lbl in list(ax.get_xticklabels()) + list(ax.get_yticklabels()) + list(ax.get_zticklabels()):
+        lbl.set_fontname("Times New Roman")
 
 
 def _draw_one_method(
@@ -531,6 +535,16 @@ def main() -> None:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    # Times New Roman for axis labels / ticks (fallback if font missing).
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+            "mathtext.fontset": "stix",
+            "axes.unicode_minus": False,
+        }
+    )
+
     face = "none" if str(args.bg).lower() in {"none", "transparent"} else args.bg
 
     shown = None
@@ -558,7 +572,6 @@ def main() -> None:
         ax.view_init(elev=float(args.elev), azim=float(args.azim))
         ax.invert_zaxis()
         _style_axes_simple(ax)
-        ax.set_title(method, fontsize=11, pad=2)
         fig.tight_layout(pad=0.4)
 
         out_path = save_dir / f"{method}_traj3d.png"
