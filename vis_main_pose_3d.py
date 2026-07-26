@@ -142,7 +142,18 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Keep every Nth RGB frame in the window for the cube",
     )
-    ap.add_argument("--rgb_alpha", type=float, default=0.85, help="RGB plane opacity")
+    ap.add_argument(
+        "--rgb_alpha_ends",
+        type=float,
+        default=0.7,
+        help="RGB plane opacity at first/last slice (default 0.7)",
+    )
+    ap.add_argument(
+        "--rgb_alpha_mid",
+        type=float,
+        default=0.2,
+        help="RGB plane opacity at middle slice (default 0.2); linear blend ends→mid→ends",
+    )
     ap.add_argument(
         "--save",
         type=Path,
@@ -739,6 +750,18 @@ def _render_spad_cube(
     plt.close(fig)
 
 
+def _rgb_slice_alpha(i: int, n: int, *, alpha_ends: float, alpha_mid: float) -> float:
+    """Opacity for slice ``i`` in ``[0, n)``: ends → mid → ends (linear)."""
+    a0 = float(np.clip(alpha_ends, 0.0, 1.0))
+    a1 = float(np.clip(alpha_mid, 0.0, 1.0))
+    if n <= 1:
+        return a0
+    # t=0 at first, 1 at last; dist_to_mid in [0,1] with 0 at ends and 1 at center.
+    t = float(i) / float(n - 1)
+    dist_to_mid = min(t, 1.0 - t) / 0.5
+    return float(a0 + (a1 - a0) * dist_to_mid)
+
+
 def _render_rgb_cube(
     *,
     rgb_path: Path,
@@ -761,21 +784,24 @@ def _render_rgb_cube(
     stride_t = int(args.rgb_stride_t)
     if stride_xy < 1 or stride_t < 1:
         raise ValueError("rgb strides must be >= 1")
-    alpha = float(np.clip(args.rgb_alpha, 0.0, 1.0))
+    alpha_ends = float(args.rgb_alpha_ends)
+    alpha_mid = float(args.rgb_alpha_mid)
 
     frame_idxs = list(range(int(start), int(end), stride_t))
     if not frame_idxs:
         raise ValueError(f"Empty RGB frame range [{start}, {end}) stride_t={stride_t}")
+    n_planes = len(frame_idxs)
     print(
-        f"RGB cube: {rgb_path} frames={len(frame_idxs)} "
-        f"stride_xy={stride_xy} stride_t={stride_t} alpha={alpha:g}",
+        f"RGB cube: {rgb_path} frames={n_planes} "
+        f"stride_xy={stride_xy} stride_t={stride_t} "
+        f"alpha_ends={alpha_ends:g} alpha_mid={alpha_mid:g}",
         flush=True,
     )
 
     fig = plt.figure(figsize=tuple(args.figsize), facecolor=face)
     ax = fig.add_subplot(111, projection="3d", facecolor=face)
 
-    for fi in frame_idxs:
+    for plane_i, fi in enumerate(frame_idxs):
         idx = int(np.clip(fi, 0, n_rgb - 1))
         bgr = frames[idx]
         if stride_xy > 1:
@@ -783,6 +809,9 @@ def _render_rgb_cube(
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         h, w, _ = rgb.shape
         t_ms = _frame_to_ms(fi, ms_per_frame)
+        alpha = _rgb_slice_alpha(
+            plane_i, n_planes, alpha_ends=alpha_ends, alpha_mid=alpha_mid
+        )
 
         # Map strided plane back to original pixel units (match pose coords).
         xs = np.linspace(0.0, float((w - 1) * stride_xy), w, dtype=np.float32)
