@@ -16,6 +16,11 @@ python ultralytics/vis_spad_bins_3d.py \\
   --in_dir /tmp/spad_bins_bayer \\
   --mode full --stride_xy 4 \\
   --save /tmp/spad_cube.png --no_show
+
+# Sparse cube (few slices, full t-extent → visible lower rate)
+python ultralytics/vis_spad_bins_3d.py \\
+  --in_dir /tmp/spad_bins_bayer \\
+  --n_slices 5 --save /tmp/spad_sparse.png --no_show
 """
 
 from __future__ import annotations
@@ -118,7 +123,33 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use 0..N-1 as t instead of filename bin indices",
     )
+    ap.add_argument(
+        "--n_slices",
+        type=int,
+        default=0,
+        help="If >0, keep only this many evenly spaced frames at true bin t; "
+        "full t-extent is kept so gaps show lower temporal density (0 = all frames)",
+    )
     return ap.parse_args()
+
+
+def _select_n_slices(
+    files: list[tuple[int, Path]],
+    n_slices: int,
+) -> list[tuple[int, Path]]:
+    if int(n_slices) <= 0 or len(files) <= int(n_slices):
+        return list(files)
+    n = int(n_slices)
+    idxs = np.round(np.linspace(0, len(files) - 1, n)).astype(int)
+    seen: set[int] = set()
+    out: list[tuple[int, Path]] = []
+    for i in idxs:
+        ii = int(i)
+        if ii in seen:
+            continue
+        seen.add(ii)
+        out.append(files[ii])
+    return out
 
 
 def _list_bin_files(in_dir: Path, pattern: str) -> list[tuple[int, Path]]:
@@ -229,9 +260,12 @@ def _subsample(
 
 def main() -> None:
     args = _parse_args()
-    files = _list_bin_files(args.in_dir, args.glob)
-    print(f"found {len(files)} frames in {args.in_dir}")
-    print(f"bin index range: {files[0][0]} … {files[-1][0]}")
+    files_all = _list_bin_files(args.in_dir, args.glob)
+    print(f"found {len(files_all)} frames in {args.in_dir}")
+    print(f"bin index range: {files_all[0][0]} … {files_all[-1][0]}")
+    files = _select_n_slices(files_all, int(args.n_slices))
+    if len(files) != len(files_all):
+        print(f"n_slices={args.n_slices}: {len(files_all)} → {len(files)} frames (true t, full extent)")
     print(f"mode={args.mode} stride_xy={args.stride_xy}")
 
     x, y, t, v = _collect_voxels(
@@ -290,6 +324,14 @@ def main() -> None:
             alpha=float(args.alpha),
             linewidths=0,
         )
+
+    # Keep full bin-index span on t so sparse slices leave gaps inside a cube.
+    if (
+        int(args.n_slices) > 0
+        and len(files_all) >= 2
+        and not bool(args.t_as_index)
+    ):
+        ax.set_ylim(float(files_all[0][0]), float(files_all[-1][0]))
 
     ax.view_init(elev=float(args.elev), azim=float(args.azim))
     # Image row increases downward → flip vertical axis for natural upright view.

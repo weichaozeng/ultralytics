@@ -5,7 +5,8 @@ Memory-safe: streams frames with a fixed-size reservoir (``--max_points``),
 mmap-loads ``.npy``, and frees each figure before the next channel.
 
 - ``s_raw`` / ``n_slow``: dense per-bin cube, colored by value (turbo).
-- ``out``: every ``--out_emit``-th bin at true ``t`` (gaps show downsample).
+- ``out``: only ``--out_n_slices`` frames (default 5) at true ``t``, full t-extent
+  kept so gaps show lower frame-rate while the volume stays cube-shaped.
 - ``out_dense``: all ``out/`` bins dense along ``t`` (same ``--out_*`` knobs as ``out``).
 
 Examples
@@ -14,7 +15,7 @@ python ultralytics/vis_hire_bins_3d.py \\
   --in_dir /tmp/hire_bins \\
   --save_dir /tmp/hire_bins_3d \\
   --which s_raw,n_slow,out,out_dense \\
-  --max_points 300000 --no_show
+  --out_n_slices 5 --max_points 300000 --no_show
 """
 
 from __future__ import annotations
@@ -41,10 +42,18 @@ def _parse_args() -> argparse.Namespace:
         help="Comma-separated: s_raw,n_slow,out,out_dense",
     )
     ap.add_argument(
+        "--out_n_slices",
+        type=int,
+        default=5,
+        help="Sparse out: how many frames to keep (default 5); 0 = use --out_emit instead. "
+        "out_dense ignores this",
+    )
+    ap.add_argument(
         "--out_emit",
         type=int,
         default=320,
-        help="Temporal downsample for sparse out only (default 320); out_dense ignores this",
+        help="Legacy temporal stride for sparse out when --out_n_slices 0 (default 320); "
+        "out_dense ignores this",
     )
     ap.add_argument("--out_slab", type=int, default=1)
     ap.add_argument("--out_alpha", type=float, default=0.4)
@@ -101,11 +110,33 @@ def _load_hw_mmap(path: Path) -> np.ndarray:
     return img
 
 
-def _select_out_files(files: list[tuple[int, Path]], *, emit: int) -> list[tuple[int, Path]]:
-    if emit < 1:
-        raise ValueError("--out_emit must be >= 1")
+def _select_out_files(
+    files: list[tuple[int, Path]],
+    *,
+    n_slices: int,
+    emit: int,
+) -> list[tuple[int, Path]]:
+    """Pick sparse out frames at true bin indices (gaps show lower rate)."""
     if not files:
         return []
+    if int(n_slices) > 0:
+        n = int(n_slices)
+        if len(files) <= n:
+            return list(files)
+        # Evenly spaced across the full sequence (include first & last).
+        idxs = np.round(np.linspace(0, len(files) - 1, n)).astype(int)
+        seen: set[int] = set()
+        out: list[tuple[int, Path]] = []
+        for i in idxs:
+            ii = int(i)
+            if ii in seen:
+                continue
+            seen.add(ii)
+            out.append(files[ii])
+        return out
+
+    if emit < 1:
+        raise ValueError("--out_emit must be >= 1 when --out_n_slices is 0")
     phase = int(files[0][0]) % int(emit)
     selected = [(idx, p) for idx, p in files if int(idx) % int(emit) == phase]
     return selected if selected else files[::emit]
@@ -277,9 +308,17 @@ def _process_channel(
         alpha = float(args.out_alpha)
         max_points = int(args.out_max_points) if int(args.out_max_points) > 0 else int(args.max_points)
         if name == "out":
-            use_files = _select_out_files(files, emit=int(args.out_emit))
+            use_files = _select_out_files(
+                files,
+                n_slices=int(args.out_n_slices),
+                emit=int(args.out_emit),
+            )
+            if int(args.out_n_slices) > 0:
+                how = f"n_slices={args.out_n_slices}"
+            else:
+                how = f"emit={args.out_emit}"
             print(
-                f"[{name}] sparse emit={args.out_emit}: {len(files)} → {len(use_files)} slices | "
+                f"[{name}] sparse {how}: {len(files)} → {len(use_files)} slices | "
                 f"alpha={alpha:g} stride_xy={stride_xy} point_size={point_size:g} max_points={max_points}"
             )
         else:

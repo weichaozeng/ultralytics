@@ -167,6 +167,9 @@ class HIRE(nn.Module):
         self._zeros_hw: Tensor | None = None
         self._compiled_step = None
         self._use_compiled_step = True
+        # Morph accounting (bins where open/geodesic actually ran).
+        self._morph_bins_seen: int = 0
+        self._morph_bins_active: int = 0
 
     def effective_mix_hold_bins(self) -> int:
         """Hold length H. ``H<0`` → chunk/subsampling (legacy); ``H>=0`` → that many bins."""
@@ -232,6 +235,21 @@ class HIRE(nn.Module):
         self.confirm_count = None
         self.t_mix = None
 
+    def reset_morph_stats(self) -> None:
+        self._ensure_infer_runtime_attrs()
+        self._morph_bins_seen = 0
+        self._morph_bins_active = 0
+
+    def morph_stats(self) -> dict[str, float | int]:
+        self._ensure_infer_runtime_attrs()
+        seen = int(self._morph_bins_seen)
+        active = int(self._morph_bins_active)
+        return {
+            "morph_bins_seen": seen,
+            "morph_bins_active": active,
+            "morph_frac": (float(active) / float(seen)) if seen > 0 else 0.0,
+        }
+
     def _ensure_infer_runtime_attrs(self) -> None:
         """Init scratch/compile fields missing on older pickled HIRE checkpoints."""
         if not hasattr(self, "_buf_key"):
@@ -244,6 +262,10 @@ class HIRE(nn.Module):
             self._compiled_step = None
         if not hasattr(self, "_use_compiled_step"):
             self._use_compiled_step = True
+        if not hasattr(self, "_morph_bins_seen"):
+            self._morph_bins_seen = 0
+        if not hasattr(self, "_morph_bins_active"):
+            self._morph_bins_active = 0
 
     def _ensure_scratch(self, ref: Tensor) -> tuple[Tensor, Tensor]:
         """Reuse ones/zeros H×W buffers across bins (same device/dtype/shape)."""
@@ -462,8 +484,11 @@ class HIRE(nn.Module):
         """Open (optional) then geodesic-grow confirmed reset seeds inside {S̄>θ_grow}."""
         # Empty seed → empty mask; skip morph/geodesic (bit-identical, much cheaper).
         # Note: ``.any()`` may graph-break under torch.compile; still a net win vs always morphing.
+        self._ensure_infer_runtime_attrs()
+        self._morph_bins_seen += 1
         if not bool(seed.any()):
             return seed
+        self._morph_bins_active += 1
         seed = self._open_mask(seed)
         support = s_chg > theta_grow
         return self._geodesic_grow(seed, support)
