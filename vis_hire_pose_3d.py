@@ -2,8 +2,9 @@
 """Stack ``vis_hire_pose.py`` PNGs into a 3D image-plane cube.
 
 Each pose visualization is placed as a textured plane at its chunk ``t0``
-(parsed from ``cube*_tTTTTTT_*``), so gaps between chunks match the emit
-interval (e.g. 320 bins). Not a sparse point cloud — full RGB image slices.
+(parsed from ``cube*_tTTTTTT_*``). By default only ``--max_frames`` slices
+are kept (evenly spaced); the t-axis still spans the full sequence so gaps
+show the lower emit rate while the volume stays cube-shaped.
 
 Same camera convention as ``vis_spad_bins_3d`` / ``vis_hire_bins_3d``:
 ``X=x``, ``Y=t``, ``Z=y`` (xy upright, t along floor). No axes / colorbar.
@@ -13,7 +14,7 @@ Examples
 python ultralytics/vis_hire_pose_3d.py \\
   --in_dir /tmp/hire_pose/sample_name \\
   --save /tmp/hire_pose_3d.png \\
-  --stride_xy 2 --no_show
+  --max_frames 5 --stride_xy 2 --alpha 0.2 --no_show
 """
 
 from __future__ import annotations
@@ -52,8 +53,9 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--max_frames",
         type=int,
-        default=0,
-        help="Use at most this many slices (0 = all)",
+        default=5,
+        help="Keep this many evenly spaced slices (default 5); 0 = all. "
+        "Planes stay at true t0; full t-extent is kept so gaps show lower rate",
     )
     ap.add_argument(
         "--stride_xy",
@@ -108,6 +110,33 @@ def _list_pose_pngs(in_dir: Path, *, which: str) -> list[tuple[int, int, Path]]:
     return items
 
 
+def _select_even_slices(
+    items: list[tuple[int, int, Path]],
+    n: int,
+) -> list[tuple[int, int, Path]]:
+    """Evenly spaced subset including first & last when possible."""
+    if n <= 0 or len(items) <= n:
+        return list(items)
+    idxs = np.round(np.linspace(0, len(items) - 1, n)).astype(int)
+    seen: set[int] = set()
+    out: list[tuple[int, int, Path]] = []
+    for i in idxs:
+        ii = int(i)
+        if ii in seen:
+            continue
+        seen.add(ii)
+        out.append(items[ii])
+    return out
+
+
+def _t_extent(items: list[tuple[int, int, Path]]) -> tuple[float, float]:
+    """Full cube t span from first t0 to last t1 (fallback: last t0)."""
+    t0 = float(items[0][0])
+    m = _POSE_RE.match(items[-1][2].name)
+    t_end = float(m.group("t1")) if m is not None else float(items[-1][0])
+    return t0, max(t_end, float(items[-1][0]) + 1.0)
+
+
 def _load_rgb_plane(path: Path, *, stride_xy: int) -> np.ndarray:
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None:
@@ -123,11 +152,19 @@ def main() -> None:
     if int(args.stride_xy) < 1:
         raise ValueError("--stride_xy must be >= 1")
 
-    items = _list_pose_pngs(args.in_dir, which=str(args.which))
-    if int(args.max_frames) > 0:
-        items = items[: int(args.max_frames)]
-    print(f"found {len(items)} slices in {args.in_dir} (which={args.which})")
-    print(f"t0 range: {items[0][0]} … {items[-1][0]}")
+    items_all = _list_pose_pngs(args.in_dir, which=str(args.which))
+    t_lim = _t_extent(items_all) if len(items_all) >= 2 else None
+    items = _select_even_slices(items_all, int(args.max_frames))
+    if len(items) != len(items_all):
+        print(
+            f"max_frames={args.max_frames}: {len(items_all)} → {len(items)} slices "
+            f"(true t0, full extent {t_lim[0]:g}…{t_lim[1]:g})"
+            if t_lim is not None
+            else f"max_frames={args.max_frames}: {len(items_all)} → {len(items)} slices"
+        )
+    else:
+        print(f"found {len(items)} slices in {args.in_dir} (which={args.which})")
+    print(f"t0 range (plotted): {items[0][0]} … {items[-1][0]}")
 
     if args.no_show:
         import matplotlib
@@ -171,13 +208,9 @@ def main() -> None:
         del rgb, rgba, xx, yy, zz
         print(f"  + plane t={t_pos:g}  {path.name}  ({w}x{h})", flush=True)
 
-    # Keep full t extent so chunk gaps are visible when using filename t0
-    if float(args.t_gap) <= 0 and len(items) >= 2:
-        # Prefer last t1 from filename if available; else last t0 + typical gap
-        last_name = items[-1][2].name
-        m = _POSE_RE.match(last_name)
-        t_end = float(m.group("t1")) if m is not None else float(items[-1][0])
-        ax.set_ylim(float(items[0][0]), max(t_end, float(items[-1][0]) + 1.0))
+    # Keep full sequence t extent so sparse planes leave gaps inside a cube.
+    if float(args.t_gap) <= 0 and t_lim is not None:
+        ax.set_ylim(t_lim[0], t_lim[1])
     elif t_positions:
         ax.set_ylim(min(t_positions), max(t_positions) + max(float(args.t_gap), 1.0))
 
