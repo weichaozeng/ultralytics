@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Make side-by-side videos from Vis/0730 frame dumps with optional slow-mo.
+"""Make combined PPB+HIRE videos from Vis/0730 frame dumps with optional slow-mo.
 
 Reads (from ``vis_0730_pose.py``)::
 
@@ -8,15 +8,14 @@ Reads (from ``vis_0730_pose.py``)::
       pose/frame_XXXXXXX.png      # BGRA → composited on white
       heatmap/frame_XXXXXXX.png   # BGRA → use BGR only (no bg fill)
 
-For each sample × method, stitches panels left→right::
+Each sample becomes one MP4. Layout (top→bottom)::
 
-    recon | pose (white) | heatmap
+    PPB :  recon | pose (white) | heatmap
+    HIRE:  recon | pose (white) | heatmap
 
-and writes a constant-fps MP4 under::
+Writes::
 
-    <vis_root>/video/<sample>_{ppb,hire}.mp4
-
-``qnn`` dumps are labeled ``ppb`` in the output name.
+    <vis_root>/video/<sample>.mp4
 
 Slow-mo: in ``--slow_ranges`` (source frame index ranges), consecutive
 frame pairs are expanded by linear (or hold) interpolation so those
@@ -24,19 +23,11 @@ segments play slower at the same output ``--fps``.
 
 Examples
 --------
-# One sample, slow frames 40–80 at 4×, clip frames 0–200
 python ultralytics/vis_0730_video.py \\
   --samples acq00001 \\
   --frame_start 0 --frame_end 200 \\
   --slow_ranges 40-80 \\
-  --slow_factor 4 --fps 25
-
-# Multiple slow windows; both methods
-python ultralytics/vis_0730_video.py \\
-  --samples acq00001 acq00002 \\
-  --methods ppb,hire \\
-  --slow_ranges 10-30,100-140 \\
-  --slow_factor 8 --interp linear --overwrite
+  --slow_factor 4 --fps 25 --overwrite
 """
 
 from __future__ import annotations
@@ -47,22 +38,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from tqdm import tqdm
 
 DEFAULT_VIS_ROOT = Path("/home/zvc/Project/SPADHand/Vis/0730")
 DEFAULT_VIDEO_SUBDIR = "video"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
-
-# folder name on disk → name in output mp4 stem
-METHOD_ALIASES = {
-    "ppb": "qnn",
-    "qnn": "qnn",
-    "hire": "hire",
-}
-METHOD_OUT_NAME = {
-    "qnn": "ppb",
-    "hire": "hire",
-}
 
 
 def _natural_key(path: Path) -> list:
@@ -147,6 +126,25 @@ def stitch_panels(recon: np.ndarray, pose: np.ndarray, heat: np.ndarray) -> np.n
     p = _resize_to_height(_to_bgr_u8(pose, alpha_bg=(255, 255, 255)), h)
     hm = _resize_to_height(_to_bgr_u8(heat, alpha_bg=None), h)
     return np.concatenate([r, p, hm], axis=1)
+
+
+def _pad_to_width(img: np.ndarray, width: int, *, fill: int = 0) -> np.ndarray:
+    h, w = img.shape[:2]
+    if w == width:
+        return img
+    if w > width:
+        return img[:, :width]
+    out = np.full((h, width, 3), fill, dtype=np.uint8)
+    out[:, :w] = img
+    return out
+
+
+def stack_ppb_hire(ppb_row: np.ndarray, hire_row: np.ndarray) -> np.ndarray:
+    """Top=PPB row, bottom=HIRE row; pad to common width."""
+    w = max(int(ppb_row.shape[1]), int(hire_row.shape[1]))
+    top = _pad_to_width(ppb_row, w)
+    bot = _pad_to_width(hire_row, w)
+    return np.concatenate([top, bot], axis=0)
 
 
 def lerp_bgr(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
@@ -251,23 +249,37 @@ def discover_samples(vis_root: Path, samples: list[str] | None) -> list[Path]:
     return dirs
 
 
-def resolve_methods(spec: str) -> list[str]:
-    names = [x.strip().lower() for x in spec.split(",") if x.strip()]
-    if not names:
-        raise ValueError("empty --methods")
-    out: list[str] = []
-    for n in names:
-        if n not in METHOD_ALIASES:
-            raise ValueError(f"Unknown method {n!r}; use ppb|qnn|hire")
-        folder = METHOD_ALIASES[n]
-        if folder not in out:
-            out.append(folder)
-    return out
+def load_combined_sequence(
+    sample_dir: Path,
+    *,
+    frame_start: int,
+    frame_end: int | None,
+) -> list[np.ndarray]:
+    """Per frame: top=PPB (qnn) row, bottom=HIRE row."""
+    ppb_dir = sample_dir / "qnn"
+    hire_dir = sample_dir / "hire"
+    if not ppb_dir.is_dir():
+        raise FileNotFoundError(f"Missing PPB/qnn dumps: {ppb_dir}")
+    if not hire_dir.is_dir():
+        raise FileNotFoundError(f"Missing HIRE dumps: {hire_dir}")
+
+    ppb_rows = load_stitched_sequence(ppb_dir, frame_start=frame_start, frame_end=frame_end)
+    hire_rows = load_stitched_sequence(hire_dir, frame_start=frame_start, frame_end=frame_end)
+    n = min(len(ppb_rows), len(hire_rows))
+    if n <= 0:
+        raise ValueError(f"No overlapping frames for {sample_dir.name}")
+    if len(ppb_rows) != len(hire_rows):
+        print(
+            f"  warn: {sample_dir.name} ppb_frames={len(ppb_rows)} hire_frames={len(hire_rows)}; "
+            f"using first {n}",
+            flush=True,
+        )
+    return [stack_ppb_hire(ppb_rows[i], hire_rows[i]) for i in range(n)]
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Vis/0730 → side-by-side videos with optional slow-mo interpolation"
+        description="Vis/0730 → PPB (top) + HIRE (bottom) videos with optional slow-mo"
     )
     ap.add_argument(
         "--vis_root",
@@ -289,12 +301,6 @@ def parse_args() -> argparse.Namespace:
         help="Sample folder names under vis_root; default = all",
     )
     ap.add_argument(
-        "--methods",
-        type=str,
-        default="ppb,hire",
-        help="Comma list: ppb (qnn dumps), hire",
-    )
-    ap.add_argument(
         "--frame_start",
         type=int,
         default=0,
@@ -310,7 +316,7 @@ def parse_args() -> argparse.Namespace:
         "--slow_ranges",
         type=str,
         default="",
-        help="Slow-mo source ranges, e.g. '40-80' or '10-30,100-140' (inclusive start, exclusive end for transitions)",
+        help="Slow-mo source ranges, e.g. '40-80' or '10-30,100-140'",
     )
     ap.add_argument(
         "--slow_factor",
@@ -341,7 +347,6 @@ def main() -> int:
     if int(args.slow_factor) < 1:
         raise ValueError(f"--slow_factor must be >= 1, got {args.slow_factor}")
 
-    methods = resolve_methods(args.methods)
     slow_ranges = parse_slow_ranges(args.slow_ranges)
     sample_dirs = discover_samples(vis_root, args.samples)
     frame_end = None if int(args.frame_end) < 0 else int(args.frame_end)
@@ -350,7 +355,7 @@ def main() -> int:
         f"vis_root={vis_root}\n"
         f"out_dir={out_dir}\n"
         f"samples={[p.name for p in sample_dirs]}\n"
-        f"methods={methods} (out names={[METHOD_OUT_NAME[m] for m in methods]})\n"
+        f"layout=PPB(top) / HIRE(bottom); each row = recon|pose|heatmap\n"
         f"frame_start={args.frame_start} frame_end={frame_end}\n"
         f"slow_ranges={slow_ranges} slow_factor={args.slow_factor} interp={args.interp}\n"
         f"fps={args.fps}",
@@ -361,39 +366,31 @@ def main() -> int:
     n_written = 0
     for sample_dir in sample_dirs:
         sample = sample_dir.name
-        for folder in methods:
-            method_dir = sample_dir / folder
-            out_name = METHOD_OUT_NAME[folder]
-            out_path = out_dir / f"{sample}_{out_name}.mp4"
-            if out_path.is_file() and not args.overwrite:
-                print(f"skip (exists): {out_path}", flush=True)
-                continue
-            if not method_dir.is_dir():
-                print(f"skip (missing method dir): {method_dir}", flush=True)
-                continue
+        out_path = out_dir / f"{sample}.mp4"
+        if out_path.is_file() and not args.overwrite:
+            print(f"skip (exists): {out_path}", flush=True)
+            continue
 
-            panels = load_stitched_sequence(
-                method_dir,
-                frame_start=int(args.frame_start),
-                frame_end=frame_end,
-            )
-            # Remap slow ranges into the clipped window (indices relative to panels).
-            lo = max(int(args.frame_start), 0)
-            rel_slow = [(max(a - lo, 0), max(b - lo, 0)) for a, b in slow_ranges]
-            rel_slow = [(a, b) for a, b in rel_slow if b > a]
-            expanded = expand_with_slowmo(
-                panels,
-                slow_ranges=rel_slow,
-                slow_factor=int(args.slow_factor),
-                interp=str(args.interp),
-            )
-            print(
-                f"{sample}/{out_name}: src_frames={len(panels)} → out_frames={len(expanded)} → {out_path}",
-                flush=True,
-            )
-            for _ in tqdm(range(1), desc=f"write {sample}_{out_name}", leave=False):
-                write_mp4(expanded, out_path, fps=float(args.fps))
-            n_written += 1
+        panels = load_combined_sequence(
+            sample_dir,
+            frame_start=int(args.frame_start),
+            frame_end=frame_end,
+        )
+        lo = max(int(args.frame_start), 0)
+        rel_slow = [(max(a - lo, 0), max(b - lo, 0)) for a, b in slow_ranges]
+        rel_slow = [(a, b) for a, b in rel_slow if b > a]
+        expanded = expand_with_slowmo(
+            panels,
+            slow_ranges=rel_slow,
+            slow_factor=int(args.slow_factor),
+            interp=str(args.interp),
+        )
+        print(
+            f"{sample}: src_frames={len(panels)} → out_frames={len(expanded)} → {out_path}",
+            flush=True,
+        )
+        write_mp4(expanded, out_path, fps=float(args.fps))
+        n_written += 1
 
     print(f"Done. wrote={n_written} → {out_dir}", flush=True)
     return 0

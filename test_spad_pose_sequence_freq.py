@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +43,6 @@ from det_spad_pose import (
 from test_spad_pose_sequence import (
     PREPROCESSOR_CHOICES,
     TRACKER_CHOICES,
-    RenderChunkRecord,
     _apply_sequence_preprocessor_override,
     _build_preprocessor_kwargs,
     _build_vis_frame,
@@ -59,12 +59,29 @@ from test_spad_pose_sequence import (
     _names_to_dict,
     _resolve_chunk_size,
     _resolve_input_gamma,
-    _resolve_spad_bin_rate_hz,
     _resolve_spad_bins_per_gt,
     _resolve_spad_subsampling,
     _sample_specs_from_json,
     _vis_dir,
 )
+
+
+@dataclass(frozen=True)
+class FreqChunkRecord:
+    """One emit at ``spad_end_bin``; stream feed is ``[feed_start_bin, feed_end_bin)``.
+
+    When ``stride_bins < chunk_size``, later steps feed only the new bins so HIRE
+    state is not double-counted (unlike re-feeding the full overlapping window).
+    """
+
+    chunk_index: int
+    spad_start_bin: int  # logical window start = end - chunk_size
+    spad_end_bin: int  # emit / source_bin
+    feed_start_bin: int
+    feed_end_bin: int
+    chunk_size: int
+    target_gt_time: float
+    packed_nch: int
 
 
 def _resolve_pred_cadence(args, *, bin_rate_hz: float) -> tuple[float, int]:
@@ -142,26 +159,45 @@ def _hire_config_snapshot(preprocessor) -> dict[str, Any] | None:
     }
 
 
-def _apply_hire_cli_overrides(spad_model, args, *, bin_rate_hz: float) -> dict[str, Any] | None:
-    """Apply ``--hire-*`` CLI onto the live HIRE preprocessor (ckpt or rebuilt)."""
+def _explicit_hire_override(args) -> bool:
+    """True when the user asked to rebuild/override with HIRE CLI hyperparams."""
+    requested = str(getattr(args, "preprocessor", "model")).strip().lower()
+    legacy = str(getattr(args, "preprocessor_override", "none")).strip().lower()
+    return requested == "hire" or legacy == "hire"
+
+
+def _sync_hire_for_inference(spad_model, args, *, bin_rate_hz: float) -> dict[str, Any] | None:
+    """Keep ckpt HIRE by default; apply full CLI only on explicit ``--preprocessor hire``.
+
+    Always sync ``sample_rate_hz`` to the inference bin rate so 8 kHz data is not
+    stuck on a 2 kHz ckpt attribute. Matches sequence-test behavior for other params.
+    """
     prep = getattr(spad_model, "preprocessor", None)
     if prep is None or not hasattr(prep, "update_hyperparams"):
         return None
     name = str(getattr(spad_model, "preprocessor_name", "") or "").strip().lower()
     if name and name != "hire" and prep.__class__.__name__ not in {"HIRE", "HIREFrame"}:
         return None
-    kwargs = _hire_cli_kwargs(args, bin_rate_hz=bin_rate_hz)
-    prep.update_hyperparams(**kwargs)
-    snap = _hire_config_snapshot(prep)
-    if snap is not None:
-        print(
-            "HIRE CLI overrides applied: "
-            f"W_f/s/S={snap['fast_bins']}/{snap['slow_bins']}/{snap['surprise_bins']}, "
-            f"θ_on/off={snap['theta_on']:g}/{snap['theta_off']:g}, "
-            f"mix_hold={snap['mix_hold_bins']}, mix_τ={snap['mix_bins']:g}, "
-            f"normalize={snap['normalize']}, quantile={snap['quantile']:g}"
-        )
-    return snap
+
+    if _explicit_hire_override(args):
+        kwargs = _hire_cli_kwargs(args, bin_rate_hz=bin_rate_hz)
+        prep.update_hyperparams(**kwargs)
+        snap = _hire_config_snapshot(prep)
+        if snap is not None:
+            print(
+                "HIRE CLI overrides applied (--preprocessor hire): "
+                f"W_f/s/S={snap['fast_bins']}/{snap['slow_bins']}/{snap['surprise_bins']}, "
+                f"θ_on/off={snap['theta_on']:g}/{snap['theta_off']:g}, "
+                f"normalize={snap['normalize']}"
+            )
+        return snap
+
+    # Preserve ckpt hyperparams; only sync inference bin rate.
+    old_fs = float(getattr(prep, "sample_rate_hz", 0.0) or 0.0)
+    if abs(old_fs - float(bin_rate_hz)) > 1e-6:
+        prep.update_hyperparams(sample_rate_hz=float(bin_rate_hz))
+        print(f"HIRE sample_rate_hz: {old_fs:g} -> {float(bin_rate_hz):g} (ckpt hyperparams kept)")
+    return _hire_config_snapshot(prep)
 
 
 def _freq_chunk_records(
@@ -172,30 +208,45 @@ def _freq_chunk_records(
     spad_bins_per_gt: int,
     n_gt: int,
     packed_nch: int,
-) -> list[RenderChunkRecord]:
-    """Bin-based GT-aligned windows: first emit at end_bin=chunk_size, then +stride_bins."""
+) -> list[FreqChunkRecord]:
+    """Emit schedule + causal stream feed ranges.
+
+    First emit at ``end_bin=chunk_size``, then every ``stride_bins``.
+    Stream feed is contiguous and non-overlapping: ``[prev_end, end)``, so
+    ``stride < chunk`` does not re-process overlap under carried HIRE state.
+    ``target_gt_time`` stays within ``[0, n_gt-1]`` like sequence GT alignment.
+    """
     if chunk_size <= 0 or stride_bins <= 0 or spad_bins_per_gt <= 0:
         raise ValueError(
             f"chunk_size, stride_bins, spad_bins_per_gt must be > 0, got "
             f"{chunk_size}, {stride_bins}, {spad_bins_per_gt}"
         )
-    max_end = min(int(total_bins), int(n_gt * spad_bins_per_gt))
+    # Match sequence: target_gt_time = end/bins_per_gt <= n_gt - 1
+    max_end = min(int(total_bins), int((n_gt - 1) * spad_bins_per_gt))
     if max_end < chunk_size:
         return []
 
-    records: list[RenderChunkRecord] = []
+    records: list[FreqChunkRecord] = []
+    prev_end = 0
     for chunk_index, end_bin in enumerate(range(chunk_size, max_end + 1, stride_bins)):
+        feed_start = int(prev_end)
+        feed_end = int(end_bin)
+        if feed_end <= feed_start:
+            continue
         start_bin = int(end_bin - chunk_size)
         records.append(
-            RenderChunkRecord(
+            FreqChunkRecord(
                 chunk_index=int(chunk_index),
                 spad_start_bin=int(start_bin),
                 spad_end_bin=int(end_bin),
+                feed_start_bin=int(feed_start),
+                feed_end_bin=int(feed_end),
                 chunk_size=int(chunk_size),
                 target_gt_time=float(end_bin) / float(spad_bins_per_gt),
                 packed_nch=int(packed_nch),
             )
         )
+        prev_end = int(end_bin)
     return records
 
 
@@ -397,7 +448,8 @@ def main():
     print(
         f"Freq sequence windowing: chunk_size={chunk_size}, "
         f"spad_bins_per_gt={spad_bins_per_gt}, pred_fps={pred_fps:g}, "
-        f"stride_bins={stride_bins}, bin_rate_hz={bin_rate_hz:g}, cache_mode=raw"
+        f"stride_bins={stride_bins}, bin_rate_hz={bin_rate_hz:g}, cache_mode=raw "
+        f"(causal stream feed: first {chunk_size} bins, then +{stride_bins} new bins/step)"
     )
 
     spad_subsampling = _resolve_spad_subsampling(spad_model, args, ckpt=yolo.ckpt)
@@ -423,9 +475,8 @@ def main():
             if abs(old - alpha) > 1e-12:
                 print(f"EMA inference: override ema_alpha {old:g} -> {alpha:g}")
 
-    hire_config = _apply_hire_cli_overrides(spad_model, args, bin_rate_hz=bin_rate_hz)
-    if hire_config is None and effective_preprocessor == "hire":
-        # Fallback snapshot after rebuild if update path was skipped.
+    hire_config = _sync_hire_for_inference(spad_model, args, bin_rate_hz=bin_rate_hz)
+    if hire_config is None and str(effective_preprocessor).lower() == "hire":
         hire_config = _hire_config_snapshot(getattr(spad_model, "preprocessor", None))
 
     spad_model.spad_cache_mode = "raw"
@@ -493,25 +544,8 @@ def main():
                 "imgsz": int(args.imgsz),
                 "expected_w": int(args.expected_w),
                 "freq_sweep": True,
+                "stream_feed": "causal_new_bins",
                 "hire": hire_config,
-                "hire_fast_bins": int(args.hire_fast_bins),
-                "hire_slow_bins": int(args.hire_slow_bins),
-                "hire_surprise_bins": int(args.hire_surprise_bins),
-                "hire_mix_hold_bins": int(args.hire_mix_hold_bins),
-                "hire_mix_bins": float(args.hire_mix_bins),
-                "hire_mix_theta": float(args.hire_mix_theta),
-                "hire_mix_floor": float(args.hire_mix_floor),
-                "hire_theta_on": float(args.hire_theta_on),
-                "hire_theta_off": float(args.hire_theta_off),
-                "hire_theta_grow": float(args.hire_theta_grow),
-                "hire_confirm_bins": int(args.hire_confirm_bins),
-                "hire_cooldown_bins": int(args.hire_cooldown_bins),
-                "hire_spatial_kernel": int(args.hire_spatial_kernel),
-                "hire_gate_pool": str(args.hire_gate_pool),
-                "hire_reset_open": int(args.hire_reset_open),
-                "hire_reset_grow": int(args.hire_reset_grow),
-                "hire_normalize": bool(args.hire_normalize),
-                "hire_quantile": float(args.hire_quantile),
             },
             "source": {
                 "path": str(sample_path),
