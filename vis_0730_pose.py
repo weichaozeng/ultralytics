@@ -183,31 +183,25 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--ema_alpha", type=float, default=0.01)
     ap.add_argument("--ema_normalize", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ema_quantile", type=float, default=1.0)
-    # DSC on raw sum → color → detector (same as preview_video)
+    # DSC on QNN/HIRE recon → BGGR ISP → detector
     ap.add_argument(
         "--resources",
         type=Path,
         default=Path("/home/zvc/Data/SPADHand/NoiseCorrection/resources/resources"),
         help="SpadDSC calibration dir (bad_pixel / gain / dcr / wb / ccm)",
     )
-    ap.add_argument("--no-dsc", action="store_true", help="Skip raw-sum DSC + BGGR ISP (use QNN/HIRE recon RGB)")
-    ap.add_argument("--no-dsc-gain", action="store_true", help="Skip gain_map_cfa inside spad_dsc")
+    ap.add_argument("--no-dsc", action="store_true", help="Skip recon gain+inpaint + BGGR ISP")
+    ap.add_argument("--no-dsc-gain", action="store_true", help="Skip gain_map_cfa inside recon DSC")
     ap.add_argument(
         "--dsc-isp-divide",
         type=float,
-        default=320.0,
-        help="Divide before WB in BGGR ISP after DSC (default=320, same as preview)",
+        default=1.0,
+        help="Divide before WB in BGGR ISP after recon DSC (default=1; recon is ~[0,1])",
     )
     ap.add_argument(
         "--dsc-srgb",
         action="store_true",
         help="Apply sRGB OETF in DSC ISP (default: linear RGB + spad_input_gamma)",
-    )
-    ap.add_argument(
-        "--dsc-max-sum-count",
-        type=int,
-        default=319,
-        help="Cap binary hits before -log (p <= count/num_frames; default 319/320)",
     )
     return ap.parse_args()
 
@@ -371,7 +365,6 @@ def _load_sequence_model(
             apply_gain=not bool(args.no_dsc_gain),
             isp_divide=float(args.dsc_isp_divide),
             use_srgb=bool(args.dsc_srgb),
-            max_sum_count=int(args.dsc_max_sum_count),
         )
         print(f"  {label}: DSC attached ({corr.calib_summary().splitlines()[0]})", flush=True)
     else:
