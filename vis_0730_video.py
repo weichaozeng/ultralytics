@@ -136,26 +136,42 @@ def planes4_to_bayer(plane_sum: np.ndarray) -> np.ndarray:
     return bayer
 
 
-def packed_chunk_to_spad_gray(
-    packed_chunk: np.ndarray,
+def packed_slice_to_spad_gray(
+    packed: np.ndarray,
+    t0: int,
+    t1: int,
     *,
     mode: str = "binary",
 ) -> np.ndarray:
-    """Unpack one ``(T,H,Wp,4)`` chunk → Bayer gray BGR ``uint8``.
+    """Read one bin window from mmap'd ``frames.npy`` → Bayer gray BGR.
 
-    ``binary``: any hit in the chunk → 255, else 0.
-    ``sum``: sum/T scaled to 0..255 (soft gray).
+    Does **not** load the whole file. Only the ``[t0:t1)`` slice is touched.
+
+    ``binary``: OR packed bytes over T, then one ``unpackbits`` → 0/255.
+    ``sum``: unpack the slice and sum (heavier; only when needed).
     """
-    if packed_chunk.ndim != 4 or packed_chunk.shape[-1] != 4:
-        raise ValueError(f"Expected packed (T,H,Wp,4), got {packed_chunk.shape}")
-    bits = np.unpackbits(packed_chunk, axis=2)  # (T,H,W,4) {0,1}
-    plane_sum = bits.sum(axis=0, dtype=np.float32)
-    bayer = planes4_to_bayer(plane_sum)
+    if packed.ndim != 4 or packed.shape[-1] != 4:
+        raise ValueError(f"Expected packed (T,H,Wp,4), got {packed.shape}")
+    t0 = max(int(t0), 0)
+    t1 = min(int(t1), int(packed.shape[0]))
+    if t1 <= t0:
+        h = int(packed.shape[1]) * 2
+        w = int(packed.shape[2]) * 8 * 2
+        return np.zeros((h, w, 3), dtype=np.uint8)
+
     mode = str(mode).strip().lower()
     if mode == "binary":
+        # OR across time on packed uint8 (bit-correct), unpack once.
+        ored = np.bitwise_or.reduce(packed[t0:t1], axis=0)  # (H,Wp,4)
+        bits = np.unpackbits(ored, axis=1)  # (H,W,4) {0,1}
+        bayer = planes4_to_bayer(bits.astype(np.float32))
         gray = (bayer > 0).astype(np.uint8) * 255
     elif mode == "sum":
-        t = max(int(packed_chunk.shape[0]), 1)
+        chunk = np.asarray(packed[t0:t1])  # copy only this window
+        bits = np.unpackbits(chunk, axis=2)
+        plane_sum = bits.sum(axis=0, dtype=np.float32)
+        bayer = planes4_to_bayer(plane_sum)
+        t = max(t1 - t0, 1)
         gray = np.clip(bayer / float(t) * 255.0, 0, 255).astype(np.uint8)
     else:
         raise ValueError(f"spad mode must be binary|sum, got {mode!r}")
@@ -171,7 +187,7 @@ def load_spad_panel_sequence(
     chunk_size: int,
     mode: str,
 ) -> list[np.ndarray]:
-    """Map viz frame i → bins ``[i*chunk_size:(i+1)*chunk_size]`` from ``frames.npy``."""
+    """Map viz frame i → bins ``[i*chunk_size:(i+1)*chunk_size]`` via mmap."""
     if not frames_npy.is_file():
         raise FileNotFoundError(frames_npy)
     packed = np.load(str(frames_npy), mmap_mode="r")
@@ -187,16 +203,8 @@ def load_spad_panel_sequence(
     panels: list[np.ndarray] = []
     for i in range(lo, hi):
         t0 = i * cs
-        t1 = t0 + cs
-        if t1 > t_bins:
-            # Pad last incomplete chunk with zeros (same as streaming pad behavior).
-            chunk = np.zeros((cs,) + packed.shape[1:], dtype=packed.dtype)
-            n_avail = max(t_bins - t0, 0)
-            if n_avail > 0:
-                chunk[:n_avail] = packed[t0:t0 + n_avail]
-        else:
-            chunk = np.asarray(packed[t0:t1])
-        panels.append(packed_chunk_to_spad_gray(chunk, mode=mode))
+        t1 = min(t0 + cs, t_bins)
+        panels.append(packed_slice_to_spad_gray(packed, t0, t1, mode=mode))
     return panels
 
 
