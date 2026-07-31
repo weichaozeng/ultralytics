@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Export recon / pose / heatmap from any packed ``frames.npy`` dataset.
 
-Same output layout as ``vis_0730_pose.py`` (so ``vis_0730_video.py`` can compose)::
+Pipeline (no DSC / ISP correction): preprocessor recon → RGB → ``x**(1/γ)``
+(default ``γ=2.2``) → detector. Same layout as ``vis_0730_pose.py`` so
+``vis_0730_video.py`` can compose::
 
     <save_root>/<sample>/{qnn,hire}/
       recon/frame_XXXXXXX.png
@@ -95,6 +97,12 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--kpt_thresh", type=float, default=0.5)
     ap.add_argument("--packed_ch_order", type=str, default="RGB", choices=["RGB", "BGR"])
     ap.add_argument(
+        "--input_gamma",
+        type=float,
+        default=2.2,
+        help="After recon RGB: apply pow(x, 1/gamma) before detector (default 2.2)",
+    )
+    ap.add_argument(
         "--folders",
         type=str,
         nargs="*",
@@ -149,16 +157,6 @@ def _parse_args() -> argparse.Namespace:
     # Heatmap display
     ap.add_argument("--run_length_vmax", type=float, default=100.0)
     ap.add_argument("--n_slow_vmax", type=float, default=0.0, help="0 = hire_slow_bins")
-    # DSC
-    ap.add_argument(
-        "--resources",
-        type=Path,
-        default=Path("/home/zvc/Data/SPADHand/NoiseCorrection/resources/resources"),
-    )
-    ap.add_argument("--no-dsc", action="store_true")
-    ap.add_argument("--no-dsc-gain", action="store_true")
-    ap.add_argument("--dsc-isp-divide", type=float, default=1.0)
-    ap.add_argument("--dsc-srgb", action="store_true")
     return ap.parse_args()
 
 
@@ -195,6 +193,7 @@ def export_spad_pose_panels(
             max_det=20,
             kpt_thresh=0.5,
             packed_ch_order="RGB",
+            input_gamma=2.2,
             folders=None,
             overwrite=False,
             methods="qnn,hire",
@@ -235,11 +234,7 @@ def export_spad_pose_panels(
             ema_quantile=1.0,
             run_length_vmax=100.0,
             n_slow_vmax=0.0,
-            resources=Path("/home/zvc/Data/SPADHand/NoiseCorrection/resources/resources"),
-            no_dsc=False,
-            no_dsc_gain=False,
-            dsc_isp_divide=1.0,
-            dsc_srgb=False,
+            no_dsc=True,
         )
     else:
         args.data_root = Path(data_root)
@@ -248,6 +243,15 @@ def export_spad_pose_panels(
         args.hire_ckpt = Path(hire_ckpt)
 
     return _run_export(args)
+
+
+def _configure_export_model(spad_model: Any, *, input_gamma: float) -> None:
+    """Export path: no DSC; recon RGB → pow(x, 1/gamma) before detector."""
+    spad_model.spad_dsc_corrector = None
+    gamma = float(input_gamma)
+    if gamma <= 0:
+        raise ValueError(f"--input_gamma must be > 0, got {gamma}")
+    spad_model.spad_input_gamma = gamma
 
 
 def _run_export(args: argparse.Namespace) -> int:
@@ -260,6 +264,10 @@ def _run_export(args: argparse.Namespace) -> int:
         raise ValueError(f"--chunk_size must be > 0, got {chunk_size}")
     if float(args.spad_bin_rate_hz) <= 0:
         raise ValueError(f"--spad_bin_rate_hz must be > 0, got {args.spad_bin_rate_hz}")
+
+    # Export never uses DSC (recon → gamma → detector).
+    args.no_dsc = True
+    input_gamma = float(getattr(args, "input_gamma", 2.2))
 
     methods = {m.strip().lower() for m in str(args.methods).split(",") if m.strip()}
     allowed = {"qnn", "hire"}
@@ -280,7 +288,8 @@ def _run_export(args: argparse.Namespace) -> int:
     print(f"save_root={save_root}")
     print(
         f"samples={len(sample_dirs)} methods={sorted(methods)} "
-        f"chunk={chunk_size} bin_rate={args.spad_bin_rate_hz} device={device}"
+        f"chunk={chunk_size} bin_rate={args.spad_bin_rate_hz} "
+        f"input_gamma={input_gamma} dsc=off device={device}"
     )
 
     models: dict[str, tuple[Any, Any]] = {}
@@ -289,11 +298,13 @@ def _run_export(args: argparse.Namespace) -> int:
         models["qnn"] = _v0730._load_sequence_model(
             Path(args.qnn_ckpt), label="qnn", args=args, device=device, chunk_size=chunk_size
         )
+        _configure_export_model(models["qnn"][1], input_gamma=input_gamma)
     if "hire" in methods:
         print(f"Loading HIRE: {args.hire_ckpt}", flush=True)
         models["hire"] = _v0730._load_sequence_model(
             Path(args.hire_ckpt), label="hire", args=args, device=device, chunk_size=chunk_size
         )
+        _configure_export_model(models["hire"][1], input_gamma=input_gamma)
 
     n_written = 0
     for sample_dir in tqdm(sample_dirs, desc="Samples"):
