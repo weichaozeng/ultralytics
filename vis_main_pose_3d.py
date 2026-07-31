@@ -2,7 +2,8 @@
 """3D pose trajectories + SPAD/RGB spatiotemporal cubes from ``vis_main_pose.py``.
 
 Outputs under ``--save`` (folder):
-- ``{gt,rgb,qnn,hire}_traj3d.png`` — skeletons + bbox-center traj (axes, Times New Roman)
+- ``{gt,rgb,qnn,hire}_traj3d.png`` — skeletons + bbox-center traj (axes, Times New Roman;
+  all methods share GT xyt limits for offset comparison)
 - ``spad_cube3d.png`` — SPAD bins in ``[start_frame, end_frame)`` as a voxel cube (no axes/text)
 - ``rgb_cube3d.png`` — RGB frames in the same window as stacked image planes (no axes/text)
 
@@ -1010,6 +1011,20 @@ def main() -> None:
     )
     print(f"font: {font_prop.get_name()} ← {font_id}", flush=True)
 
+    # Shared xyt limits from GT so all methods show the same spatial scale
+    # (makes positional offset vs GT visible). Fall back to per-method if no GT.
+    if "gt" in windowed:
+        shared_limits = _axis_limits(windowed["gt"], ms_per_frame=ms_per_frame)
+        print(
+            f"axis limits (from gt): x=[{shared_limits[0]:.1f},{shared_limits[1]:.1f}] "
+            f"t=[{shared_limits[2]:.1f},{shared_limits[3]:.1f}] "
+            f"y=[{shared_limits[4]:.1f},{shared_limits[5]:.1f}]",
+            flush=True,
+        )
+    else:
+        shared_limits = None
+        print("axis limits: no gt loaded; using per-method limits", flush=True)
+
     shown = None
     for method, frames in windowed.items():
         fig = plt.figure(figsize=tuple(args.figsize), facecolor=face)
@@ -1028,7 +1043,12 @@ def main() -> None:
             deep=float(args.deep),
             ms_per_frame=ms_per_frame,
         )
-        xmin, xmax, tmin, tmax, ymin, ymax = _axis_limits(frames, ms_per_frame=ms_per_frame)
+        if shared_limits is not None:
+            xmin, xmax, tmin, tmax, ymin, ymax = shared_limits
+        else:
+            xmin, xmax, tmin, tmax, ymin, ymax = _axis_limits(
+                frames, ms_per_frame=ms_per_frame
+            )
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(tmin, tmax)
         ax.set_zlim(ymin, ymax)
