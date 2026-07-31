@@ -8,18 +8,19 @@ Reads (from ``vis_0730_pose.py``)::
       pose/frame_XXXXXXX.png      # BGRA → composited on white
       heatmap/frame_XXXXXXX.png   # BGRA → use BGR only (no bg fill)
 
+Raw SPAD (left column) is taken from the matching ``frames.npy`` chunk::
+
+    <data_root>/<sample>/frames.npy
+    viz frame i  ↔  bins [i*chunk_size : (i+1)*chunk_size]
+
 Each sample becomes one MP4. Layout (top→bottom)::
 
-    PPB :  recon | pose (white) | heatmap
-    HIRE:  recon | pose (white) | heatmap
+    PPB :  spad | recon | pose (white) | heatmap
+    HIRE:  spad | recon | pose (white) | heatmap
 
 Writes::
 
     <vis_root>/video/<sample>.mp4
-
-Slow-mo: in ``--slow_ranges`` (source frame index ranges), consecutive
-frame pairs are expanded by linear (or hold) interpolation so those
-segments play slower at the same output ``--fps``.
 
 Examples
 --------
@@ -40,7 +41,10 @@ import cv2
 import numpy as np
 
 DEFAULT_VIS_ROOT = Path("/home/zvc/Project/SPADHand/Vis/0730")
+DEFAULT_DATA_ROOT = Path("/home/zvc/Data/SPADHand/0730/spad/capture-spc8kHz")
 DEFAULT_VIDEO_SUBDIR = "video"
+DEFAULT_CHUNK_SIZE = 320
+FRAMES_NPY = "frames.npy"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
 
 
@@ -119,13 +123,100 @@ def _resize_to_height(img: np.ndarray, height: int) -> np.ndarray:
     return cv2.resize(img, (new_w, height), interpolation=cv2.INTER_AREA)
 
 
-def stitch_panels(recon: np.ndarray, pose: np.ndarray, heat: np.ndarray) -> np.ndarray:
-    """Left→right: recon | pose (white bg) | heatmap (raw BGR, no fill)."""
+def planes4_to_bayer(plane_sum: np.ndarray) -> np.ndarray:
+    """``(H,W,4)`` spatial planes → full Bayer ``(2H,2W)``."""
+    if plane_sum.ndim != 3 or plane_sum.shape[-1] != 4:
+        raise ValueError(f"Expected (H,W,4), got {plane_sum.shape}")
+    h, w, _ = plane_sum.shape
+    bayer = np.empty((h * 2, w * 2), dtype=np.float32)
+    bayer[0::2, 0::2] = plane_sum[:, :, 0]
+    bayer[0::2, 1::2] = plane_sum[:, :, 1]
+    bayer[1::2, 0::2] = plane_sum[:, :, 2]
+    bayer[1::2, 1::2] = plane_sum[:, :, 3]
+    return bayer
+
+
+def packed_chunk_to_spad_gray(
+    packed_chunk: np.ndarray,
+    *,
+    mode: str = "binary",
+) -> np.ndarray:
+    """Unpack one ``(T,H,Wp,4)`` chunk → Bayer gray BGR ``uint8``.
+
+    ``binary``: any hit in the chunk → 255, else 0.
+    ``sum``: sum/T scaled to 0..255 (soft gray).
+    """
+    if packed_chunk.ndim != 4 or packed_chunk.shape[-1] != 4:
+        raise ValueError(f"Expected packed (T,H,Wp,4), got {packed_chunk.shape}")
+    bits = np.unpackbits(packed_chunk, axis=2)  # (T,H,W,4) {0,1}
+    plane_sum = bits.sum(axis=0, dtype=np.float32)
+    bayer = planes4_to_bayer(plane_sum)
+    mode = str(mode).strip().lower()
+    if mode == "binary":
+        gray = (bayer > 0).astype(np.uint8) * 255
+    elif mode == "sum":
+        t = max(int(packed_chunk.shape[0]), 1)
+        gray = np.clip(bayer / float(t) * 255.0, 0, 255).astype(np.uint8)
+    else:
+        raise ValueError(f"spad mode must be binary|sum, got {mode!r}")
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def load_spad_panel_sequence(
+    frames_npy: Path,
+    *,
+    frame_start: int,
+    frame_end: int | None,
+    n_viz: int,
+    chunk_size: int,
+    mode: str,
+) -> list[np.ndarray]:
+    """Map viz frame i → bins ``[i*chunk_size:(i+1)*chunk_size]`` from ``frames.npy``."""
+    if not frames_npy.is_file():
+        raise FileNotFoundError(frames_npy)
+    packed = np.load(str(frames_npy), mmap_mode="r")
+    if packed.ndim != 4 or packed.shape[-1] != 4:
+        raise ValueError(f"Expected frames.npy (T,H,Wp,4), got {packed.shape} in {frames_npy}")
+    t_bins = int(packed.shape[0])
+    cs = int(chunk_size)
+    if cs <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {cs}")
+
+    lo = max(int(frame_start), 0)
+    hi = n_viz if frame_end is None or int(frame_end) < 0 else min(int(frame_end), n_viz)
+    panels: list[np.ndarray] = []
+    for i in range(lo, hi):
+        t0 = i * cs
+        t1 = t0 + cs
+        if t1 > t_bins:
+            # Pad last incomplete chunk with zeros (same as streaming pad behavior).
+            chunk = np.zeros((cs,) + packed.shape[1:], dtype=packed.dtype)
+            n_avail = max(t_bins - t0, 0)
+            if n_avail > 0:
+                chunk[:n_avail] = packed[t0:t0 + n_avail]
+        else:
+            chunk = np.asarray(packed[t0:t1])
+        panels.append(packed_chunk_to_spad_gray(chunk, mode=mode))
+    return panels
+
+
+def stitch_panels(
+    recon: np.ndarray,
+    pose: np.ndarray,
+    heat: np.ndarray,
+    *,
+    spad: np.ndarray | None = None,
+) -> np.ndarray:
+    """Left→right: [spad |] recon | pose (white) | heatmap."""
     r = _to_bgr_u8(recon)
     h = int(r.shape[0])
-    p = _resize_to_height(_to_bgr_u8(pose, alpha_bg=(255, 255, 255)), h)
-    hm = _resize_to_height(_to_bgr_u8(heat, alpha_bg=None), h)
-    return np.concatenate([r, p, hm], axis=1)
+    parts: list[np.ndarray] = []
+    if spad is not None:
+        parts.append(_resize_to_height(_to_bgr_u8(spad), h))
+    parts.append(r)
+    parts.append(_resize_to_height(_to_bgr_u8(pose, alpha_bg=(255, 255, 255)), h))
+    parts.append(_resize_to_height(_to_bgr_u8(heat, alpha_bg=None), h))
+    return np.concatenate(parts, axis=1)
 
 
 def _pad_to_width(img: np.ndarray, width: int, *, fill: int = 0) -> np.ndarray:
@@ -186,11 +277,19 @@ def expand_with_slowmo(
     return out
 
 
+def count_viz_frames(method_dir: Path) -> int:
+    recon_paths = list_frame_paths(method_dir / "recon")
+    pose_paths = list_frame_paths(method_dir / "pose")
+    heat_paths = list_frame_paths(method_dir / "heatmap")
+    return min(len(recon_paths), len(pose_paths), len(heat_paths))
+
+
 def load_stitched_sequence(
     method_dir: Path,
     *,
     frame_start: int,
     frame_end: int | None,
+    spad_panels: list[np.ndarray] | None = None,
 ) -> list[np.ndarray]:
     recon_paths = list_frame_paths(method_dir / "recon")
     pose_paths = list_frame_paths(method_dir / "pose")
@@ -205,15 +304,20 @@ def load_stitched_sequence(
     hi = n if frame_end is None or int(frame_end) < 0 else min(int(frame_end), n)
     if hi <= lo:
         raise ValueError(f"Empty frame window [{lo}, {hi}) for {method_dir} (n={n})")
+    if spad_panels is not None and len(spad_panels) != (hi - lo):
+        raise ValueError(
+            f"spad_panels length {len(spad_panels)} != viz window {hi - lo}"
+        )
 
     panels: list[np.ndarray] = []
-    for i in range(lo, hi):
+    for j, i in enumerate(range(lo, hi)):
         recon = cv2.imread(str(recon_paths[i]), cv2.IMREAD_UNCHANGED)
         pose = cv2.imread(str(pose_paths[i]), cv2.IMREAD_UNCHANGED)
         heat = cv2.imread(str(heat_paths[i]), cv2.IMREAD_UNCHANGED)
         if recon is None or pose is None or heat is None:
             raise RuntimeError(f"Failed to read frame index {i} under {method_dir}")
-        panels.append(stitch_panels(recon, pose, heat))
+        spad = spad_panels[j] if spad_panels is not None else None
+        panels.append(stitch_panels(recon, pose, heat, spad=spad))
     return panels
 
 
@@ -254,8 +358,12 @@ def load_combined_sequence(
     *,
     frame_start: int,
     frame_end: int | None,
+    data_root: Path | None,
+    chunk_size: int,
+    spad_mode: str,
+    use_spad: bool,
 ) -> list[np.ndarray]:
-    """Per frame: top=PPB (qnn) row, bottom=HIRE row."""
+    """Per frame: top=PPB (qnn) row, bottom=HIRE row; optional raw SPAD on the left."""
     ppb_dir = sample_dir / "qnn"
     hire_dir = sample_dir / "hire"
     if not ppb_dir.is_dir():
@@ -263,11 +371,33 @@ def load_combined_sequence(
     if not hire_dir.is_dir():
         raise FileNotFoundError(f"Missing HIRE dumps: {hire_dir}")
 
-    ppb_rows = load_stitched_sequence(ppb_dir, frame_start=frame_start, frame_end=frame_end)
-    hire_rows = load_stitched_sequence(hire_dir, frame_start=frame_start, frame_end=frame_end)
-    n = min(len(ppb_rows), len(hire_rows))
-    if n <= 0:
+    n_ppb = count_viz_frames(ppb_dir)
+    n_hire = count_viz_frames(hire_dir)
+    n_viz = min(n_ppb, n_hire)
+    if n_viz <= 0:
         raise ValueError(f"No overlapping frames for {sample_dir.name}")
+
+    spad_panels: list[np.ndarray] | None = None
+    if use_spad:
+        if data_root is None:
+            raise ValueError("data_root is required when using SPAD panel")
+        frames_npy = Path(data_root) / sample_dir.name / FRAMES_NPY
+        spad_panels = load_spad_panel_sequence(
+            frames_npy,
+            frame_start=frame_start,
+            frame_end=frame_end,
+            n_viz=n_viz,
+            chunk_size=chunk_size,
+            mode=spad_mode,
+        )
+
+    ppb_rows = load_stitched_sequence(
+        ppb_dir, frame_start=frame_start, frame_end=frame_end, spad_panels=spad_panels
+    )
+    hire_rows = load_stitched_sequence(
+        hire_dir, frame_start=frame_start, frame_end=frame_end, spad_panels=spad_panels
+    )
+    n = min(len(ppb_rows), len(hire_rows))
     if len(ppb_rows) != len(hire_rows):
         print(
             f"  warn: {sample_dir.name} ppb_frames={len(ppb_rows)} hire_frames={len(hire_rows)}; "
@@ -299,6 +429,30 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Sample folder names under vis_root; default = all",
+    )
+    ap.add_argument(
+        "--data_root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help="Packed frames.npy root (same as vis_0730_pose --data_root)",
+    )
+    ap.add_argument(
+        "--chunk_size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Bins per viz frame (must match vis_0730_pose; default 320)",
+    )
+    ap.add_argument(
+        "--spad_mode",
+        type=str,
+        default="binary",
+        choices=["binary", "sum"],
+        help="SPAD left panel: binary=0/255 any-hit; sum=count/T→0..255",
+    )
+    ap.add_argument(
+        "--no-spad",
+        action="store_true",
+        help="Skip raw SPAD left column",
     )
     ap.add_argument(
         "--frame_start",
@@ -351,11 +505,15 @@ def main() -> int:
     sample_dirs = discover_samples(vis_root, args.samples)
     frame_end = None if int(args.frame_end) < 0 else int(args.frame_end)
 
+    use_spad = not bool(args.no_spad)
     print(
         f"vis_root={vis_root}\n"
         f"out_dir={out_dir}\n"
         f"samples={[p.name for p in sample_dirs]}\n"
-        f"layout=PPB(top) / HIRE(bottom); each row = recon|pose|heatmap\n"
+        f"layout=PPB(top) / HIRE(bottom); each row = "
+        f"{'spad|' if use_spad else ''}recon|pose|heatmap\n"
+        f"data_root={args.data_root} chunk_size={args.chunk_size} "
+        f"spad_mode={args.spad_mode} use_spad={use_spad}\n"
         f"frame_start={args.frame_start} frame_end={frame_end}\n"
         f"slow_ranges={slow_ranges} slow_factor={args.slow_factor} interp={args.interp}\n"
         f"fps={args.fps}",
@@ -375,6 +533,10 @@ def main() -> int:
             sample_dir,
             frame_start=int(args.frame_start),
             frame_end=frame_end,
+            data_root=Path(args.data_root),
+            chunk_size=int(args.chunk_size),
+            spad_mode=str(args.spad_mode),
+            use_spad=use_spad,
         )
         lo = max(int(args.frame_start), 0)
         rel_slow = [(max(a - lo, 0), max(b - lo, 0)) for a, b in slow_ranges]

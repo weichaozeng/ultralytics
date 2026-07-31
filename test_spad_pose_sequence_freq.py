@@ -2,12 +2,16 @@
 """Frequency-sweep sequence SPAD pose inference (raw + test_json only).
 
 Controls prediction cadence via ``--pred_fps`` / ``--stride_bins`` while keeping the
-checkpoint chunk window. Emits one pose per window at the chunk end bin.
+checkpoint chunk window. Streaming is **causal**: first forward consumes
+``chunk_size`` bins, each later step feeds only the new ``stride_bins`` (no
+overlap re-feed under carried HIRE state). Emit time is still the chunk end bin.
 
 Example (8 kHz, 50 fps readout):
   python test_spad_pose_sequence_freq.py \\
     --ckpt <hire_8kHz.pt> --test_json <test_8kHz.json> \\
     --spad-bin-rate-hz 8000 --pred_fps 50
+
+HIRE CLI hyperparams apply only with ``--preprocessor hire``; default keeps ckpt.
 """
 
 from __future__ import annotations
@@ -599,10 +603,14 @@ def main():
 
             try:
                 for chunk in chunk_records:
+                    # Logical window for metadata / GT time; stream feed is causal new bins only.
                     t0 = int(chunk.spad_start_bin)
                     t1 = int(chunk.spad_end_bin)
-                    raw_chunk = _slice_raw_chunk(source, t0, t1, packed_ch_order=args.packed_ch_order)
-                    raw_chunk = _prepare_raw_chunk_for_spad(raw_chunk, chunk_t=chunk_size, tail_pad_full=False)
+                    feed0 = int(chunk.feed_start_bin)
+                    feed1 = int(chunk.feed_end_bin)
+                    feed_len = int(feed1 - feed0)
+                    raw_chunk = _slice_raw_chunk(source, feed0, feed1, packed_ch_order=args.packed_ch_order)
+                    raw_chunk = _prepare_raw_chunk_for_spad(raw_chunk, chunk_t=feed_len, tail_pad_full=False)
                     if raw_chunk is None:
                         continue
 
@@ -616,7 +624,8 @@ def main():
                     with torch.inference_mode():
                         video_tensor = torch.from_numpy(np.ascontiguousarray(raw_chunk)).unsqueeze(0).to(device)
                         if getattr(spad_model, "spad_stream_mode", False):
-                            spad_model.spad_stream_bin_offset = int(t0)
+                            # Absolute times for the fed slice (not the full logical window).
+                            spad_model.spad_stream_bin_offset = int(feed0)
                             spad_model.spad_pending_t_index_ll = [int(t1)]
                         raw_preds = spad_model(video_tensor)
                         preds = _postprocess_pose_predictions(
@@ -644,12 +653,19 @@ def main():
                         prefix=f"{sample_name}_cube{video_idx:05d}_t{t0:06d}_{t1:06d}",
                         kpt_shape=kpt_shape,
                     )
+                    if len(results) != 1:
+                        print(
+                            f"Warning: expected 1 pose frame per emit "
+                            f"feed[{feed0},{feed1}) end={t1} but got {len(results)}"
+                        )
 
                     chunk_record: dict[str, Any] = {
                         "chunk_idx": int(chunk.chunk_index),
                         "start_bin": int(t0),
                         "end_bin": int(t1),
-                        "input_bins": int(t1 - t0),
+                        "feed_start_bin": int(feed0),
+                        "feed_end_bin": int(feed1),
+                        "input_bins": int(feed_len),
                         "model_input_bins": int(raw_chunk.shape[0]),
                         "target_gt_time": chunk.target_gt_time,
                         "frames": [],
