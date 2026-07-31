@@ -683,6 +683,14 @@ class SpadPoseModel(PoseModel):
         # Detector letterbox size (0 = feed native recon resolution). Native frames kept in spad_last_recon_frames.
         self.spad_detect_imgsz = 0
         self.spad_scale_meta = None
+        # Optional real-SPAD DSC on **raw binary sum** (not post-recon):
+        # photon_cube sum → full spad_dsc → BGGR ISP → detector.
+        # QNN/HIRE still run for temporal state / aux maps; detector RGB uses DSC(raw).
+        # Attach via ``attach_spad_dsc_corrector`` (DataProcess/noisecorrection).
+        self.spad_dsc_corrector = None
+        self.spad_dsc_apply_gain = True
+        self.spad_dsc_isp_divide = 320.0
+        self.spad_dsc_use_srgb = False
 
         super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
 
@@ -1126,12 +1134,18 @@ class SpadPoseModel(PoseModel):
         pending = getattr(self, "spad_pending_t_index_ll", None)
         stream_mode = bool(getattr(self, "spad_stream_mode", False))
         stream_offset = int(getattr(self, "spad_stream_bin_offset", 0) or 0)
+        use_dsc = getattr(self, "spad_dsc_corrector", None) is not None
         for b in range(bsz):
             photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
             t_raw = int(photon_cube.shape[2])
             recons = self._spad_process_full_window(photon_cube)
-            frames = self._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
-            frames = self._spad_apply_input_gamma(frames, self.spad_input_gamma)
+            if use_dsc:
+                # raw sum → full spad_dsc (bad-pixel) → BGGR ISP → detector
+                # (QNN/HIRE recon kept for preprocessor state / aux; not used as RGB)
+                frames = self._spad_photon_cube_to_rgb_with_dsc(photon_cube)
+            else:
+                frames = self._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
+                frames = self._spad_apply_input_gamma(frames, self.spad_input_gamma)
             frame_ll.append(frames)
 
             if t_index_ll is None:
@@ -1252,6 +1266,61 @@ class SpadPoseModel(PoseModel):
 
         return raw_hwt_to_rgb_float(raw_hwt, packed_nch=int(packed_nch))
 
+    def _spad_photon_cube_to_rgb_with_dsc(self, photon_cube: torch.Tensor) -> torch.Tensor:
+        """Raw binary cube → sum → full ``spad_dsc`` → BGGR ISP → ``(1,3,H,W)`` float RGB.
+
+        Bad-pixel / DCR / gain calibration is defined on **raw Bayer sums**, matching
+        ``preview_video``: ``frames.npy`` unpack → sum(T) → DSC → color. Do **not**
+        run DSC on PPB/HIRE continuous recon (sites would not match the CFA maps).
+        """
+        import sys
+        from pathlib import Path
+
+        import numpy as np
+
+        corrector = getattr(self, "spad_dsc_corrector", None)
+        if corrector is None:
+            raise RuntimeError("spad_dsc_corrector is not set")
+        if photon_cube.ndim != 3:
+            raise ValueError(f"Expected photon_cube (H,W,T), got shape={tuple(photon_cube.shape)}")
+
+        noise_dir = Path(__file__).resolve().parents[3] / "DataProcess" / "noisecorrection"
+        if not noise_dir.is_dir():
+            noise_dir = Path(__file__).resolve().parents[2].parent / "DataProcess" / "noisecorrection"
+        if str(noise_dir) not in sys.path:
+            sys.path.insert(0, str(noise_dir))
+        from bggr_isp import CCM as _CCM_DEFAULT
+        from bggr_isp import WB_GAIN as _WB_DEFAULT
+        from bggr_isp import isp_bayer_to_rgb01
+        from cfa import unpack_raw
+
+        apply_gain = bool(getattr(self, "spad_dsc_apply_gain", True))
+        use_srgb = bool(getattr(self, "spad_dsc_use_srgb", False))
+        wb = getattr(corrector, "wb_gain", None)
+        ccm = getattr(corrector, "ccm", None)
+        wb = np.asarray(wb if wb is not None else _WB_DEFAULT, dtype=np.float32).reshape(-1)
+        ccm = np.asarray(ccm if ccm is not None else _CCM_DEFAULT, dtype=np.float32)
+
+        cube = photon_cube.detach().float().cpu().numpy()
+        t_raw = int(cube.shape[-1])
+        bayer_sum = cube.sum(axis=-1).astype(np.float32)
+        corrected_4ch = corrector.spad_dsc(
+            bayer_sum,
+            num_frames=t_raw,
+            apply_gain=apply_gain,
+        )
+        bayer = unpack_raw(corrected_4ch)
+        # Default divide = chunk length (same as preview); override via spad_dsc_isp_divide.
+        divide = float(getattr(self, "spad_dsc_isp_divide", 0.0) or 0.0)
+        if divide <= 0:
+            divide = float(t_raw)
+        rgb = isp_bayer_to_rgb01(bayer, divide=divide, wb_gain=wb, ccm=ccm, use_srgb=use_srgb)
+        frame = torch.from_numpy(np.ascontiguousarray(rgb.transpose(2, 0, 1))).unsqueeze(0)
+        frame = frame.to(device=photon_cube.device, dtype=torch.float32)
+        if use_srgb:
+            return frame
+        return self._spad_apply_input_gamma(frame, self.spad_input_gamma)
+
     @staticmethod
     def _spad_apply_input_gamma(frames_tchw: torch.Tensor, gamma: float) -> torch.Tensor:
         gamma = float(gamma)
@@ -1335,6 +1404,10 @@ class SpadPoseFrameModel(PoseModel):
         self.spad_last_w_mean = None
         self.spad_last_w_mean_frames = None
         self.spad_t_index_ll = []
+        self.spad_dsc_corrector = None
+        self.spad_dsc_apply_gain = True
+        self.spad_dsc_isp_divide = 320.0
+        self.spad_dsc_use_srgb = False
 
         super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
 
@@ -1416,13 +1489,17 @@ class SpadPoseFrameModel(PoseModel):
             raise ValueError(f"Raw SPAD height/width must be even for Bayer unexpand, got {(raw_h, raw_w)}")
 
         packed_nch = int(getattr(self, "spad_packed_nch", 3) or 3)
+        use_dsc = getattr(self, "spad_dsc_corrector", None) is not None
         frame_ll, confidence_ll = [], []
         t_raw = int(video.shape[1])
         for b in range(bsz):
             photon_cube = video[b, :, :, :, 0].permute(1, 2, 0).contiguous().bool()
             recons, confidence = self._spad_process_frame_window(photon_cube)
-            frames_tchw = SpadPoseModel._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
-            frames_tchw = SpadPoseModel._spad_apply_input_gamma(frames_tchw, self.spad_input_gamma)
+            if use_dsc:
+                frames_tchw = SpadPoseModel._spad_photon_cube_to_rgb_with_dsc(self, photon_cube)
+            else:
+                frames_tchw = SpadPoseModel._spad_raw_recons_to_rgb_frames(recons, packed_nch=packed_nch)
+                frames_tchw = SpadPoseModel._spad_apply_input_gamma(frames_tchw, self.spad_input_gamma)
             if int(frames_tchw.shape[0]) == 0:
                 raise ValueError("Frame-mode preprocessor produced zero frames; expected exactly one.")
             frame_ll.append(frames_tchw[-1])
