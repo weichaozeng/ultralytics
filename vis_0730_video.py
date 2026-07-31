@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Make combined PPB+HIRE videos from Vis/0730 frame dumps with optional slow-mo.
+"""Make combined PPB+HIRE videos from pose-export frame dumps with optional slow-mo.
 
-Reads (from ``vis_0730_pose.py``)::
+Reads dumps from ``vis_0730_pose.py`` / ``vis_spad_pose_export.py``::
 
     <vis_root>/<sample>/{qnn,hire}/
       recon/frame_XXXXXXX.png
