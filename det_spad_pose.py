@@ -368,6 +368,8 @@ def _build_override_preprocessor(args) -> tuple[str | None, object | None]:
                 "gate_pool": str(getattr(args, "hire_gate_pool", "max")),
                 "reset_open": int(getattr(args, "hire_reset_open", 15)),
                 "reset_grow": int(getattr(args, "hire_reset_grow", 6)),
+                "normalize": bool(getattr(args, "hire_normalize", True)),
+                "quantile": float(getattr(args, "hire_quantile", 1.0)),
             }
         )
     else:

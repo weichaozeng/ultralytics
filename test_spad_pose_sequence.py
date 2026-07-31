@@ -316,6 +316,8 @@ def _build_preprocessor_kwargs(args, *, preprocessor_name: str, spad_subsampling
             "gate_pool": str(args.hire_gate_pool),
             "reset_open": int(args.hire_reset_open),
             "reset_grow": int(args.hire_reset_grow),
+            "normalize": bool(getattr(args, "hire_normalize", True)),
+            "quantile": float(getattr(args, "hire_quantile", 1.0)),
         }
     if name == "hyb":
         return {
