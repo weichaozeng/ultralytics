@@ -40,6 +40,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from ultralytics.data.spad_packed import packed_frames_to_raw_bayer
+
 DEFAULT_VIS_ROOT = Path("/home/zvc/Project/SPADHand/Vis/0730")
 DEFAULT_DATA_ROOT = Path("/home/zvc/Data/SPADHand/0730/spad/capture-spc8kHz")
 DEFAULT_VIDEO_SUBDIR = "video"
@@ -123,36 +125,25 @@ def _resize_to_height(img: np.ndarray, height: int) -> np.ndarray:
     return cv2.resize(img, (new_w, height), interpolation=cv2.INTER_AREA)
 
 
-def planes4_to_bayer(plane_sum: np.ndarray) -> np.ndarray:
-    """``(H,W,4)`` spatial planes → full Bayer ``(2H,2W)``."""
-    if plane_sum.ndim != 3 or plane_sum.shape[-1] != 4:
-        raise ValueError(f"Expected (H,W,4), got {plane_sum.shape}")
-    h, w, _ = plane_sum.shape
-    bayer = np.empty((h * 2, w * 2), dtype=np.float32)
-    bayer[0::2, 0::2] = plane_sum[:, :, 0]
-    bayer[0::2, 1::2] = plane_sum[:, :, 1]
-    bayer[1::2, 0::2] = plane_sum[:, :, 2]
-    bayer[1::2, 1::2] = plane_sum[:, :, 3]
-    return bayer
-
-
 def packed_slice_to_spad_gray(
     packed: np.ndarray,
     t0: int,
     t1: int,
     *,
     mode: str = "last",
+    ch_order: str = "RGB",
 ) -> np.ndarray:
     """Read one bin window from mmap'd ``frames.npy`` → Bayer gray BGR.
 
-    Does **not** load the whole file. Only the needed slice is touched.
+    Supports packed ``C=3`` (VisionSIM) and ``C=4`` (real RGGB). Uses
+    ``packed_frames_to_raw_bayer`` so expand matches the detector path.
 
-    ``last`` / ``binary``: **single** last bin in the chunk → 0/255 (not OR over 320).
-    ``any``: OR over the whole chunk → often near-white at 8 kHz / 320 bins.
+    ``last`` / ``binary``: single last bin → 0/255.
+    ``any``: OR over the chunk (often near-white at 320 bins).
     ``sum``: hit-count / T → 0..255 gray.
     """
-    if packed.ndim != 4 or packed.shape[-1] != 4:
-        raise ValueError(f"Expected packed (T,H,Wp,4), got {packed.shape}")
+    if packed.ndim != 4 or packed.shape[-1] not in (3, 4):
+        raise ValueError(f"Expected packed (T,H,Wp,3|4), got {packed.shape}")
     t0 = max(int(t0), 0)
     t1 = min(int(t1), int(packed.shape[0]))
     if t1 <= t0:
@@ -161,24 +152,24 @@ def packed_slice_to_spad_gray(
         return np.zeros((h, w, 3), dtype=np.uint8)
 
     mode = str(mode).strip().lower()
+    order = str(ch_order)
+
+    def _bayer_u8(slice_thwpc: np.ndarray) -> np.ndarray:
+        raw = packed_frames_to_raw_bayer(np.asarray(slice_thwpc), ch_order=order)
+        # raw: (T, 2H, 2W) uint8 {0,1}
+        return raw
+
     if mode in {"last", "binary"}:
-        # One 125 µs bin (chunk end), not OR of 320 — OR would wash out to white.
-        frame = np.asarray(packed[t1 - 1])  # (H,Wp,4)
-        bits = np.unpackbits(frame, axis=1)  # (H,W,4)
-        bayer = planes4_to_bayer(bits.astype(np.float32))
-        gray = (bayer > 0).astype(np.uint8) * 255
+        raw = _bayer_u8(packed[t1 - 1 : t1])  # (1,2H,2W)
+        gray = (raw[0] > 0).astype(np.uint8) * 255
     elif mode == "any":
-        ored = np.bitwise_or.reduce(packed[t0:t1], axis=0)
-        bits = np.unpackbits(ored, axis=1)
-        bayer = planes4_to_bayer(bits.astype(np.float32))
-        gray = (bayer > 0).astype(np.uint8) * 255
+        ored = np.bitwise_or.reduce(packed[t0:t1], axis=0)  # (H,Wp,C)
+        raw = _bayer_u8(ored[None, ...])
+        gray = (raw[0] > 0).astype(np.uint8) * 255
     elif mode == "sum":
-        chunk = np.asarray(packed[t0:t1])
-        bits = np.unpackbits(chunk, axis=2)
-        plane_sum = bits.sum(axis=0, dtype=np.float32)
-        bayer = planes4_to_bayer(plane_sum)
-        t = max(t1 - t0, 1)
-        gray = np.clip(bayer / float(t) * 255.0, 0, 255).astype(np.uint8)
+        raw = _bayer_u8(packed[t0:t1]).astype(np.float32)
+        t = max(int(raw.shape[0]), 1)
+        gray = np.clip(raw.sum(axis=0) / float(t) * 255.0, 0, 255).astype(np.uint8)
     else:
         raise ValueError(f"spad mode must be last|binary|any|sum, got {mode!r}")
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -192,13 +183,16 @@ def load_spad_panel_sequence(
     n_viz: int,
     chunk_size: int,
     mode: str,
+    ch_order: str = "RGB",
 ) -> list[np.ndarray]:
     """Map viz frame i → bins ``[i*chunk_size:(i+1)*chunk_size]`` via mmap."""
     if not frames_npy.is_file():
         raise FileNotFoundError(frames_npy)
     packed = np.load(str(frames_npy), mmap_mode="r")
-    if packed.ndim != 4 or packed.shape[-1] != 4:
-        raise ValueError(f"Expected frames.npy (T,H,Wp,4), got {packed.shape} in {frames_npy}")
+    if packed.ndim != 4 or packed.shape[-1] not in (3, 4):
+        raise ValueError(
+            f"Expected frames.npy (T,H,Wp,3|4), got {packed.shape} in {frames_npy}"
+        )
     t_bins = int(packed.shape[0])
     cs = int(chunk_size)
     if cs <= 0:
@@ -210,7 +204,9 @@ def load_spad_panel_sequence(
     for i in range(lo, hi):
         t0 = i * cs
         t1 = min(t0 + cs, t_bins)
-        panels.append(packed_slice_to_spad_gray(packed, t0, t1, mode=mode))
+        panels.append(
+            packed_slice_to_spad_gray(packed, t0, t1, mode=mode, ch_order=ch_order)
+        )
     return panels
 
 
@@ -376,6 +372,7 @@ def load_combined_sequence(
     chunk_size: int,
     spad_mode: str,
     use_spad: bool,
+    packed_ch_order: str = "RGB",
 ) -> list[np.ndarray]:
     """Per frame: top=PPB (qnn) row, bottom=HIRE row; optional raw SPAD on the left."""
     ppb_dir = sample_dir / "qnn"
@@ -403,6 +400,7 @@ def load_combined_sequence(
             n_viz=n_viz,
             chunk_size=chunk_size,
             mode=spad_mode,
+            ch_order=packed_ch_order,
         )
 
     ppb_rows = load_stitched_sequence(
@@ -467,6 +465,13 @@ def parse_args() -> argparse.Namespace:
         "--no-spad",
         action="store_true",
         help="Skip raw SPAD left column",
+    )
+    ap.add_argument(
+        "--packed_ch_order",
+        type=str,
+        default="RGB",
+        choices=["RGB", "BGR"],
+        help="Channel order for C=3 VisionSIM packed frames (same as export)",
     )
     ap.add_argument(
         "--frame_start",
@@ -551,6 +556,7 @@ def main() -> int:
             chunk_size=int(args.chunk_size),
             spad_mode=str(args.spad_mode),
             use_spad=use_spad,
+            packed_ch_order=str(args.packed_ch_order),
         )
         lo = max(int(args.frame_start), 0)
         rel_slow = [(max(a - lo, 0), max(b - lo, 0)) for a, b in slow_ranges]
