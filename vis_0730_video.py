@@ -51,6 +51,10 @@ DEFAULT_VIS_ROOT = Path("/home/zvc/Project/SPADHand/Vis/0730")
 DEFAULT_DATA_ROOT = Path("/home/zvc/Data/SPADHand/0730/spad/capture-spc8kHz")
 DEFAULT_VIDEO_SUBDIR = "video"
 DEFAULT_CHUNK_SIZE = 320
+DEFAULT_PANEL_SIZE = 512
+# Fixed OpenCV text look at panel_size=512; scales linearly with --panel_size.
+SPEED_FONT_SCALE_AT_512 = 0.85
+SPEED_FONT_THICKNESS_AT_512 = 2
 FRAMES_NPY = "frames.npy"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
 
@@ -108,16 +112,30 @@ def format_playback_speed(slow_factor: int) -> str:
     return text
 
 
-def draw_speed_label(img: np.ndarray, text: str, *, x: int, y: int) -> np.ndarray:
+def speed_font_params(panel_size: int) -> tuple[float, int, int]:
+    """Return ``(scale, thickness, baseline_y_offset)`` locked to ``panel_size``."""
+    size = max(int(panel_size), 1)
+    scale = SPEED_FONT_SCALE_AT_512 * (size / float(DEFAULT_PANEL_SIZE))
+    thickness = max(1, int(round(SPEED_FONT_THICKNESS_AT_512 * (size / float(DEFAULT_PANEL_SIZE)))))
+    y_off = int(round(28 * scale)) + 4
+    return float(scale), int(thickness), int(y_off)
+
+
+def draw_speed_label(
+    img: np.ndarray,
+    text: str,
+    *,
+    x: int,
+    y: int,
+    panel_size: int = DEFAULT_PANEL_SIZE,
+) -> np.ndarray:
     """Draw playback-speed text at top-left of a pose panel (in-place + return)."""
     if not text:
         return img
-    h = int(img.shape[0])
-    scale = max(0.55, min(1.4, h / 512.0 * 0.85))
-    thickness = max(1, int(round(scale * 2)))
+    scale, thickness, y_off = speed_font_params(panel_size)
     font = cv2.FONT_HERSHEY_SIMPLEX
-    org = (int(x) + 8, int(y) + int(28 * scale) + 4)
-    # White halo then dark text — readable on white pose bg and dark recon.
+    org = (int(x) + 8, int(y) + y_off)
+    # White halo then dark text — readable on white pose bg.
     cv2.putText(img, text, org, font, scale, (255, 255, 255), thickness + 2, cv2.LINE_AA)
     cv2.putText(img, text, org, font, scale, (20, 20, 20), thickness, cv2.LINE_AA)
     return img
@@ -150,12 +168,16 @@ def _to_bgr_u8(
     raise ValueError(f"Unsupported image shape {img.shape}")
 
 
-def _resize_to_height(img: np.ndarray, height: int) -> np.ndarray:
+def _resize_square(img: np.ndarray, size: int) -> np.ndarray:
+    """Force panel to exact ``size×size`` (unified grid cell)."""
+    size = int(size)
+    if size <= 0:
+        raise ValueError(f"panel size must be > 0, got {size}")
     h, w = img.shape[:2]
-    if h == height:
+    if h == size and w == size:
         return img
-    new_w = max(int(round(w * (height / float(h)))), 1)
-    return cv2.resize(img, (new_w, height), interpolation=cv2.INTER_AREA)
+    interp = cv2.INTER_AREA if (h > size or w > size) else cv2.INTER_LINEAR
+    return cv2.resize(img, (size, size), interpolation=interp)
 
 
 def packed_slice_to_spad_gray(
@@ -249,46 +271,40 @@ def stitch_panels(
     heat: np.ndarray,
     *,
     spad: np.ndarray | None = None,
+    panel_size: int = DEFAULT_PANEL_SIZE,
 ) -> tuple[np.ndarray, int]:
     """Left→right: [spad |] recon | pose (white) | heatmap.
 
-    Returns ``(row_bgr, pose_x0)`` where ``pose_x0`` is the pose panel left edge.
+    Every cell is resized to ``panel_size×panel_size``. Returns
+    ``(row_bgr, pose_x0)`` where ``pose_x0`` is the pose panel left edge.
     """
-    r = _to_bgr_u8(recon)
-    h = int(r.shape[0])
+    size = int(panel_size)
     parts: list[np.ndarray] = []
     if spad is not None:
-        parts.append(_resize_to_height(_to_bgr_u8(spad), h))
-    parts.append(r)
-    pose_x0 = int(sum(int(p.shape[1]) for p in parts))
-    parts.append(_resize_to_height(_to_bgr_u8(pose, alpha_bg=(255, 255, 255)), h))
-    parts.append(_resize_to_height(_to_bgr_u8(heat, alpha_bg=None), h))
-    return np.concatenate(parts, axis=1), pose_x0
-
-
-def _pad_to_width(img: np.ndarray, width: int, *, fill: int = 0) -> np.ndarray:
-    h, w = img.shape[:2]
-    if w == width:
-        return img
-    if w > width:
-        return img[:, :width]
-    out = np.full((h, width, 3), fill, dtype=np.uint8)
-    out[:, :w] = img
-    return out
+        parts.append(_resize_square(_to_bgr_u8(spad), size))
+    parts.append(_resize_square(_to_bgr_u8(recon), size))
+    pose_x0 = size * len(parts)
+    parts.append(_resize_square(_to_bgr_u8(pose, alpha_bg=(255, 255, 255)), size))
+    parts.append(_resize_square(_to_bgr_u8(heat, alpha_bg=None), size))
+    return np.concatenate(parts, axis=1), int(pose_x0)
 
 
 def stack_ppb_hire(
-    ppb_row: np.ndarray, hire_row: np.ndarray, *, pose_x0: int
+    ppb_row: np.ndarray, hire_row: np.ndarray, *, pose_x0: int, panel_size: int
 ) -> tuple[np.ndarray, list[tuple[int, int]]]:
-    """Top=PPB row, bottom=HIRE row; pad to common width.
+    """Top=PPB row, bottom=HIRE row (same geometry after unified panel resize).
 
     Returns stacked frame and pose-panel top-left origins ``[(x,y), ...]``.
     """
-    w = max(int(ppb_row.shape[1]), int(hire_row.shape[1]))
-    top = _pad_to_width(ppb_row, w)
-    bot = _pad_to_width(hire_row, w)
-    top_h = int(top.shape[0])
-    stacked = np.concatenate([top, bot], axis=0)
+    if ppb_row.shape != hire_row.shape:
+        # Should not happen with square cells; force match to PPB row.
+        hire_row = cv2.resize(
+            hire_row,
+            (int(ppb_row.shape[1]), int(ppb_row.shape[0])),
+            interpolation=cv2.INTER_AREA,
+        )
+    top_h = int(panel_size)
+    stacked = np.concatenate([ppb_row, hire_row], axis=0)
     origins = [(int(pose_x0), 0), (int(pose_x0), top_h)]
     return stacked, origins
 
@@ -308,6 +324,7 @@ def expand_with_slowmo(
     slow_factor: int,
     interp: str,
     pose_origins: list[tuple[int, int]] | None = None,
+    panel_size: int = DEFAULT_PANEL_SIZE,
 ) -> list[np.ndarray]:
     """Insert interpolated frames on slow transitions; keep constant-time steps at output fps.
 
@@ -321,12 +338,13 @@ def expand_with_slowmo(
         raise ValueError(f"interp must be linear|hold, got {interp!r}")
     speed_text = format_playback_speed(factor)
     origins = list(pose_origins or [])
+    psize = int(panel_size)
 
     def _emit(frame: np.ndarray, src_idx: int) -> np.ndarray:
         out_fr = np.ascontiguousarray(frame.copy())
         if origins and frame_in_slow(src_idx, slow_ranges):
             for x, y in origins:
-                draw_speed_label(out_fr, speed_text, x=x, y=y)
+                draw_speed_label(out_fr, speed_text, x=x, y=y, panel_size=psize)
         return out_fr
 
     out: list[np.ndarray] = [_emit(panels[0], 0)]
@@ -360,6 +378,7 @@ def load_stitched_sequence(
     frame_start: int,
     frame_end: int | None,
     spad_panels: list[np.ndarray] | None = None,
+    panel_size: int = DEFAULT_PANEL_SIZE,
 ) -> tuple[list[np.ndarray], int]:
     """Load stitched rows. Returns ``(panels, pose_x0)``."""
     recon_paths = list_frame_paths(method_dir / "recon")
@@ -389,7 +408,9 @@ def load_stitched_sequence(
         if recon is None or pose is None or heat is None:
             raise RuntimeError(f"Failed to read frame index {i} under {method_dir}")
         spad = spad_panels[j] if spad_panels is not None else None
-        row, pose_x0 = stitch_panels(recon, pose, heat, spad=spad)
+        row, pose_x0 = stitch_panels(
+            recon, pose, heat, spad=spad, panel_size=panel_size
+        )
         panels.append(row)
     return panels, pose_x0
 
@@ -436,6 +457,7 @@ def load_combined_sequence(
     spad_mode: str,
     use_spad: bool,
     packed_ch_order: str = "RGB",
+    panel_size: int = DEFAULT_PANEL_SIZE,
 ) -> tuple[list[np.ndarray], list[tuple[int, int]]]:
     """Per frame: top=PPB (qnn) row, bottom=HIRE row; optional raw SPAD on the left.
 
@@ -470,10 +492,18 @@ def load_combined_sequence(
         )
 
     ppb_rows, pose_x0 = load_stitched_sequence(
-        ppb_dir, frame_start=frame_start, frame_end=frame_end, spad_panels=spad_panels
+        ppb_dir,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        spad_panels=spad_panels,
+        panel_size=panel_size,
     )
     hire_rows, pose_x0_hire = load_stitched_sequence(
-        hire_dir, frame_start=frame_start, frame_end=frame_end, spad_panels=spad_panels
+        hire_dir,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        spad_panels=spad_panels,
+        panel_size=panel_size,
     )
     if pose_x0_hire != pose_x0:
         print(
@@ -490,7 +520,9 @@ def load_combined_sequence(
     frames: list[np.ndarray] = []
     pose_origins: list[tuple[int, int]] = []
     for i in range(n):
-        stacked, origins = stack_ppb_hire(ppb_rows[i], hire_rows[i], pose_x0=pose_x0)
+        stacked, origins = stack_ppb_hire(
+            ppb_rows[i], hire_rows[i], pose_x0=pose_x0, panel_size=panel_size
+        )
         frames.append(stacked)
         if not pose_origins:
             pose_origins = origins
@@ -552,6 +584,12 @@ def parse_args() -> argparse.Namespace:
         help="Channel order for C=3 VisionSIM packed frames (same as export)",
     )
     ap.add_argument(
+        "--panel_size",
+        type=int,
+        default=DEFAULT_PANEL_SIZE,
+        help=f"Resize every cell (spad/recon/pose/heatmap) to NxN before stitch (default {DEFAULT_PANEL_SIZE})",
+    )
+    ap.add_argument(
         "--frame_start",
         type=int,
         default=0,
@@ -598,18 +636,23 @@ def main() -> int:
         raise ValueError(f"--fps must be > 0, got {args.fps}")
     if int(args.slow_factor) < 1:
         raise ValueError(f"--slow_factor must be >= 1, got {args.slow_factor}")
+    panel_size = int(args.panel_size)
+    if panel_size <= 0:
+        raise ValueError(f"--panel_size must be > 0, got {panel_size}")
 
     slow_ranges = parse_slow_ranges(args.slow_ranges)
     sample_dirs = discover_samples(vis_root, args.samples)
     frame_end = None if int(args.frame_end) < 0 else int(args.frame_end)
 
     use_spad = not bool(args.no_spad)
+    n_cols = (1 if use_spad else 0) + 3
     print(
         f"vis_root={vis_root}\n"
         f"out_dir={out_dir}\n"
         f"samples={[p.name for p in sample_dirs]}\n"
         f"layout=PPB(top) / HIRE(bottom); each row = "
         f"{'spad|' if use_spad else ''}recon|pose|heatmap\n"
+        f"panel_size={panel_size} → frame {n_cols * panel_size}x{2 * panel_size}\n"
         f"data_root={args.data_root} chunk_size={args.chunk_size} "
         f"spad_mode={args.spad_mode} use_spad={use_spad}\n"
         f"frame_start={args.frame_start} frame_end={frame_end}\n"
@@ -637,6 +680,7 @@ def main() -> int:
             spad_mode=str(args.spad_mode),
             use_spad=use_spad,
             packed_ch_order=str(args.packed_ch_order),
+            panel_size=panel_size,
         )
         lo = max(int(args.frame_start), 0)
         rel_slow = [(max(a - lo, 0), max(b - lo, 0)) for a, b in slow_ranges]
@@ -647,6 +691,7 @@ def main() -> int:
             slow_factor=int(args.slow_factor),
             interp=str(args.interp),
             pose_origins=pose_origins,
+            panel_size=panel_size,
         )
         print(
             f"{sample}: src_frames={len(panels)} → out_frames={len(expanded)} → {out_path}",
