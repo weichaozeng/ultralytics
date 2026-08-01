@@ -29,6 +29,11 @@ python ultralytics/vis_0730_video.py \\
   --frame_start 0 --frame_end 200 \\
   --slow_ranges 40-80 \\
   --slow_factor 4 --fps 25 --overwrite
+
+# Slow-mo draws e.g. 0.02x on pose (top-left) when --slow_factor 50
+python ultralytics/vis_0730_video.py \\
+  --samples acq00019 --frame_start 0 --frame_end 33 \\
+  --slow_ranges 10-15,20-26 --slow_factor 50 --interp hold --overwrite
 """
 
 from __future__ import annotations
@@ -63,10 +68,15 @@ def list_frame_paths(folder: Path) -> list[Path]:
 
 
 def parse_slow_ranges(spec: str) -> list[tuple[int, int]]:
-    """Parse ``'10-30,100-140'`` → inclusive ``[(10,30), (100,140)]``."""
+    """Parse ``'10-30,100-140'`` → ``[(10,30), (100,140)]`` (hi exclusive for transitions).
+
+    Accepts ASCII ``,`` / ``;`` and full-width ``，`` / ``；`` as separators.
+    """
     spec = (spec or "").strip()
     if not spec:
         return []
+    for sep in ("，", "；", ";", "|"):
+        spec = spec.replace(sep, ",")
     ranges: list[tuple[int, int]] = []
     for part in spec.split(","):
         part = part.strip()
@@ -88,6 +98,29 @@ def frame_in_slow(i: int, ranges: list[tuple[int, int]]) -> bool:
         if lo <= i < hi:
             return True
     return False
+
+
+def format_playback_speed(slow_factor: int) -> str:
+    """``slow_factor=50`` → ``'0.02x'``; ``10`` → ``'0.1x'``."""
+    factor = max(int(slow_factor), 1)
+    speed = 1.0 / float(factor)
+    text = f"{speed:.4g}x"
+    return text
+
+
+def draw_speed_label(img: np.ndarray, text: str, *, x: int, y: int) -> np.ndarray:
+    """Draw playback-speed text at top-left of a pose panel (in-place + return)."""
+    if not text:
+        return img
+    h = int(img.shape[0])
+    scale = max(0.55, min(1.4, h / 512.0 * 0.85))
+    thickness = max(1, int(round(scale * 2)))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    org = (int(x) + 8, int(y) + int(28 * scale) + 4)
+    # White halo then dark text — readable on white pose bg and dark recon.
+    cv2.putText(img, text, org, font, scale, (255, 255, 255), thickness + 2, cv2.LINE_AA)
+    cv2.putText(img, text, org, font, scale, (20, 20, 20), thickness, cv2.LINE_AA)
+    return img
 
 
 def _to_bgr_u8(
@@ -216,17 +249,21 @@ def stitch_panels(
     heat: np.ndarray,
     *,
     spad: np.ndarray | None = None,
-) -> np.ndarray:
-    """Left→right: [spad |] recon | pose (white) | heatmap."""
+) -> tuple[np.ndarray, int]:
+    """Left→right: [spad |] recon | pose (white) | heatmap.
+
+    Returns ``(row_bgr, pose_x0)`` where ``pose_x0`` is the pose panel left edge.
+    """
     r = _to_bgr_u8(recon)
     h = int(r.shape[0])
     parts: list[np.ndarray] = []
     if spad is not None:
         parts.append(_resize_to_height(_to_bgr_u8(spad), h))
     parts.append(r)
+    pose_x0 = int(sum(int(p.shape[1]) for p in parts))
     parts.append(_resize_to_height(_to_bgr_u8(pose, alpha_bg=(255, 255, 255)), h))
     parts.append(_resize_to_height(_to_bgr_u8(heat, alpha_bg=None), h))
-    return np.concatenate(parts, axis=1)
+    return np.concatenate(parts, axis=1), pose_x0
 
 
 def _pad_to_width(img: np.ndarray, width: int, *, fill: int = 0) -> np.ndarray:
@@ -240,12 +277,20 @@ def _pad_to_width(img: np.ndarray, width: int, *, fill: int = 0) -> np.ndarray:
     return out
 
 
-def stack_ppb_hire(ppb_row: np.ndarray, hire_row: np.ndarray) -> np.ndarray:
-    """Top=PPB row, bottom=HIRE row; pad to common width."""
+def stack_ppb_hire(
+    ppb_row: np.ndarray, hire_row: np.ndarray, *, pose_x0: int
+) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """Top=PPB row, bottom=HIRE row; pad to common width.
+
+    Returns stacked frame and pose-panel top-left origins ``[(x,y), ...]``.
+    """
     w = max(int(ppb_row.shape[1]), int(hire_row.shape[1]))
     top = _pad_to_width(ppb_row, w)
     bot = _pad_to_width(hire_row, w)
-    return np.concatenate([top, bot], axis=0)
+    top_h = int(top.shape[0])
+    stacked = np.concatenate([top, bot], axis=0)
+    origins = [(int(pose_x0), 0), (int(pose_x0), top_h)]
+    return stacked, origins
 
 
 def lerp_bgr(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
@@ -262,28 +307,43 @@ def expand_with_slowmo(
     slow_ranges: list[tuple[int, int]],
     slow_factor: int,
     interp: str,
+    pose_origins: list[tuple[int, int]] | None = None,
 ) -> list[np.ndarray]:
-    """Insert interpolated frames on slow transitions; keep constant-time steps at output fps."""
+    """Insert interpolated frames on slow transitions; keep constant-time steps at output fps.
+
+    During slowed source frames, draws playback speed (e.g. ``0.02x``) on each pose panel.
+    """
     if not panels:
         return []
     factor = max(int(slow_factor), 1)
     interp = str(interp).strip().lower()
     if interp not in {"linear", "hold"}:
         raise ValueError(f"interp must be linear|hold, got {interp!r}")
+    speed_text = format_playback_speed(factor)
+    origins = list(pose_origins or [])
 
-    out: list[np.ndarray] = [panels[0]]
+    def _emit(frame: np.ndarray, src_idx: int) -> np.ndarray:
+        out_fr = np.ascontiguousarray(frame.copy())
+        if origins and frame_in_slow(src_idx, slow_ranges):
+            for x, y in origins:
+                draw_speed_label(out_fr, speed_text, x=x, y=y)
+        return out_fr
+
+    out: list[np.ndarray] = [_emit(panels[0], 0)]
     for i in range(len(panels) - 1):
         a, b = panels[i], panels[i + 1]
         n_steps = factor if frame_in_slow(i, slow_ranges) else 1
         if n_steps <= 1:
-            out.append(b)
+            out.append(_emit(b, i + 1))
             continue
         for s in range(1, n_steps + 1):
             t = s / float(n_steps)
             if interp == "hold" or s == n_steps:
-                out.append(b if s == n_steps else a)
+                fr = b if s == n_steps else a
             else:
-                out.append(lerp_bgr(a, b, t))
+                fr = lerp_bgr(a, b, t)
+            src = i + 1 if s == n_steps else i
+            out.append(_emit(fr, src))
     return out
 
 
@@ -300,7 +360,8 @@ def load_stitched_sequence(
     frame_start: int,
     frame_end: int | None,
     spad_panels: list[np.ndarray] | None = None,
-) -> list[np.ndarray]:
+) -> tuple[list[np.ndarray], int]:
+    """Load stitched rows. Returns ``(panels, pose_x0)``."""
     recon_paths = list_frame_paths(method_dir / "recon")
     pose_paths = list_frame_paths(method_dir / "pose")
     heat_paths = list_frame_paths(method_dir / "heatmap")
@@ -320,6 +381,7 @@ def load_stitched_sequence(
         )
 
     panels: list[np.ndarray] = []
+    pose_x0 = 0
     for j, i in enumerate(range(lo, hi)):
         recon = cv2.imread(str(recon_paths[i]), cv2.IMREAD_UNCHANGED)
         pose = cv2.imread(str(pose_paths[i]), cv2.IMREAD_UNCHANGED)
@@ -327,8 +389,9 @@ def load_stitched_sequence(
         if recon is None or pose is None or heat is None:
             raise RuntimeError(f"Failed to read frame index {i} under {method_dir}")
         spad = spad_panels[j] if spad_panels is not None else None
-        panels.append(stitch_panels(recon, pose, heat, spad=spad))
-    return panels
+        row, pose_x0 = stitch_panels(recon, pose, heat, spad=spad)
+        panels.append(row)
+    return panels, pose_x0
 
 
 def write_mp4(frames: list[np.ndarray], path: Path, *, fps: float) -> None:
@@ -373,8 +436,11 @@ def load_combined_sequence(
     spad_mode: str,
     use_spad: bool,
     packed_ch_order: str = "RGB",
-) -> list[np.ndarray]:
-    """Per frame: top=PPB (qnn) row, bottom=HIRE row; optional raw SPAD on the left."""
+) -> tuple[list[np.ndarray], list[tuple[int, int]]]:
+    """Per frame: top=PPB (qnn) row, bottom=HIRE row; optional raw SPAD on the left.
+
+    Returns ``(frames, pose_origins)`` with pose top-lefts for speed-label overlay.
+    """
     ppb_dir = sample_dir / "qnn"
     hire_dir = sample_dir / "hire"
     if not ppb_dir.is_dir():
@@ -403,12 +469,17 @@ def load_combined_sequence(
             ch_order=packed_ch_order,
         )
 
-    ppb_rows = load_stitched_sequence(
+    ppb_rows, pose_x0 = load_stitched_sequence(
         ppb_dir, frame_start=frame_start, frame_end=frame_end, spad_panels=spad_panels
     )
-    hire_rows = load_stitched_sequence(
+    hire_rows, pose_x0_hire = load_stitched_sequence(
         hire_dir, frame_start=frame_start, frame_end=frame_end, spad_panels=spad_panels
     )
+    if pose_x0_hire != pose_x0:
+        print(
+            f"  warn: {sample_dir.name} pose_x0 qnn={pose_x0} hire={pose_x0_hire}; using qnn",
+            flush=True,
+        )
     n = min(len(ppb_rows), len(hire_rows))
     if len(ppb_rows) != len(hire_rows):
         print(
@@ -416,7 +487,14 @@ def load_combined_sequence(
             f"using first {n}",
             flush=True,
         )
-    return [stack_ppb_hire(ppb_rows[i], hire_rows[i]) for i in range(n)]
+    frames: list[np.ndarray] = []
+    pose_origins: list[tuple[int, int]] = []
+    for i in range(n):
+        stacked, origins = stack_ppb_hire(ppb_rows[i], hire_rows[i], pose_x0=pose_x0)
+        frames.append(stacked)
+        if not pose_origins:
+            pose_origins = origins
+    return frames, pose_origins
 
 
 def parse_args() -> argparse.Namespace:
@@ -487,9 +565,10 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--slow_ranges",
+        "--slow_range",
         type=str,
         default="",
-        help="Slow-mo source ranges, e.g. '40-80' or '10-30,100-140'",
+        help="Slow-mo source ranges, e.g. '40-80' or '10-30,100-140' (also accepts Chinese ，)",
     )
     ap.add_argument(
         "--slow_factor",
@@ -534,7 +613,8 @@ def main() -> int:
         f"data_root={args.data_root} chunk_size={args.chunk_size} "
         f"spad_mode={args.spad_mode} use_spad={use_spad}\n"
         f"frame_start={args.frame_start} frame_end={frame_end}\n"
-        f"slow_ranges={slow_ranges} slow_factor={args.slow_factor} interp={args.interp}\n"
+        f"slow_ranges={slow_ranges} slow_factor={args.slow_factor} "
+        f"({format_playback_speed(int(args.slow_factor))} on pose) interp={args.interp}\n"
         f"fps={args.fps}",
         flush=True,
     )
@@ -548,7 +628,7 @@ def main() -> int:
             print(f"skip (exists): {out_path}", flush=True)
             continue
 
-        panels = load_combined_sequence(
+        panels, pose_origins = load_combined_sequence(
             sample_dir,
             frame_start=int(args.frame_start),
             frame_end=frame_end,
@@ -566,6 +646,7 @@ def main() -> int:
             slow_ranges=rel_slow,
             slow_factor=int(args.slow_factor),
             interp=str(args.interp),
+            pose_origins=pose_origins,
         )
         print(
             f"{sample}: src_frames={len(panels)} → out_frames={len(expanded)} → {out_path}",
